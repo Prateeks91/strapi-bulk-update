@@ -1,48 +1,25 @@
 # Publishing & Release Guide
 
-This guide provides step-by-step instructions to initialize the Git repository, push to GitHub under the **`strapi-utills`** organization, and publish the plugin to the npm registry.
+This guide provides step-by-step instructions to push the plugin to GitHub at **`https://github.com/Prateeks91/strapi-bulk-update.git`** and publish the plugin to the npm registry.
 
 ---
 
 ## 📋 Pre-Requisites
 
-1. **GitHub Account / Org Access**: Ensure you have permission to create repositories in [https://github.com/strapi-utills](https://github.com/strapi-utills).
+1. **GitHub Account Access**: Ensure you have write access to [https://github.com/Prateeks91/strapi-bulk-update](https://github.com/Prateeks91/strapi-bulk-update).
 2. **npm Account**: An active account at [npmjs.com](https://www.npmjs.com) with 2FA enabled. If publishing as scoped `@strapi-utills/strapi-plugin-bulk-updater`, ensure the `strapi-utills` organization or team is created on npm.
 3. **Node.js**: Version 18.x to 22.x.
 
 ---
 
-## 🐙 Step 1: Initialize Git & Push to GitHub
+## 🐙 Step 1: Push to GitHub
 
-### 1.1 Create the GitHub Repository
-1. Visit [https://github.com/organizations/strapi-utills/repositories/new](https://github.com/organizations/strapi-utills/repositories/new).
-2. **Repository name**: `strapi-plugin-bulk-updater`
-3. **Description**: `Bulk update attributes and relationships across multiple collection types in Strapi v5 with schema validation, maker-checker governance, off-peak scheduling, and 3-tier audit rollback.`
-4. **Visibility**: Public
-5. Do **not** initialize with a README, .gitignore, or license (these are already configured in this repo).
-6. Click **Create repository**.
+The local repository is already initialized on branch `main` with remote origin set to `https://github.com/Prateeks91/strapi-bulk-update.git`.
 
-### 1.2 Initialize Local Git & Make Initial Commit
-
-Run the following commands inside the `strapi-plugin-bulk-updater` folder:
+Simply run:
 
 ```bash
 cd /Users/prateeksrivastava/Desktop/pocs/strapi-plugin-bulk-updater
-
-# Initialize git repository
-git init
-
-# Ensure main is the default branch
-git branch -M main
-
-# Add all prepared files (respecting .gitignore)
-git add .
-
-# Create initial release commit
-git commit -m "feat: initial release of strapi-plugin-bulk-updater v1.0.0"
-
-# Add remote origin
-git remote add origin https://github.com/strapi-utills/strapi-plugin-bulk-updater.git
 
 # Push to GitHub
 git push -u origin main
@@ -134,7 +111,7 @@ git tag -a v1.0.0 -m "Release v1.0.0: Initial release of Strapi Bulk Attribute &
 git push origin v1.0.0
 ```
 
-1. Go to [https://github.com/strapi-utills/strapi-plugin-bulk-updater/releases/new](https://github.com/strapi-utills/strapi-plugin-bulk-updater/releases/new).
+1. Go to [https://github.com/Prateeks91/strapi-bulk-update/releases/new](https://github.com/Prateeks91/strapi-bulk-update/releases/new).
 2. Select tag `v1.0.0`.
 3. Title: `v1.0.0 - Mass Attribute & Relation Updates for Strapi v5`
 4. Paste the feature highlights from `README.md`.

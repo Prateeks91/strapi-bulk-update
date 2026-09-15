@@ -9,7 +9,7 @@
 [![npm version](https://img.shields.io/npm/v/strapi-plugin-bulk-updater.svg?style=flat-square)](https://www.npmjs.com/package/strapi-plugin-bulk-updater)
 [![Strapi v5 Compatible](https://img.shields.io/badge/Strapi-v5.x-4945ff.svg?style=flat-square)](https://strapi.io)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](https://github.com/strapi-utills/strapi-plugin-bulk-updater/pulls)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](https://github.com/Prateeks91/strapi-bulk-update/pulls)
 
 </div>
 
@@ -231,7 +231,7 @@ All routes are mounted under `/bulk-updater` and protected by Strapi Admin authe
 
 Contributions are welcome! Please feel free to submit issues and pull requests:
 
-1. Fork the repository: [https://github.com/strapi-utills/strapi-plugin-bulk-updater](https://github.com/strapi-utills/strapi-plugin-bulk-updater)
+1. Fork the repository: [https://github.com/Prateeks91/strapi-bulk-update](https://github.com/Prateeks91/strapi-bulk-update)
 2. Create your feature branch (`git checkout -b feature/amazing-feature`)
 3. Commit your changes (`git commit -m 'feat: add amazing feature'`)
 4. Push to the branch (`git push origin feature/amazing-feature`)
@@ -246,5 +246,5 @@ Distributed under the MIT License. See [LICENSE](LICENSE) for more details.
 ---
 
 <div align="center">
-  Maintained by <b><a href="https://github.com/strapi-utills">strapi-utills</a></b>
+  Maintained by <b><a href="https://github.com/Prateeks91">Prateek Srivastava</a></b> (strapi-utills)
 </div>

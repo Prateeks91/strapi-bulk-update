@@ -21,11 +21,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/strapi-utills/strapi-plugin-bulk-updater.git"
+    "url": "git+https://github.com/Prateeks91/strapi-bulk-update.git"
   },
-  "homepage": "https://github.com/strapi-utills/strapi-plugin-bulk-updater#readme",
+  "homepage": "https://github.com/Prateeks91/strapi-bulk-update#readme",
   "bugs": {
-    "url": "https://github.com/strapi-utills/strapi-plugin-bulk-updater/issues"
+    "url": "https://github.com/Prateeks91/strapi-bulk-update/issues"
   },
   "keywords": [
     "strapi",
