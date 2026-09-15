@@ -1,0 +1,2852 @@
+import React, { useEffect, useState } from 'react';
+import { useFetchClient, useNotification } from '@strapi/strapi/admin';
+import {
+  Box,
+  Flex,
+  Typography,
+  Button,
+  TextInput,
+  SingleSelect,
+  SingleSelectOption,
+  Checkbox,
+  Badge,
+  Alert,
+  Table,
+  Thead,
+  Tbody,
+  Tr,
+  Th,
+  Td,
+} from '@strapi/design-system';
+import { Play, ArrowClockwise, Check } from '@strapi/icons';
+
+interface Entry {
+  id: number | string;
+  documentId: string;
+  [key: string]: any;
+}
+
+export interface RelationMeta {
+  isRelation: boolean;
+  relationType: string;
+  targetUid: string;
+  targetDisplayName: string;
+  isMulti: boolean;
+}
+
+interface CollectionModel {
+  uid: string;
+  kind?: string;
+  isSingleType?: boolean;
+  singularName: string;
+  pluralName: string;
+  displayName: string;
+  attributes: string[];
+  relations?: Record<string, RelationMeta>;
+  totalEntries?: number;
+  entries: Entry[];
+}
+
+interface CollectionPageState {
+  page: number;
+  pageSize: number;
+  total: number;
+  pageCount: number;
+  entries: Entry[];
+  loading: boolean;
+}
+
+interface LicenseStatus {
+  isPro: boolean;
+  tier: 'free' | 'pro' | 'enterprise';
+  features: string[];
+}
+
+interface UpdateResult {
+  uid: string;
+  collectionName: string;
+  documentId: string;
+  label: string;
+  attribute: string;
+  oldValue?: any;
+  newValue?: any;
+  status: 'updated' | 'skipped' | 'error';
+  message: string;
+}
+
+interface AuditRecord {
+  id: number | string;
+  documentId: string;
+  batchId: string;
+  attribute: string;
+  value: string;
+  userEmail: string;
+  userName: string;
+  updatedCount: number;
+  skippedCount: number;
+  totalTargets: number;
+  diffs: UpdateResult[];
+  isRolledBack: boolean;
+  rolledBackAt: string | null;
+  rolledBackBy: string | null;
+  executedAt: string;
+}
+
+interface ExecutionWindowInfo {
+  enabled: boolean;
+  timeZone: string;
+  businessHours: {
+    start: string;
+    end: string;
+  };
+  offPeakStartTime: string;
+  autoQueueDuringBusinessHours: boolean;
+  isBusinessHours: boolean;
+  currentServerTime: string;
+  policyMessage: string;
+}
+
+interface PendingBatch {
+  id: string;
+  createdAt: string;
+  createdBy: { id?: string | number; email?: string; firstname?: string; lastname?: string; username?: string };
+  payload: {
+    attribute: string;
+    value: string;
+    selectedEntries?: Array<{ uid: string; documentId: string }>;
+    selectedCollections?: string[];
+    isRegex?: boolean;
+    regexPattern?: string;
+    publishOnApproval?: boolean;
+  };
+  summary: {
+    attribute: string;
+    value: string;
+    totalTargets: number;
+    collectionBreakdown: Record<string, number>;
+    publishOnApproval?: boolean;
+  };
+  status: 'pending_approval' | 'queued_offpeak' | 'approved' | 'rejected' | 'executed';
+  executionMode: 'maker_checker' | 'queue_offpeak' | 'immediate';
+  scheduledFor?: string;
+  makerNotes?: string;
+  approval?: {
+    checkerUser?: { id?: string | number; email?: string; firstname?: string; lastname?: string; username?: string };
+    decisionDate?: string;
+    rejectionReason?: string;
+  };
+  executionResult?: any;
+}
+
+export interface ColumnDef {
+  key: string;
+  label: string;
+  sortable?: boolean;
+  isPermanent?: boolean;
+  defaultVisible: boolean;
+}
+
+/**
+ * Flat helper: Generates the list of available columns for a given collection model.
+ * Zero deep nesting: returns a flat array of ColumnDef.
+ */
+export function getAvailableColumnsForCollection(
+  col: CollectionModel,
+  selectedAttribute: string
+): ColumnDef[] {
+  const cols: ColumnDef[] = [
+    {
+      key: 'select',
+      label: 'Select',
+      isPermanent: true,
+      defaultVisible: true,
+    },
+    {
+      key: 'identifier',
+      label: 'Identifier',
+      sortable: !col.isSingleType,
+      defaultVisible: true,
+    },
+  ];
+
+  // Schema-specific attributes
+  const candidateAttrs = col.attributes || [];
+  candidateAttrs.forEach((attr) => {
+    if (attr === 'name' || attr === 'title' || attr === selectedAttribute) {
+      return;
+    }
+    const formattedLabel = attr.charAt(0).toUpperCase() + attr.slice(1);
+    cols.push({
+      key: `attr_${attr}`,
+      label: formattedLabel,
+      sortable: !col.isSingleType,
+      defaultVisible: ['department', 'email', 'location'].includes(attr),
+    });
+  });
+
+  // Target attribute column
+  cols.push({
+    key: 'target_attr',
+    label: `Current "${selectedAttribute}"`,
+    sortable: !col.isSingleType && col.attributes.includes(selectedAttribute),
+    defaultVisible: true,
+  });
+
+  // Status column
+  cols.push({
+    key: 'status',
+    label: 'Status',
+    sortable: false,
+    defaultVisible: true,
+  });
+
+  return cols;
+}
+
+/**
+ * Flat helper: Renders table header cell without nested JSX.
+ */
+function renderHeaderCell(
+  colDef: ColumnDef,
+  col: CollectionModel,
+  currentSort: { field: string; order: 'asc' | 'desc' },
+  selectedAttribute: string,
+  onSort: (colUid: string, field: string) => void
+) {
+  if (colDef.key === 'select') {
+    return (
+      <Th key="select" style={{ width: 48 }}>
+        <Typography variant="sigma">Select</Typography>
+      </Th>
+    );
+  }
+
+  const isCurrentSorted =
+    (colDef.key === 'identifier' && (currentSort.field === 'name' || currentSort.field === 'title')) ||
+    (colDef.key === 'target_attr' && currentSort.field === selectedAttribute) ||
+    (colDef.key.startsWith('attr_') && currentSort.field === colDef.key.replace('attr_', ''));
+
+  const sortArrow = isCurrentSorted ? (currentSort.order === 'asc' ? '▲' : '▼') : '⇅';
+
+  const handleClick = () => {
+    if (!colDef.sortable) return;
+    if (colDef.key === 'identifier') {
+      const field = col.attributes.includes('name') ? 'name' : col.attributes.includes('title') ? 'title' : 'createdAt';
+      onSort(col.uid, field);
+    } else if (colDef.key === 'target_attr') {
+      onSort(col.uid, selectedAttribute);
+    } else if (colDef.key.startsWith('attr_')) {
+      onSort(col.uid, colDef.key.replace('attr_', ''));
+    }
+  };
+
+  return (
+    <Th
+      key={colDef.key}
+      style={{ cursor: colDef.sortable ? 'pointer' : 'default', userSelect: 'none' }}
+      onClick={handleClick}
+    >
+      <Flex gap={1} alignItems="center">
+        <Typography variant="sigma">{colDef.label}</Typography>
+        {colDef.sortable && (
+          <Typography variant="pi" textColor="neutral500">
+            {sortArrow}
+          </Typography>
+        )}
+      </Flex>
+    </Th>
+  );
+}
+
+/**
+ * Flat helper: Formats attribute values, gracefully handling relation objects and arrays.
+ */
+export function formatDisplayValue(val: any): string {
+  if (val === undefined || val === null || val === '') {
+    return '(empty / not set)';
+  }
+  if (Array.isArray(val)) {
+    if (val.length === 0) return '(empty / unlinked)';
+    return val
+      .map((item) =>
+        typeof item === 'object' && item !== null
+          ? item.name || item.title || item.email || item.username || item.documentId || item.id
+          : String(item)
+      )
+      .join(', ');
+  }
+  if (typeof val === 'object' && val !== null) {
+    if (val.isRelation && val.display) return val.display;
+    return val.name || val.title || val.email || val.username || val.documentId || val.id || JSON.stringify(val);
+  }
+  return String(val);
+}
+
+/**
+ * Flat helper: Renders a single cell content using clean early returns.
+ * Zero deep nesting.
+ */
+function renderCellContent(
+  colDef: ColumnDef,
+  entry: Entry,
+  col: CollectionModel,
+  selectedAttribute: string,
+  isMatch: boolean,
+  hasAttr: boolean,
+  isSelected: boolean,
+  onToggleSelect: () => void
+): React.ReactNode {
+  switch (colDef.key) {
+    case 'select':
+      return (
+        <Checkbox
+          checked={isSelected}
+          onCheckedChange={onToggleSelect}
+        />
+      );
+
+    case 'identifier': {
+      const mainText = entry.name || entry.title || `Entry #${entry.id || entry.documentId}`;
+      return (
+        <Box>
+          <Typography fontWeight="semiBold">{mainText}</Typography>
+          {entry.email && (
+            <Typography variant="pi" textColor="neutral500" display="block">
+              {entry.email}
+            </Typography>
+          )}
+        </Box>
+      );
+    }
+
+    case 'target_attr': {
+      const val = entry[selectedAttribute];
+      const displayStr = formatDisplayValue(val);
+      const isUnset = displayStr === '(empty / not set)' || displayStr === '(empty / unlinked)';
+      return (
+        <Typography
+          textColor={isUnset ? 'neutral500' : 'neutral800'}
+          style={{
+            fontStyle: isUnset ? 'italic' : 'normal',
+            display: 'inline-block',
+            maxWidth: 260,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {displayStr}
+        </Typography>
+      );
+    }
+
+    case 'status': {
+      if (!hasAttr) {
+        return (
+          <Badge backgroundColor="neutral200" textColor="neutral600">
+            Ignored
+          </Badge>
+        );
+      }
+      return (
+        <Flex gap={1} alignItems="center">
+          <Badge backgroundColor="success100" textColor="success700">
+            Supported
+          </Badge>
+          {isMatch && (
+            <Badge backgroundColor="secondary100" textColor="secondary700">
+              Matches Filter
+            </Badge>
+          )}
+        </Flex>
+      );
+    }
+
+    default: {
+      const attrName = colDef.key.replace('attr_', '');
+      const rawVal = entry[attrName];
+      const displayStr = formatDisplayValue(rawVal);
+      return (
+        <Typography
+          textColor="neutral700"
+          style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+        >
+          {displayStr === '(empty / not set)' ? '-' : displayStr}
+        </Typography>
+      );
+    }
+  }
+}
+
+const BulkUpdater: React.FC = () => {
+  const { get, post } = useFetchClient();
+  const { toggleNotification } = useNotification();
+
+  // Active view tab: 'editor' | 'audit' (synced with ?tab= query param)
+  const getInitialTab = (): 'editor' | 'audit' => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const t = params.get('tab');
+      if (t === 'audit' || t === 'editor') return t;
+    } catch {}
+    return 'editor';
+  };
+
+  const [activeTab, setActiveTabState] = useState<'editor' | 'audit'>(getInitialTab);
+
+  const setActiveTab = (tab: 'editor' | 'audit') => {
+    setActiveTabState(tab);
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.set('tab', tab);
+      window.history.replaceState({}, '', url.toString());
+    } catch {}
+  };
+
+  const [loading, setLoading] = useState<boolean>(true);
+  const [updating, setUpdating] = useState<boolean>(false);
+  const [attributes, setAttributes] = useState<string[]>([]);
+  const [collections, setCollections] = useState<CollectionModel[]>([]);
+  const [license, setLicense] = useState<LicenseStatus | null>(null);
+  const [auditEnabled, setAuditEnabled] = useState<boolean>(false);
+
+  // Execution Window & Maker-Checker State
+  const [executionWindow, setExecutionWindow] = useState<ExecutionWindowInfo | null>(null);
+  const [showConfirmModal, setShowConfirmModal] = useState<boolean>(false);
+  const [pendingBatches, setPendingBatches] = useState<PendingBatch[]>([]);
+  const [pendingBatchesLoading, setPendingBatchesLoading] = useState<boolean>(false);
+  const [approvingBatchId, setApprovingBatchId] = useState<string | null>(null);
+  const [rejectingBatchId, setRejectingBatchId] = useState<string | null>(null);
+  const [executingNowBatchId, setExecutingNowBatchId] = useState<string | null>(null);
+  const [makerNotesInput, setMakerNotesInput] = useState<string>('');
+  const [publishOnApproval, setPublishOnApproval] = useState<boolean>(true);
+
+  // Selected state
+  const [selectedAttribute, setSelectedAttribute] = useState<string>('metaDescription');
+  const [attributeValue, setAttributeValue] = useState<string>('');
+  const [selectedEntries, setSelectedEntries] = useState<Record<string, boolean>>({});
+
+  // Relation State
+  const [relationsMeta, setRelationsMeta] = useState<Record<string, RelationMeta>>({});
+  const [relationOptions, setRelationOptions] = useState<Array<{ documentId: string; label: string }>>([]);
+  const [relationOptionsLoading, setRelationOptionsLoading] = useState<boolean>(false);
+  const [selectedRelationDocId, setSelectedRelationDocId] = useState<string>('');
+  const [relationMode, setRelationMode] = useState<'set' | 'connect' | 'disconnect' | 'clear'>('set');
+
+  const fetchRelationOptions = async (targetUid: string) => {
+    try {
+      setRelationOptionsLoading(true);
+      const res = await get(`/bulk-updater/relation-options?targetUid=${encodeURIComponent(targetUid)}`);
+      if (res.data && res.data.success) {
+        setRelationOptions(res.data.options || []);
+      }
+    } catch {
+      setRelationOptions([]);
+    } finally {
+      setRelationOptionsLoading(false);
+    }
+  };
+
+  // Pro feature: Regex
+  const [useRegex, setUseRegex] = useState<boolean>(false);
+  const [regexPattern, setRegexPattern] = useState<string>('');
+
+  // Target Value Filter state ("Find items with a certain value first")
+  type FilterOperator = 'none' | 'empty' | 'not_empty' | 'equals' | 'contains' | 'starts_with';
+  const [filterOperator, setFilterOperator] = useState<FilterOperator>('none');
+  const [filterQuery, setFilterQuery] = useState<string>('');
+  const [hideNonMatching, setHideNonMatching] = useState<boolean>(false);
+
+  // Result state
+  const [lastResults, setLastResults] = useState<UpdateResult[] | null>(null);
+  const [updateSummary, setUpdateSummary] = useState<{
+    updatedCount: number;
+    skippedCount: number;
+    batchId?: string;
+  } | null>(null);
+
+  const [collectionPages, setCollectionPages] = useState<Record<string, CollectionPageState>>({});
+  const [collectionSearch, setCollectionSearch] = useState<string>('');
+
+  // Content Type visibility filter
+  const [visibleTypeUids, setVisibleTypeUids] = useState<Record<string, boolean>>({});
+
+  // Pagination & Sorting state (capped at 100)
+  const [defaultPageSize, setDefaultPageSize] = useState<number>(10);
+  const [collectionSorts, setCollectionSorts] = useState<Record<string, { field: string; order: 'asc' | 'desc' }>>({});
+
+  // Column Visibility per Collection Type (flat mapping: uid -> string[])
+  const [collectionColumnVisibility, setCollectionColumnVisibility] = useState<Record<string, string[]>>({});
+  const [openColumnPickerUid, setOpenColumnPickerUid] = useState<string | null>(null);
+
+  const toggleColumn = (colUid: string, colKey: string, availableCols: ColumnDef[]) => {
+    setCollectionColumnVisibility((prev) => {
+      const current = prev[colUid] || availableCols.filter((c) => c.defaultVisible).map((c) => c.key);
+      let next: string[];
+      if (current.includes(colKey)) {
+        const remaining = current.filter((k) => k !== colKey);
+        if (remaining.filter((k) => k !== 'select').length === 0) {
+          return prev;
+        }
+        next = remaining;
+      } else {
+        next = [...current, colKey];
+      }
+      return { ...prev, [colUid]: next };
+    });
+  };
+
+  const showAllColumns = (colUid: string, availableCols: ColumnDef[]) => {
+    setCollectionColumnVisibility((prev) => ({
+      ...prev,
+      [colUid]: availableCols.map((c) => c.key),
+    }));
+  };
+
+  const resetDefaultColumns = (colUid: string, availableCols: ColumnDef[]) => {
+    setCollectionColumnVisibility((prev) => ({
+      ...prev,
+      [colUid]: availableCols.filter((c) => c.defaultVisible).map((c) => c.key),
+    }));
+  };
+
+  // Audit state
+  const [auditHistory, setAuditHistory] = useState<AuditRecord[]>([]);
+  const [auditLoading, setAuditLoading] = useState<boolean>(false);
+  const [rollingBackBatchId, setRollingBackBatchId] = useState<string | null>(null);
+  const [expandedDiffBatchId, setExpandedDiffBatchId] = useState<string | null>(null);
+  const [auditNotice, setAuditNotice] = useState<string | null>(null);
+
+  const latestActiveBatch = auditHistory.find((rec) => !rec.isRolledBack);
+
+  const fetchModels = async () => {
+    try {
+      setLoading(true);
+      const res = await get('/bulk-updater/models');
+      if (res.data && res.data.success) {
+        setAttributes(res.data.attributes || []);
+        const cols: CollectionModel[] = res.data.collections || [];
+        setCollections(cols);
+        setLicense(res.data.license || null);
+        setAuditEnabled(Boolean(res.data.auditEnabled));
+        if (res.data.executionWindow) {
+          setExecutionWindow(res.data.executionWindow);
+        }
+
+        const pages: Record<string, CollectionPageState> = {};
+        const initialVisibility: Record<string, boolean> = {};
+        const initialSorts: Record<string, { field: string; order: 'asc' | 'desc' }> = {};
+        cols.forEach((col: CollectionModel) => {
+          const total = col.totalEntries !== undefined ? col.totalEntries : (col.entries ? col.entries.length : 0);
+          const initialPageSize = col.isSingleType ? 1 : 10;
+          pages[col.uid] = {
+            page: 1,
+            pageSize: initialPageSize,
+            total,
+            pageCount: col.isSingleType ? 1 : (Math.ceil(total / initialPageSize) || 1),
+            entries: (col.entries || []).slice(0, initialPageSize),
+            loading: false,
+          };
+          initialVisibility[col.uid] = true;
+          initialSorts[col.uid] = { field: 'createdAt', order: 'desc' };
+        });
+        setCollectionPages(pages);
+        setVisibleTypeUids(initialVisibility);
+        setCollectionSorts(initialSorts);
+
+        if (res.data.relationsMeta) {
+          setRelationsMeta(res.data.relationsMeta);
+        }
+
+        const activeAttr = selectedAttribute || (res.data.attributes && res.data.attributes[0]);
+        if (!selectedAttribute && activeAttr) {
+          setSelectedAttribute(activeAttr);
+        }
+        if (activeAttr && res.data.relationsMeta && res.data.relationsMeta[activeAttr]) {
+          fetchRelationOptions(res.data.relationsMeta[activeAttr].targetUid);
+        }
+      }
+    } catch (err: any) {
+      toggleNotification({
+        type: 'danger',
+        message: err.message || 'Failed to load collections data',
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadCollectionPage = async (
+    colUid: string,
+    targetPage: number,
+    customPageSize?: number,
+    customSortField?: string,
+    customSortOrder?: 'asc' | 'desc'
+  ) => {
+    const currentPageState = collectionPages[colUid];
+    const size = customPageSize || currentPageState?.pageSize || defaultPageSize;
+    const currentSort = collectionSorts[colUid] || { field: 'createdAt', order: 'desc' };
+    const sortField = customSortField !== undefined ? customSortField : currentSort.field;
+    const sortOrder = customSortOrder !== undefined ? customSortOrder : currentSort.order;
+
+    setCollectionPages((prev) => ({
+      ...prev,
+      [colUid]: {
+        ...(prev[colUid] || { page: 1, pageSize: size, total: 0, pageCount: 1, entries: [] }),
+        loading: true,
+      },
+    }));
+
+    try {
+      const params = new URLSearchParams({
+        page: String(targetPage),
+        pageSize: String(size),
+      });
+      if (selectedAttribute) params.set('attribute', selectedAttribute);
+      if (filterOperator && filterOperator !== 'none') {
+        params.set('filterOperator', filterOperator);
+        if (filterQuery) params.set('filterQuery', filterQuery);
+      }
+      if (sortField) {
+        params.set('sortField', sortField);
+        params.set('sortOrder', sortOrder);
+      }
+
+      const res = await get(`/bulk-updater/collections/${colUid}/entries?${params.toString()}`);
+      if (res.data && res.data.success) {
+        setCollectionPages((prev) => ({
+          ...prev,
+          [colUid]: {
+            page: res.data.pagination.page,
+            pageSize: res.data.pagination.pageSize,
+            total: res.data.pagination.total,
+            pageCount: res.data.pagination.pageCount,
+            entries: res.data.entries || [],
+            loading: false,
+          },
+        }));
+      }
+    } catch (err: any) {
+      toggleNotification({
+        type: 'danger',
+        message: `Failed to load entries for ${colUid}: ${err.message}`,
+      });
+      setCollectionPages((prev) => ({
+        ...prev,
+        [colUid]: {
+          ...(prev[colUid] || {}),
+          loading: false,
+        },
+      }));
+    }
+  };
+
+  const fetchAuditHistory = async () => {
+    try {
+      setAuditLoading(true);
+      const res = await get('/bulk-updater/audit/history');
+      if (res.data) {
+        if (res.data.enabled) {
+          setAuditHistory(res.data.history || []);
+          setAuditNotice(null);
+        } else {
+          setAuditHistory([]);
+          setAuditNotice(res.data.message || 'Audit trail is not configured.');
+        }
+      }
+    } catch (err: any) {
+      toggleNotification({
+        type: 'danger',
+        message: err.message || 'Failed to fetch audit history.',
+      });
+    } finally {
+      setAuditLoading(false);
+    }
+  };
+
+  const fetchPendingBatches = async () => {
+    try {
+      setPendingBatchesLoading(true);
+      const res = await get('/bulk-updater/pending-batches');
+      if (res.data && res.data.success) {
+        setPendingBatches(res.data.batches || []);
+        if (res.data.executionWindow) {
+          setExecutionWindow(res.data.executionWindow);
+        }
+      }
+    } catch {
+      // ignore
+    } finally {
+      setPendingBatchesLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchModels();
+    fetchAuditHistory();
+    fetchPendingBatches();
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === 'audit') {
+      fetchAuditHistory();
+      fetchPendingBatches();
+    }
+  }, [activeTab]);
+
+  const KEY_SEP = '@@@';
+
+  // Handle attribute selection change: unchecks all existing selections if attribute changes
+  const handleAttributeChange = (newAttr: string) => {
+    if (newAttr !== selectedAttribute) {
+      setSelectedAttribute(newAttr);
+      setSelectedEntries({});
+      setFilterOperator('none');
+      setFilterQuery('');
+      setHideNonMatching(false);
+      setSelectedRelationDocId('');
+      setAttributeValue('');
+
+      if (relationsMeta[newAttr]) {
+        fetchRelationOptions(relationsMeta[newAttr].targetUid);
+      } else {
+        setRelationOptions([]);
+      }
+
+      collections.forEach((col) => {
+        loadCollectionPage(col.uid, 1);
+      });
+    }
+  };
+
+  const filteredCollections = collections.filter(
+    (c) =>
+      visibleTypeUids[c.uid] !== false &&
+      (!collectionSearch.trim() ||
+        c.displayName.toLowerCase().includes(collectionSearch.toLowerCase().trim()) ||
+        c.uid.toLowerCase().includes(collectionSearch.toLowerCase().trim()))
+  );
+
+  const handleGlobalPageSizeChange = (newSize: number) => {
+    const capped = Math.min(100, Math.max(1, newSize));
+    setDefaultPageSize(capped);
+    collections.forEach((col) => {
+      if (!col.isSingleType) {
+        loadCollectionPage(col.uid, 1, capped);
+      }
+    });
+  };
+
+  const handleCollectionPageSizeChange = (colUid: string, newSize: number) => {
+    const capped = Math.min(100, Math.max(1, newSize));
+    loadCollectionPage(colUid, 1, capped);
+  };
+
+  const handleCollectionSortChange = (colUid: string, field: string, order: 'asc' | 'desc') => {
+    setCollectionSorts((prev) => ({
+      ...prev,
+      [colUid]: { field, order },
+    }));
+    loadCollectionPage(colUid, 1, undefined, field, order);
+  };
+
+  const handleHeaderSortClick = (colUid: string, field: string) => {
+    const current = collectionSorts[colUid] || { field: 'createdAt', order: 'desc' };
+    const nextOrder: 'asc' | 'desc' = current.field === field && current.order === 'asc' ? 'desc' : 'asc';
+    handleCollectionSortChange(colUid, field, nextOrder);
+  };
+
+  // Toggle single entry
+  const toggleEntry = (uid: string, documentId: string) => {
+    const key = `${uid}${KEY_SEP}${documentId}`;
+    setSelectedEntries((prev) => ({
+      ...prev,
+      [key]: !prev[key],
+    }));
+  };
+
+  // Value filter evaluation
+  const entryMatchesFilter = (entry: Entry, attr: string): boolean => {
+    if (filterOperator === 'none') return true;
+    const val = entry[attr];
+    const displayStr = formatDisplayValue(val);
+    const isValEmpty =
+      val === undefined ||
+      val === null ||
+      displayStr.trim() === '' ||
+      displayStr.trim().toLowerCase() === '(not set)' ||
+      displayStr.trim().toLowerCase() === '(empty / not set)' ||
+      displayStr.trim().toLowerCase() === '(empty / unlinked)';
+
+    switch (filterOperator) {
+      case 'empty':
+        return isValEmpty;
+      case 'not_empty':
+        return !isValEmpty;
+      case 'equals':
+        return !isValEmpty && displayStr.trim().toLowerCase() === filterQuery.trim().toLowerCase();
+      case 'contains':
+        return !isValEmpty && displayStr.toLowerCase().includes(filterQuery.trim().toLowerCase());
+      case 'starts_with':
+        return !isValEmpty && displayStr.trim().toLowerCase().startsWith(filterQuery.trim().toLowerCase());
+      default:
+        return true;
+    }
+  };
+
+  const getVisibleEntries = (col: CollectionModel) => {
+    const pageState = collectionPages[col.uid];
+    const entries = pageState ? pageState.entries : (col.entries || []);
+    if (!hideNonMatching || filterOperator === 'none') {
+      return entries;
+    }
+    return entries.filter((e) => entryMatchesFilter(e, selectedAttribute));
+  };
+
+  const matchingEntriesCount = React.useMemo(() => {
+    if (filterOperator === 'none') return 0;
+    let count = 0;
+    filteredCollections.forEach((col) => {
+      if (col.attributes.includes(selectedAttribute)) {
+        const pageState = collectionPages[col.uid];
+        const entries = pageState ? pageState.entries : (col.entries || []);
+        entries.forEach((entry) => {
+          if (entryMatchesFilter(entry, selectedAttribute)) {
+            count++;
+          }
+        });
+      }
+    });
+    return count;
+  }, [filteredCollections, collectionPages, selectedAttribute, filterOperator, filterQuery]);
+
+  const selectAllMatching = () => {
+    const updated = { ...selectedEntries };
+    filteredCollections.forEach((col) => {
+      if (col.attributes.includes(selectedAttribute)) {
+        const pageState = collectionPages[col.uid];
+        const entries = pageState ? pageState.entries : (col.entries || []);
+        entries.forEach((e) => {
+          if (entryMatchesFilter(e, selectedAttribute)) {
+            updated[`${col.uid}${KEY_SEP}${e.documentId}`] = true;
+          }
+        });
+      }
+    });
+    setSelectedEntries(updated);
+  };
+
+  const deselectAllMatching = () => {
+    const updated = { ...selectedEntries };
+    filteredCollections.forEach((col) => {
+      if (col.attributes.includes(selectedAttribute)) {
+        const pageState = collectionPages[col.uid];
+        const entries = pageState ? pageState.entries : (col.entries || []);
+        entries.forEach((e) => {
+          if (entryMatchesFilter(e, selectedAttribute)) {
+            delete updated[`${col.uid}${KEY_SEP}${e.documentId}`];
+          }
+        });
+      }
+    });
+    setSelectedEntries(updated);
+  };
+
+  const clearFilter = () => {
+    setFilterOperator('none');
+    setFilterQuery('');
+    setHideNonMatching(false);
+    collections.forEach((col) => {
+      loadCollectionPage(col.uid, 1);
+    });
+  };
+
+  const isCollectionFullySelected = (col: CollectionModel) => {
+    const entries = getVisibleEntries(col);
+    if (!entries.length) return false;
+    return entries.every((e) => selectedEntries[`${col.uid}${KEY_SEP}${e.documentId}`]);
+  };
+
+  const isCollectionPartiallySelected = (col: CollectionModel) => {
+    const entries = getVisibleEntries(col);
+    if (!entries.length) return false;
+    const selectedCount = entries.filter(
+      (e) => selectedEntries[`${col.uid}${KEY_SEP}${e.documentId}`]
+    ).length;
+    return selectedCount > 0 && selectedCount < entries.length;
+  };
+
+  const toggleCollection = (col: CollectionModel) => {
+    const entries = getVisibleEntries(col);
+    const willSelectAll = !isCollectionFullySelected(col);
+    const updated = { ...selectedEntries };
+    entries.forEach((e) => {
+      const key = `${col.uid}${KEY_SEP}${e.documentId}`;
+      if (willSelectAll) {
+        updated[key] = true;
+      } else {
+        delete updated[key];
+      }
+    });
+    setSelectedEntries(updated);
+  };
+
+  const selectAll = () => {
+    const updated = { ...selectedEntries };
+    filteredCollections.forEach((col) => {
+      const entries = getVisibleEntries(col);
+      entries.forEach((e) => {
+        updated[`${col.uid}${KEY_SEP}${e.documentId}`] = true;
+      });
+    });
+    setSelectedEntries(updated);
+  };
+
+  const deselectAll = () => {
+    setSelectedEntries({});
+  };
+
+  const getSelectedBreakdown = () => {
+    const breakdown: Record<string, number> = {};
+    Object.keys(selectedEntries).forEach((key) => {
+      if (selectedEntries[key]) {
+        const parts = key.split(KEY_SEP);
+        if (parts.length === 2) {
+          const uid = parts[0];
+          const col = collections.find((c) => c.uid === uid);
+          const name = col?.displayName || uid;
+          breakdown[name] = (breakdown[name] || 0) + 1;
+        }
+      }
+    });
+    return breakdown;
+  };
+
+  // Open Confirmation Modal
+  const handleOpenConfirmModal = () => {
+    if (!selectedAttribute) {
+      toggleNotification({
+        type: 'warning',
+        message: 'Please select an attribute from the dropdown',
+      });
+      return;
+    }
+
+    if (useRegex && !license?.isPro) {
+      toggleNotification({
+        type: 'warning',
+        message: 'Regex replacement is a Pro feature. Please activate your license in Settings.',
+      });
+      return;
+    }
+
+    const totalSelected = Object.values(selectedEntries).filter(Boolean).length;
+    if (totalSelected === 0) {
+      toggleNotification({
+        type: 'warning',
+        message: 'Please select at least one collection type or entry to update',
+      });
+      return;
+    }
+
+    setShowConfirmModal(true);
+  };
+
+  // Perform bulk update with chosen mode
+  const executeBatchWithMode = async (
+    executionMode: 'immediate' | 'queue_offpeak' | 'maker_checker',
+    forceImmediate = false
+  ) => {
+    const targets: Array<{ uid: string; documentId: string }> = [];
+    Object.keys(selectedEntries).forEach((key) => {
+      if (selectedEntries[key]) {
+        const parts = key.split(KEY_SEP);
+        if (parts.length === 2) {
+          targets.push({ uid: parts[0], documentId: parts[1] });
+        }
+      }
+    });
+
+    try {
+      setUpdating(true);
+      setShowConfirmModal(false);
+      setLastResults(null);
+
+      const payload = {
+        attribute: selectedAttribute,
+        value: attributeValue,
+        selectedEntries: targets,
+        isRegex: useRegex,
+        regexPattern: regexPattern,
+        executionMode,
+        makerNotes: makerNotesInput,
+        forceImmediate,
+        publishOnApproval,
+      };
+
+      const res = await post('/bulk-updater/batch-update', payload);
+
+      if (res.data && res.data.success) {
+        if (res.data.pending) {
+          toggleNotification({
+            type: 'success',
+            message: res.data.message || 'Batch submitted successfully.',
+          });
+          await fetchPendingBatches();
+          setActiveTab('audit');
+        } else {
+          setLastResults(res.data.results || []);
+          setUpdateSummary({
+            updatedCount: res.data.updatedCount || 0,
+            skippedCount: res.data.skippedCount || 0,
+            batchId: res.data.batchId,
+          });
+
+          toggleNotification({
+            type: 'success',
+            message: `Bulk update complete! Batch ID: ${res.data.batchId}. Updated: ${res.data.updatedCount}, Skipped: ${res.data.skippedCount}`,
+          });
+
+          await fetchModels();
+        }
+      } else {
+        toggleNotification({
+          type: 'danger',
+          message: res.data?.error || 'Batch update encountered an error',
+        });
+      }
+    } catch (err: any) {
+      toggleNotification({
+        type: 'danger',
+        message: err.response?.data?.error || err.message || 'Batch update failed',
+      });
+    } finally {
+      setUpdating(false);
+      setMakerNotesInput('');
+    }
+  };
+
+  // Checker Approves Batch
+  const handleApproveBatch = async (batchId: string) => {
+    try {
+      setApprovingBatchId(batchId);
+      const res = await post(`/bulk-updater/batches/${batchId}/approve`, { executeImmediately: true });
+      if (res.data && res.data.success) {
+        toggleNotification({
+          type: 'success',
+          message: res.data.message || `Batch ${batchId} approved and executed successfully!`,
+        });
+        await fetchPendingBatches();
+        await fetchAuditHistory();
+        await fetchModels();
+      } else {
+        toggleNotification({
+          type: 'danger',
+          message: res.data?.error || 'Failed to approve batch',
+        });
+      }
+    } catch (err: any) {
+      toggleNotification({
+        type: 'danger',
+        message: err.response?.data?.error || err.message || 'Failed to approve batch',
+      });
+    } finally {
+      setApprovingBatchId(null);
+    }
+  };
+
+  // Checker Rejects Batch
+  const handleRejectBatch = async (batchId: string) => {
+    const reason = window.prompt('Enter reason for rejection:', 'Does not meet release criteria') || 'Rejected by Checker';
+    try {
+      setRejectingBatchId(batchId);
+      const res = await post(`/bulk-updater/batches/${batchId}/reject`, { reason });
+      if (res.data && res.data.success) {
+        toggleNotification({
+          type: 'info',
+          message: `Batch ${batchId} rejected: ${reason}`,
+        });
+        await fetchPendingBatches();
+      } else {
+        toggleNotification({
+          type: 'danger',
+          message: res.data?.error || 'Failed to reject batch',
+        });
+      }
+    } catch (err: any) {
+      toggleNotification({
+        type: 'danger',
+        message: err.response?.data?.error || err.message || 'Failed to reject batch',
+      });
+    } finally {
+      setRejectingBatchId(null);
+    }
+  };
+
+  // Execute Queued Batch Immediately
+  const handleExecuteNow = async (batchId: string) => {
+    try {
+      setExecutingNowBatchId(batchId);
+      const res = await post(`/bulk-updater/batches/${batchId}/execute-now`);
+      if (res.data && res.data.success) {
+        toggleNotification({
+          type: 'success',
+          message: `Batch ${batchId} executed immediately!`,
+        });
+        await fetchPendingBatches();
+        await fetchAuditHistory();
+        await fetchModels();
+      } else {
+        toggleNotification({
+          type: 'danger',
+          message: res.data?.error || 'Failed to execute batch',
+        });
+      }
+    } catch (err: any) {
+      toggleNotification({
+        type: 'danger',
+        message: err.response?.data?.error || err.message || 'Failed to execute batch',
+      });
+    } finally {
+      setExecutingNowBatchId(null);
+    }
+  };
+
+  // Perform Rollback
+  const handleRollback = async (batchId: string) => {
+    if (!window.confirm(`Are you sure you want to roll back all changes made in batch "${batchId}"?`)) {
+      return;
+    }
+
+    try {
+      setRollingBackBatchId(batchId);
+      const res = await post(`/bulk-updater/audit/${batchId}/rollback`);
+
+      if (res.data && res.data.success) {
+        toggleNotification({
+          type: 'success',
+          message: `Batch "${batchId}" rolled back successfully! Reverted ${res.data.revertedCount} entries.`,
+        });
+        await fetchAuditHistory();
+        await fetchModels();
+      } else {
+        toggleNotification({
+          type: 'danger',
+          message: res.data?.error || 'Rollback failed.',
+        });
+      }
+    } catch (err: any) {
+      toggleNotification({
+        type: 'danger',
+        message: err.response?.data?.error || err.message || 'Rollback encountered an error.',
+      });
+    } finally {
+      setRollingBackBatchId(null);
+    }
+  };
+
+  const totalSelectedCount = Object.values(selectedEntries).filter(Boolean).length;
+  const rootRef = React.useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (rootRef.current && rootRef.current.parentElement) {
+      rootRef.current.parentElement.style.minWidth = '0';
+      rootRef.current.parentElement.style.maxWidth = '100%';
+    }
+  }, []);
+
+  return (
+    <Box
+      ref={rootRef}
+      className="bulk-updater-root"
+      padding={8}
+      background="neutral100"
+      style={{ width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box' }}
+    >
+      <style>{`
+        /* Prevent page-level horizontal overflow under any circumstance */
+        html, body {
+          overflow-x: hidden !important;
+          max-width: 100vw !important;
+        }
+        div:has(> .bulk-updater-root) {
+          min-width: 0 !important;
+          max-width: 100% !important;
+          width: 100% !important;
+          flex: 1 1 0% !important;
+          overflow-x: clip !important;
+        }
+        .bulk-updater-root {
+          min-width: 0 !important;
+          max-width: 100% !important;
+          width: 100% !important;
+          box-sizing: border-box !important;
+          overflow-x: clip !important;
+        }
+        /* All tables stretch to take the full available container space */
+        .bulk-updater-root table {
+          width: 100% !important;
+          min-width: 0 !important;
+        }
+        .bulk-updater-root div:has(> table) {
+          width: 100% !important;
+          max-width: 100% !important;
+          min-width: 0 !important;
+        }
+        /* Table scroll container keeps horizontal scroll strictly at the table level */
+        .bulk-updater-table-container {
+          width: 100% !important;
+          max-width: 100% !important;
+          min-width: 0 !important;
+          overflow-x: auto !important;
+          -webkit-overflow-scrolling: touch;
+        }
+        .bulk-updater-table-container::-webkit-scrollbar {
+          height: 8px;
+        }
+        .bulk-updater-table-container::-webkit-scrollbar-track {
+          background: rgba(120, 120, 150, 0.1);
+          border-radius: 4px;
+        }
+        .bulk-updater-table-container::-webkit-scrollbar-thumb {
+          background: rgba(120, 120, 150, 0.4);
+          border-radius: 4px;
+        }
+        .bulk-updater-table-container::-webkit-scrollbar-thumb:hover {
+          background: rgba(120, 120, 150, 0.7);
+        }
+      `}</style>
+      {/* Page Header */}
+      <Flex direction="column" alignItems="flex-start" gap={2} marginBottom={6}>
+        <Flex justifyContent="space-between" width="100%">
+          <Box>
+            <Flex gap={3} alignItems="center">
+              <Typography variant="alpha" tag="h1" fontWeight="bold">
+                Bulk Attribute Updater
+              </Typography>
+              <Badge
+                backgroundColor={license?.isPro ? 'success100' : 'neutral200'}
+                textColor={license?.isPro ? 'success700' : 'neutral700'}
+              >
+                {license?.isPro ? `${license.tier.toUpperCase()} EDITION` : 'COMMUNITY EDITION'}
+              </Badge>
+              {auditEnabled && (
+                <Badge backgroundColor="secondary100" textColor="secondary700">
+                  AUDIT &amp; ROLLBACK ACTIVE
+                </Badge>
+              )}
+            </Flex>
+            <Typography variant="omega" textColor="neutral600">
+              Cross-collection batch attribute management with declarative audit trail and one-click rollback.
+            </Typography>
+          </Box>
+          <Flex gap={2}>
+            <Button
+              startIcon={<ArrowClockwise />}
+              variant="tertiary"
+              onClick={activeTab === 'editor' ? fetchModels : fetchAuditHistory}
+              loading={loading || auditLoading}
+            >
+              Refresh
+            </Button>
+          </Flex>
+        </Flex>
+      </Flex>
+
+      {/* Tab Navigation */}
+      <Flex gap={2} marginBottom={4} wrap="wrap" justifyContent="space-between" alignItems="center">
+        <Flex gap={2}>
+          <Button
+            variant={activeTab === 'editor' ? 'default' : 'tertiary'}
+            onClick={() => setActiveTab('editor')}
+            size="M"
+          >
+            Bulk Updater Workspace
+          </Button>
+          <Button
+            variant={activeTab === 'audit' ? 'default' : 'tertiary'}
+            onClick={() => setActiveTab('audit')}
+            size="M"
+          >
+            Audit Trail &amp; Approvals
+            {pendingBatches.filter((b) => b.status === 'pending_approval' || b.status === 'queued_offpeak').length > 0 ? (
+              <Badge backgroundColor="warning100" textColor="warning700" style={{ marginLeft: 8 }}>
+                {pendingBatches.filter((b) => b.status === 'pending_approval' || b.status === 'queued_offpeak').length} PENDING
+              </Badge>
+            ) : auditHistory.length > 0 ? (
+              ` (${auditHistory.length})`
+            ) : (
+              ''
+            )}
+          </Button>
+        </Flex>
+
+        {/* Server Policy Indicator */}
+        {executionWindow && (
+          <Flex gap={2} alignItems="center">
+            <Badge
+              backgroundColor={executionWindow.isBusinessHours ? 'warning100' : 'success100'}
+              textColor={executionWindow.isBusinessHours ? 'warning700' : 'success700'}
+            >
+              {executionWindow.isBusinessHours
+                ? `PEAK HOURS (${executionWindow.businessHours?.start} - ${executionWindow.businessHours?.end} ${executionWindow.timeZone || ''}) • OFF-PEAK QUEUE ACTIVE`
+                : `OFF-PEAK WINDOW ACTIVE (${executionWindow.timeZone || ''}) • DIRECT EXECUTION PERMITTED`}
+            </Badge>
+          </Flex>
+        )}
+      </Flex>
+
+      {/* Quick Rollback Banner for Workspace */}
+      {activeTab === 'editor' && latestActiveBatch && !updateSummary && (
+        <Box
+          padding={3}
+          paddingLeft={4}
+          paddingRight={4}
+          background="neutral0"
+          shadow="filterShadow"
+          hasRadius
+          marginBottom={4}
+          style={{ borderLeft: '4px solid #4945ff' }}
+        >
+          <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={2}>
+            <Flex gap={2} alignItems="center">
+              <Badge backgroundColor="primary100" textColor="primary700">
+                ACTIVE BATCH
+              </Badge>
+              <Typography variant="pi" textColor="neutral700">
+                <code>{latestActiveBatch.batchId}</code> ({latestActiveBatch.recordCount} entries updated by {latestActiveBatch.userEmail})
+              </Typography>
+            </Flex>
+            <Flex gap={2}>
+              <Button
+                variant="danger-light"
+                size="S"
+                startIcon={<ArrowClockwise />}
+                onClick={() => handleRollback(latestActiveBatch.batchId)}
+                loading={rollingBackBatchId === latestActiveBatch.batchId}
+              >
+                Rollback This Batch
+              </Button>
+              <Button
+                variant="tertiary"
+                size="S"
+                onClick={() => setActiveTab('audit')}
+              >
+                View Rollback History →
+              </Button>
+            </Flex>
+          </Flex>
+        </Box>
+      )}
+
+      {/* ======================================================== */}
+      {/* TAB 1: BULK UPDATER EDITOR                               */}
+      {/* ======================================================== */}
+      {activeTab === 'editor' && (
+        <>
+          {/* Main Control Panel: Attribute Dropdown + Value Input + Action Button */}
+          <Box
+            padding={6}
+            background="neutral0"
+            shadow="filterShadow"
+            hasRadius
+            marginBottom={6}
+            style={{ width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box' }}
+          >
+            <Typography variant="delta" tag="h2" marginBottom={4} fontWeight="semiBold">
+              1. Configure Attribute Update
+            </Typography>
+
+            <Flex gap={4} alignItems="flex-end" wrap="wrap">
+              {/* Attribute Dropdown */}
+              <Box style={{ minWidth: 260 }}>
+                <SingleSelect
+                  label="Attribute to Update"
+                  placeholder="Select an attribute..."
+                  value={selectedAttribute}
+                  onChange={(val) => handleAttributeChange(String(val))}
+                >
+                  {attributes.map((attr) => {
+                    const rel = relationsMeta[attr];
+                    return (
+                      <SingleSelectOption key={attr} value={attr}>
+                        {attr} {rel ? `(relation ➔ ${rel.targetDisplayName})` : ''}
+                      </SingleSelectOption>
+                    );
+                  })}
+                </SingleSelect>
+              </Box>
+
+              {/* New Value Input or Relation Target Selector */}
+              <Box style={{ flex: 1, minWidth: 340 }}>
+                {relationsMeta[selectedAttribute] ? (
+                  <Flex direction="column" gap={1} style={{ width: '100%' }}>
+                    <Flex gap={2} alignItems="center" wrap="wrap">
+                      <Typography variant="pi" fontWeight="bold" textColor="neutral700">
+                        Target {relationsMeta[selectedAttribute].targetDisplayName} Relation:
+                      </Typography>
+                      <Badge backgroundColor="secondary100" textColor="secondary700">
+                        {relationsMeta[selectedAttribute].relationType} &rarr; {relationsMeta[selectedAttribute].targetDisplayName}
+                      </Badge>
+                      {relationsMeta[selectedAttribute].isMulti && (
+                        <Badge backgroundColor="primary100" textColor="primary700">
+                          Multi-Relation
+                        </Badge>
+                      )}
+                    </Flex>
+                    <Flex gap={2} alignItems="center" style={{ width: '100%' }}>
+                      <Box style={{ flex: 1, minWidth: 200 }}>
+                        <SingleSelect
+                          label={`Choose ${relationsMeta[selectedAttribute].targetDisplayName}`}
+                          placeholder={relationOptionsLoading ? 'Loading entities...' : `Pick a ${relationsMeta[selectedAttribute].targetDisplayName}...`}
+                          value={selectedRelationDocId}
+                          onChange={(val) => {
+                            const docId = String(val);
+                            setSelectedRelationDocId(docId);
+                            if (docId === '__clear__') {
+                              setAttributeValue(JSON.stringify({ mode: 'clear', label: '(clear relation)' }));
+                            } else {
+                              const opt = relationOptions.find((o) => o.documentId === docId);
+                              setAttributeValue(JSON.stringify({ mode: relationMode, documentIds: [docId], label: opt?.label || docId }));
+                            }
+                          }}
+                        >
+                          <SingleSelectOption value="__clear__">-- Clear / Unlink Relation --</SingleSelectOption>
+                          {relationOptions.map((opt) => (
+                            <SingleSelectOption key={opt.documentId} value={opt.documentId}>
+                              {opt.label}
+                            </SingleSelectOption>
+                          ))}
+                        </SingleSelect>
+                      </Box>
+                      {relationsMeta[selectedAttribute].isMulti && (
+                        <Box style={{ width: 170 }}>
+                          <SingleSelect
+                            label="Action Mode"
+                            value={relationMode}
+                            onChange={(val) => {
+                              const m = String(val) as 'set' | 'connect' | 'disconnect' | 'clear';
+                              setRelationMode(m);
+                              if (selectedRelationDocId) {
+                                if (selectedRelationDocId === '__clear__' || m === 'clear') {
+                                  setAttributeValue(JSON.stringify({ mode: 'clear', label: '(clear relation)' }));
+                                } else {
+                                  const opt = relationOptions.find((o) => o.documentId === selectedRelationDocId);
+                                  setAttributeValue(JSON.stringify({ mode: m, documentIds: [selectedRelationDocId], label: opt?.label || selectedRelationDocId }));
+                                }
+                              }
+                            }}
+                          >
+                            <SingleSelectOption value="set">Set / Overwrite</SingleSelectOption>
+                            <SingleSelectOption value="connect">Add / Connect</SingleSelectOption>
+                            <SingleSelectOption value="disconnect">Remove / Disconnect</SingleSelectOption>
+                            <SingleSelectOption value="clear">Clear All</SingleSelectOption>
+                          </SingleSelect>
+                        </Box>
+                      )}
+                    </Flex>
+                  </Flex>
+                ) : (
+                  <TextInput
+                    label={useRegex ? 'Replacement Value' : 'New Attribute Value'}
+                    name="attributeValue"
+                    placeholder={useRegex ? 'Replace matched pattern with...' : 'Enter the value to apply...'}
+                    value={attributeValue}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                      setAttributeValue(e.target.value)
+                    }
+                  />
+                )}
+              </Box>
+
+              {/* Update Action Button */}
+              <Box>
+                <Button
+                  startIcon={<Play />}
+                  variant="default"
+                  size="L"
+                  onClick={handleOpenConfirmModal}
+                  loading={updating}
+                  disabled={loading || totalSelectedCount === 0}
+                >
+                  Update Selected ({totalSelectedCount})
+                </Button>
+              </Box>
+            </Flex>
+
+            {/* Pro Feature: Regex Search & Replace */}
+            <Box marginTop={4} padding={4} background="neutral100" hasRadius>
+              <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={3}>
+                <Flex gap={2} alignItems="center">
+                  <Checkbox
+                    checked={useRegex}
+                    onCheckedChange={(checked: boolean) => setUseRegex(Boolean(checked))}
+                  >
+                    <Typography fontWeight="bold">Enable Regex Find &amp; Replace</Typography>
+                  </Checkbox>
+                  <Badge
+                    backgroundColor={license?.isPro ? 'success100' : 'warning100'}
+                    textColor={license?.isPro ? 'success700' : 'warning700'}
+                  >
+                    {license?.isPro ? 'PRO UNLOCKED' : 'PRO FEATURE'}
+                  </Badge>
+                </Flex>
+                {useRegex && (
+                  <Box style={{ flex: 1, minWidth: 240 }}>
+                    <TextInput
+                      placeholder="Regex pattern (e.g. \b(OldName)\b)..."
+                      value={regexPattern}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                        setRegexPattern(e.target.value)
+                      }
+                      disabled={!license?.isPro}
+                    />
+                  </Box>
+                )}
+              </Flex>
+              {!license?.isPro && useRegex && (
+                <Box marginTop={2}>
+                  <Typography variant="pi" textColor="warning700">
+                    Regex replacement is locked to Pro license holders. Visit Settings &gt; Bulk Updater to activate your key.
+                  </Typography>
+                </Box>
+              )}
+            </Box>
+
+            {/* Selected Attribute Context Hint */}
+            {selectedAttribute && (
+              <Box marginTop={4} padding={3} background="neutral100" hasRadius>
+                <Flex gap={2} alignItems="center" wrap="wrap">
+                  <Typography variant="pi" fontWeight="bold">
+                    Attribute Info:
+                  </Typography>
+                  <Typography variant="pi">
+                    Targeting attribute <strong>{selectedAttribute}</strong>.
+                  </Typography>
+                  {collections.map((c) => {
+                    const hasAttr = c.attributes.includes(selectedAttribute);
+                    return (
+                      <Badge
+                        key={c.uid}
+                        backgroundColor={hasAttr ? 'success100' : 'neutral200'}
+                        textColor={hasAttr ? 'success700' : 'neutral600'}
+                      >
+                        {c.displayName}: {hasAttr ? 'Attribute exists' : 'Not in schema'}
+                      </Badge>
+                    );
+                  })}
+                </Flex>
+              </Box>
+            )}
+          </Box>
+
+          {/* Target Selection: Collections & Entries */}
+          <Box
+            padding={6}
+            background="neutral0"
+            shadow="filterShadow"
+            hasRadius
+            marginBottom={6}
+            style={{ width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box' }}
+          >
+            <Flex justifyContent="space-between" alignItems="center" marginBottom={4} wrap="wrap" gap={3}>
+              <Box>
+                <Typography variant="delta" tag="h2" fontWeight="semiBold">
+                  2. Select Targets
+                </Typography>
+                <Typography variant="pi" textColor="neutral600">
+                  Pick entire collection types or individual entries to apply the update to.
+                </Typography>
+              </Box>
+              <Flex gap={2}>
+                <Button variant="secondary" size="S" onClick={selectAll}>
+                  Select All
+                </Button>
+                <Button variant="tertiary" size="S" onClick={deselectAll}>
+                  Deselect All
+                </Button>
+              </Flex>
+            </Flex>
+
+            {/* Target Value Filter Bar ("Find items by value first") */}
+            <Box
+              padding={4}
+              background="neutral100"
+              hasRadius
+              marginBottom={5}
+              style={{ width: '100%', maxWidth: '100%', boxSizing: 'border-box' }}
+            >
+              <Flex direction="column" gap={3}>
+                <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={2}>
+                  <Flex gap={2} alignItems="center">
+                    <Typography variant="omega" fontWeight="bold">
+                      Find Targets by Current Value:
+                    </Typography>
+                    {filterOperator !== 'none' && (
+                      <Badge backgroundColor="primary100" textColor="primary700">
+                        {matchingEntriesCount} matching {matchingEntriesCount === 1 ? 'entry' : 'entries'}
+                      </Badge>
+                    )}
+                  </Flex>
+                  {filterOperator !== 'none' && (
+                    <Button variant="ghost" size="S" onClick={clearFilter}>
+                      Clear Filter
+                    </Button>
+                  )}
+                </Flex>
+
+                <Flex gap={3} alignItems="flex-end" wrap="wrap">
+                  {/* Operator Select */}
+                  <Box style={{ width: 240, minWidth: 200 }}>
+                    <SingleSelect
+                      label={`Filter condition for "${selectedAttribute}"`}
+                      value={filterOperator}
+                      onChange={(val) => setFilterOperator(String(val) as FilterOperator)}
+                    >
+                      <SingleSelectOption value="none">Show All (No Filter)</SingleSelectOption>
+                      <SingleSelectOption value="empty">Is Empty or Null</SingleSelectOption>
+                      <SingleSelectOption value="not_empty">Is Not Empty</SingleSelectOption>
+                      <SingleSelectOption value="equals">Equals Exact Text</SingleSelectOption>
+                      <SingleSelectOption value="contains">Contains Substring</SingleSelectOption>
+                      <SingleSelectOption value="starts_with">Starts With</SingleSelectOption>
+                    </SingleSelect>
+                  </Box>
+
+                  {/* Value query input if needed */}
+                  {(filterOperator === 'equals' || filterOperator === 'contains' || filterOperator === 'starts_with') && (
+                    <Box style={{ flex: 1, minWidth: 220 }}>
+                      <TextInput
+                        label="Value to Search"
+                        placeholder="Type value to match..."
+                        value={filterQuery}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFilterQuery(e.target.value)}
+                      />
+                    </Box>
+                  )}
+
+                  {/* Quick Action Buttons when filter is active */}
+                  {filterOperator !== 'none' && (
+                    <Flex gap={2} alignItems="center">
+                      <Button
+                        variant="default"
+                        size="S"
+                        onClick={selectAllMatching}
+                        disabled={matchingEntriesCount === 0}
+                      >
+                        Select Matching ({matchingEntriesCount})
+                      </Button>
+                      <Button
+                        variant="tertiary"
+                        size="S"
+                        onClick={deselectAllMatching}
+                        disabled={matchingEntriesCount === 0}
+                      >
+                        Deselect Matching
+                      </Button>
+                    </Flex>
+                  )}
+                </Flex>
+
+                {/* Filter Options: Toggle hide non-matching */}
+                {filterOperator !== 'none' && (
+                  <Flex gap={2} alignItems="center" marginTop={1}>
+                    <Checkbox
+                      checked={hideNonMatching}
+                      onCheckedChange={(checked: boolean) => setHideNonMatching(Boolean(checked))}
+                    >
+                      <Typography variant="pi" textColor="neutral700">
+                        Only display matching entries in tables (hide non-matching)
+                      </Typography>
+                    </Checkbox>
+                  </Flex>
+                )}
+              </Flex>
+            </Box>
+
+            {/* Advanced Content Type Visibility Filter */}
+            {collections.length > 0 && (
+              <Box
+                padding={4}
+                background="neutral100"
+                hasRadius
+                marginBottom={4}
+                style={{ width: '100%', maxWidth: '100%', boxSizing: 'border-box' }}
+              >
+                <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={2} marginBottom={3}>
+                  <Flex gap={2} alignItems="center">
+                    <Typography variant="omega" fontWeight="bold">
+                      Filter Visible Content Types:
+                    </Typography>
+                    <Badge backgroundColor="primary100" textColor="primary700">
+                      {filteredCollections.length} of {collections.length} visible
+                    </Badge>
+                  </Flex>
+                  <Flex gap={2} alignItems="center">
+                    <Button
+                      variant="tertiary"
+                      size="S"
+                      onClick={() => {
+                        const allVis: Record<string, boolean> = {};
+                        collections.forEach((c) => (allVis[c.uid] = true));
+                        setVisibleTypeUids(allVis);
+                      }}
+                    >
+                      Show All Types
+                    </Button>
+                    <Button
+                      variant="tertiary"
+                      size="S"
+                      onClick={() => {
+                        const allVis: Record<string, boolean> = {};
+                        collections.forEach((c) => (allVis[c.uid] = false));
+                        setVisibleTypeUids(allVis);
+                      }}
+                    >
+                      Hide All Types
+                    </Button>
+                  </Flex>
+                </Flex>
+
+                <Flex wrap="wrap" gap={2} alignItems="center">
+                  {collections.map((col) => {
+                    const isVisible = visibleTypeUids[col.uid] !== false;
+                    return (
+                      <Box
+                        key={col.uid}
+                        padding={2}
+                        paddingLeft={3}
+                        paddingRight={3}
+                        background={isVisible ? 'neutral0' : 'neutral200'}
+                        hasRadius
+                        borderStyle="solid"
+                        borderWidth="1px"
+                        borderColor={isVisible ? 'primary200' : 'neutral300'}
+                      >
+                        <Flex gap={2} alignItems="center">
+                          <Checkbox
+                            checked={isVisible}
+                            onCheckedChange={(checked: boolean) =>
+                              setVisibleTypeUids((prev) => ({ ...prev, [col.uid]: Boolean(checked) }))
+                            }
+                          >
+                            <Typography fontWeight={isVisible ? 'semiBold' : 'regular'}>
+                              {col.displayName}
+                            </Typography>
+                          </Checkbox>
+                          {col.isSingleType ? (
+                            <Badge backgroundColor="secondary100" textColor="secondary700" size="S">
+                              Single Type
+                            </Badge>
+                          ) : (
+                            <Badge backgroundColor="neutral150" textColor="neutral600" size="S">
+                              Collection
+                            </Badge>
+                          )}
+                        </Flex>
+                      </Box>
+                    );
+                  })}
+                </Flex>
+              </Box>
+            )}
+
+            {/* Filter Search & Global Page Size Controls */}
+            <Flex justifyContent="space-between" alignItems="center" marginBottom={4} wrap="wrap" gap={3}>
+              {collections.length > 1 && (
+                <Box style={{ flex: 1, maxWidth: 360, minWidth: 220 }}>
+                  <TextInput
+                    label="Search Content Types"
+                    placeholder="Search by name or UID..."
+                    value={collectionSearch}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                      setCollectionSearch(e.target.value)
+                    }
+                  />
+                </Box>
+              )}
+              <Flex gap={2} alignItems="center" style={{ marginLeft: 'auto' }}>
+                <Typography variant="pi" textColor="neutral600">
+                  Default page size (max 100):
+                </Typography>
+                <Box style={{ width: 120 }}>
+                  <SingleSelect
+                    size="S"
+                    value={String(defaultPageSize)}
+                    onChange={(val) => handleGlobalPageSizeChange(Number(val))}
+                  >
+                    <SingleSelectOption value="5">5 / page</SingleSelectOption>
+                    <SingleSelectOption value="10">10 / page</SingleSelectOption>
+                    <SingleSelectOption value="25">25 / page</SingleSelectOption>
+                    <SingleSelectOption value="50">50 / page</SingleSelectOption>
+                    <SingleSelectOption value="100">100 / page</SingleSelectOption>
+                  </SingleSelect>
+                </Box>
+              </Flex>
+            </Flex>
+
+            {filteredCollections.length === 0 ? (
+              <Box padding={6} background="neutral100" hasRadius style={{ textAlign: 'center' }}>
+                <Typography variant="pi" textColor="neutral600">
+                  No content types match the visibility or search filters.
+                </Typography>
+              </Box>
+            ) : (
+              filteredCollections.map((col) => {
+                const pageState = collectionPages[col.uid];
+                const entries = pageState ? pageState.entries : (col.entries || []);
+                const totalEntries = pageState ? pageState.total : (col.totalEntries !== undefined ? col.totalEntries : entries.length);
+                const page = pageState ? pageState.page : 1;
+                const pageCount = pageState ? pageState.pageCount : 1;
+                const pageSize = pageState ? pageState.pageSize : defaultPageSize;
+                const hasAttr = col.attributes.includes(selectedAttribute);
+                const visibleEntries = getVisibleEntries(col);
+                const matchingColCount = entries.filter((e) => entryMatchesFilter(e, selectedAttribute)).length;
+                const isFullySelected = isCollectionFullySelected(col);
+                const isPartiallySelected = isCollectionPartiallySelected(col);
+                const currentSort = collectionSorts[col.uid] || { field: 'createdAt', order: 'desc' };
+                const availableColumns = getAvailableColumnsForCollection(col, selectedAttribute);
+                const savedColKeys = collectionColumnVisibility[col.uid];
+                const activeColumns = savedColKeys
+                  ? availableColumns.filter((c) => c.isPermanent || savedColKeys.includes(c.key))
+                  : availableColumns.filter((c) => c.defaultVisible);
+
+                return (
+                  <Box
+                    key={col.uid}
+                    marginBottom={5}
+                    padding={4}
+                    hasRadius
+                    borderStyle="solid"
+                    borderWidth="1px"
+                    borderColor="neutral200"
+                    background="neutral0"
+                    style={{ width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box' }}
+                  >
+                    {/* Collection Header */}
+                    <Flex justifyContent="space-between" alignItems="center" marginBottom={3} wrap="wrap" gap={2}>
+                      <Flex gap={3} alignItems="center" wrap="wrap">
+                        <Checkbox
+                          checked={isFullySelected}
+                          indeterminate={isPartiallySelected ? true : undefined}
+                          onCheckedChange={() => toggleCollection(col)}
+                        >
+                          <Typography variant="beta" fontWeight="bold">
+                            {col.displayName} {col.isSingleType ? '(Single Type)' : 'Collection'}
+                          </Typography>
+                        </Checkbox>
+                        {col.isSingleType ? (
+                          <Badge backgroundColor="secondary100" textColor="secondary700">
+                            Single Type
+                          </Badge>
+                        ) : (
+                          <Badge
+                            backgroundColor={hasAttr ? 'success100' : 'warning100'}
+                            textColor={hasAttr ? 'success700' : 'warning700'}
+                          >
+                            {hasAttr
+                              ? `Schema has "${selectedAttribute}"`
+                              : `Schema lacks "${selectedAttribute}" (will skip)`}
+                          </Badge>
+                        )}
+                      </Flex>
+
+                      <Flex gap={3} alignItems="center" wrap="wrap">
+                        {!col.isSingleType && (
+                          <Flex gap={2} alignItems="center">
+                            <Typography variant="pi" textColor="neutral600">
+                              Sort:
+                            </Typography>
+                            <Box style={{ width: 190 }}>
+                              <SingleSelect
+                                size="S"
+                                value={`${currentSort.field}:${currentSort.order}`}
+                                onChange={(val) => {
+                                  const [f, o] = String(val).split(':');
+                                  handleCollectionSortChange(col.uid, f, o as 'asc' | 'desc');
+                                }}
+                              >
+                                <SingleSelectOption value="createdAt:desc">Created: Newest</SingleSelectOption>
+                                <SingleSelectOption value="createdAt:asc">Created: Oldest</SingleSelectOption>
+                                {hasAttr && (
+                                  <>
+                                    <SingleSelectOption value={`${selectedAttribute}:asc`}>
+                                      {selectedAttribute} (A &rarr; Z)
+                                    </SingleSelectOption>
+                                    <SingleSelectOption value={`${selectedAttribute}:desc`}>
+                                      {selectedAttribute} (Z &rarr; A)
+                                    </SingleSelectOption>
+                                  </>
+                                )}
+                                {col.attributes.includes('name') && (
+                                  <>
+                                    <SingleSelectOption value="name:asc">Name (A &rarr; Z)</SingleSelectOption>
+                                    <SingleSelectOption value="name:desc">Name (Z &rarr; A)</SingleSelectOption>
+                                  </>
+                                )}
+                                {col.attributes.includes('title') && (
+                                  <>
+                                    <SingleSelectOption value="title:asc">Title (A &rarr; Z)</SingleSelectOption>
+                                    <SingleSelectOption value="title:desc">Title (Z &rarr; A)</SingleSelectOption>
+                                  </>
+                                )}
+                              </SingleSelect>
+                            </Box>
+                          </Flex>
+                        )}
+
+                        <Button
+                          variant={openColumnPickerUid === col.uid ? 'secondary' : 'tertiary'}
+                          size="S"
+                          onClick={() => setOpenColumnPickerUid(openColumnPickerUid === col.uid ? null : col.uid)}
+                        >
+                          Columns ({activeColumns.filter((c) => !c.isPermanent).length}/{availableColumns.filter((c) => !c.isPermanent).length})
+                        </Button>
+
+                        <Typography variant="pi" textColor="neutral500">
+                          {col.isSingleType
+                            ? '1 single entry'
+                            : filterOperator !== 'none'
+                            ? `${matchingColCount} matching of ${totalEntries} entries`
+                            : `${totalEntries} entries`}
+                        </Typography>
+                      </Flex>
+                    </Flex>
+
+                    {/* Column Visibility Selector Panel */}
+                    {openColumnPickerUid === col.uid && (
+                      <Box
+                        padding={3}
+                        marginBottom={3}
+                        background="neutral100"
+                        hasRadius
+                        borderColor="neutral200"
+                        style={{ border: '1px solid #dcdce4' }}
+                      >
+                        <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={3}>
+                          <Flex gap={3} alignItems="center" wrap="wrap">
+                            <Typography variant="pi" fontWeight="bold" textColor="neutral700">
+                              Columns for {col.displayName}:
+                            </Typography>
+                            {availableColumns
+                              .filter((c) => !c.isPermanent)
+                              .map((c) => {
+                                const isChecked = activeColumns.some((ac) => ac.key === c.key);
+                                return (
+                                  <Box key={c.key}>
+                                    <Checkbox
+                                      checked={isChecked}
+                                      onCheckedChange={() => toggleColumn(col.uid, c.key, availableColumns)}
+                                    >
+                                      <Typography variant="pi">{c.label}</Typography>
+                                    </Checkbox>
+                                  </Box>
+                                );
+                              })}
+                          </Flex>
+                          <Flex gap={2}>
+                            <Button
+                              variant="tertiary"
+                              size="S"
+                              onClick={() => showAllColumns(col.uid, availableColumns)}
+                            >
+                              Show All
+                            </Button>
+                            <Button
+                              variant="tertiary"
+                              size="S"
+                              onClick={() => resetDefaultColumns(col.uid, availableColumns)}
+                            >
+                              Reset
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="S"
+                              onClick={() => setOpenColumnPickerUid(null)}
+                            >
+                              Close
+                            </Button>
+                          </Flex>
+                        </Flex>
+                      </Box>
+                    )}
+
+                    {/* Entries Table */}
+                    <Box className="bulk-updater-table-container" style={{ width: '100%', maxWidth: '100%', minWidth: 0, overflowX: 'auto' }}>
+                      <Table colCount={activeColumns.length} rowCount={visibleEntries.length + 1} style={{ width: '100%' }}>
+                        <Thead>
+                          <Tr>
+                            {activeColumns.map((colDef) =>
+                              renderHeaderCell(colDef, col, currentSort, selectedAttribute, handleHeaderSortClick)
+                            )}
+                          </Tr>
+                        </Thead>
+                        <Tbody>
+                          {visibleEntries.length === 0 ? (
+                            <Tr>
+                              <Td colSpan={activeColumns.length}>
+                                <Box padding={4} style={{ textAlign: 'center' }}>
+                                  <Typography variant="pi" textColor="neutral500">
+                                    No entries in this content type match the active filter criteria.
+                                  </Typography>
+                                </Box>
+                              </Td>
+                            </Tr>
+                          ) : (
+                            visibleEntries.map((entry) => {
+                              const key = `${col.uid}${KEY_SEP}${entry.documentId}`;
+                              const isSelected = Boolean(selectedEntries[key]);
+                              const isMatch = filterOperator !== 'none' && entryMatchesFilter(entry, selectedAttribute);
+
+                              return (
+                                <Tr
+                                  key={key}
+                                  style={{
+                                    backgroundColor: isSelected
+                                      ? 'rgba(73, 69, 255, 0.14)'
+                                      : isMatch
+                                      ? 'rgba(46, 213, 115, 0.08)'
+                                      : undefined,
+                                    boxShadow: isSelected
+                                      ? 'inset 3px 0 0 0 #4945ff'
+                                      : isMatch
+                                      ? 'inset 3px 0 0 0 #2ed573'
+                                      : undefined,
+                                  }}
+                                >
+                                  {activeColumns.map((colDef) => (
+                                    <Td key={colDef.key}>
+                                      {renderCellContent(
+                                        colDef,
+                                        entry,
+                                        col,
+                                        selectedAttribute,
+                                        isMatch,
+                                        hasAttr,
+                                        isSelected,
+                                        () => toggleEntry(col.uid, entry.documentId)
+                                      )}
+                                    </Td>
+                                  ))}
+                                </Tr>
+                              );
+                            })
+                          )}
+                        </Tbody>
+                      </Table>
+                    </Box>
+
+                    {/* Server-Side Pagination & Page Size Controls */}
+                    {!col.isSingleType && (
+                      <Flex justifyContent="space-between" alignItems="center" marginTop={4} wrap="wrap" gap={3}>
+                        <Flex gap={3} alignItems="center" wrap="wrap">
+                          <Typography variant="pi" textColor="neutral600">
+                            Showing {totalEntries === 0 ? 0 : Math.min((page - 1) * pageSize + 1, totalEntries)} to {Math.min(page * pageSize, totalEntries)} of {totalEntries} entries
+                          </Typography>
+                          <Flex gap={1} alignItems="center">
+                            <Typography variant="pi" textColor="neutral600">Show:</Typography>
+                            <Box style={{ width: 80 }}>
+                              <SingleSelect
+                                size="S"
+                                value={String(pageSize)}
+                                onChange={(val) => handleCollectionPageSizeChange(col.uid, Number(val))}
+                              >
+                                <SingleSelectOption value="5">5</SingleSelectOption>
+                                <SingleSelectOption value="10">10</SingleSelectOption>
+                                <SingleSelectOption value="25">25</SingleSelectOption>
+                                <SingleSelectOption value="50">50</SingleSelectOption>
+                                <SingleSelectOption value="100">100</SingleSelectOption>
+                              </SingleSelect>
+                            </Box>
+                            <Typography variant="pi" textColor="neutral500">per page</Typography>
+                          </Flex>
+                        </Flex>
+
+                        {pageCount > 1 && (
+                          <Flex gap={2} alignItems="center">
+                            <Button
+                              variant="tertiary"
+                              size="S"
+                              disabled={page <= 1 || pageState?.loading}
+                              onClick={() => loadCollectionPage(col.uid, page - 1)}
+                            >
+                              &larr; Previous
+                            </Button>
+                            <Typography variant="pi" fontWeight="bold" textColor="neutral800">
+                              Page {page} of {pageCount}
+                            </Typography>
+                            <Button
+                              variant="tertiary"
+                              size="S"
+                              disabled={page >= pageCount || pageState?.loading}
+                              onClick={() => loadCollectionPage(col.uid, page + 1)}
+                            >
+                              Next &rarr;
+                            </Button>
+                          </Flex>
+                        )}
+                      </Flex>
+                    )}
+                  </Box>
+                );
+              })
+            )}
+          </Box>
+
+          {/* Execution Results Feedback */}
+          {updateSummary && (
+            <Box
+              padding={6}
+              background="neutral0"
+              shadow="filterShadow"
+              hasRadius
+              marginBottom={6}
+            >
+              <Typography variant="delta" tag="h2" fontWeight="semiBold" marginBottom={3}>
+                3. Execution Results
+              </Typography>
+
+              <Alert
+                title="Batch Update Completed"
+                variant={updateSummary.updatedCount > 0 ? 'success' : 'default'}
+                closeLabel="Close"
+                onClose={() => setUpdateSummary(null)}
+                marginBottom={4}
+              >
+                <Flex direction="column" alignItems="flex-start" gap={3} width="100%">
+                  <Typography variant="omega">
+                    Successfully updated <strong>{updateSummary.updatedCount}</strong> records.
+                    Skipped <strong>{updateSummary.skippedCount}</strong> records.
+                    {updateSummary.batchId && (
+                      <span>
+                        {' '}Transaction Batch ID: <code>{updateSummary.batchId}</code> (logged to audit trail).
+                      </span>
+                    )}
+                  </Typography>
+                  {updateSummary.batchId && (
+                    <Flex gap={2} marginTop={1}>
+                      <Button
+                        variant="danger-light"
+                        size="S"
+                        startIcon={<ArrowClockwise />}
+                        onClick={() => handleRollback(updateSummary.batchId!)}
+                        loading={rollingBackBatchId === updateSummary.batchId}
+                      >
+                        Rollback This Batch
+                      </Button>
+                      <Button
+                        variant="tertiary"
+                        size="S"
+                        onClick={() => setActiveTab('audit')}
+                      >
+                        View in Audit Trail &amp; Rollback History →
+                      </Button>
+                    </Flex>
+                  )}
+                </Flex>
+              </Alert>
+
+              {lastResults && lastResults.length > 0 && (
+                <Table colCount={4} rowCount={lastResults.length + 1}>
+                  <Thead>
+                    <Tr>
+                      <Th>
+                        <Typography variant="sigma">Collection</Typography>
+                      </Th>
+                      <Th>
+                        <Typography variant="sigma">Entry</Typography>
+                      </Th>
+                      <Th>
+                        <Typography variant="sigma">Status</Typography>
+                      </Th>
+                      <Th>
+                        <Typography variant="sigma">Details</Typography>
+                      </Th>
+                    </Tr>
+                  </Thead>
+                  <Tbody>
+                    {lastResults.map((res, idx) => (
+                  <Tr key={idx}>
+                    <Td>
+                      <Typography fontWeight="bold">{res.collectionName}</Typography>
+                    </Td>
+                    <Td>
+                      <Typography>{res.label}</Typography>
+                    </Td>
+                    <Td>
+                      {res.status === 'updated' && (
+                        <Badge backgroundColor="success100" textColor="success700">
+                          Updated
+                        </Badge>
+                      )}
+                      {res.status === 'skipped' && (
+                        <Badge backgroundColor="warning100" textColor="warning700">
+                          Skipped
+                        </Badge>
+                      )}
+                      {res.status === 'error' && (
+                        <Badge backgroundColor="danger100" textColor="danger700">
+                          Error
+                        </Badge>
+                      )}
+                    </Td>
+                    <Td>
+                      <Typography variant="pi" textColor="neutral700">
+                        {res.message}
+                      </Typography>
+                    </Td>
+                  </Tr>
+                ))}
+              </Tbody>
+            </Table>
+          )}
+        </Box>
+      )}
+    </>
+  )}
+
+      {/* ======================================================== */}
+      {/* TAB 2: AUDIT TRAIL & ROLLBACK HISTORY                    */}
+      {/* ======================================================== */}
+      {activeTab === 'audit' && (
+        <Box
+          padding={6}
+          background="neutral0"
+          shadow="filterShadow"
+          hasRadius
+          style={{ width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box' }}
+        >
+          <Flex justifyContent="space-between" alignItems="center" marginBottom={4}>
+            <Box>
+              <Typography variant="delta" tag="h2" fontWeight="semiBold">
+                Audit Trail &amp; Version History
+              </Typography>
+              <Typography variant="pi" textColor="neutral600">
+                Deterministic record of all batch updates, timestamps, admin authorship, and one-click rollback.
+              </Typography>
+            </Box>
+            <Button
+              variant="tertiary"
+              size="S"
+              startIcon={<ArrowClockwise />}
+              onClick={() => {
+                fetchAuditHistory();
+                fetchPendingBatches();
+              }}
+              loading={auditLoading || pendingBatchesLoading}
+            >
+              Refresh History
+            </Button>
+          </Flex>
+
+          {/* Pending Approvals & Queued Batches Section */}
+          <Box marginBottom={6} padding={5} background="neutral100" hasRadius style={{ border: '1px solid #e6e6ef' }}>
+            <Flex justifyContent="space-between" alignItems="center" marginBottom={3}>
+              <Box>
+                <Flex gap={2} alignItems="center">
+                  <Typography variant="epsilon" fontWeight="bold">
+                    Pending Approvals &amp; Queued Batches
+                  </Typography>
+                  {pendingBatches.filter((b) => b.status === 'pending_approval' || b.status === 'queued_offpeak').length > 0 && (
+                    <Badge backgroundColor="warning100" textColor="warning700">
+                      {pendingBatches.filter((b) => b.status === 'pending_approval' || b.status === 'queued_offpeak').length} Action Required
+                    </Badge>
+                  )}
+                </Flex>
+                <Typography variant="pi" textColor="neutral600">
+                  Four-Eyes Maker-Checker authorization queue and off-peak scheduled maintenance batches.
+                </Typography>
+              </Box>
+              <Button
+                variant="tertiary"
+                size="S"
+                startIcon={<ArrowClockwise />}
+                onClick={fetchPendingBatches}
+                loading={pendingBatchesLoading}
+              >
+                Refresh Queue
+              </Button>
+            </Flex>
+
+            {pendingBatches.length === 0 ? (
+              <Box padding={4} background="neutral0" hasRadius style={{ textAlign: 'center' }}>
+                <Typography variant="pi" textColor="neutral600">
+                  No batches pending approval or queued for off-peak execution.
+                </Typography>
+              </Box>
+            ) : (
+              <Box className="bulk-updater-table-container" style={{ width: '100%', maxWidth: '100%', minWidth: 0, overflowX: 'auto' }}>
+                <Table colCount={6} rowCount={pendingBatches.length + 1} style={{ width: '100%' }}>
+                  <Thead>
+                    <Tr>
+                      <Th style={{ minWidth: 160 }}><Typography variant="sigma">Batch ID &amp; Created</Typography></Th>
+                      <Th style={{ minWidth: 130 }}><Typography variant="sigma">Maker</Typography></Th>
+                      <Th style={{ minWidth: 200 }}><Typography variant="sigma">Target Details</Typography></Th>
+                      <Th style={{ minWidth: 150 }}><Typography variant="sigma">Status</Typography></Th>
+                      <Th style={{ minWidth: 180 }}><Typography variant="sigma">Notes</Typography></Th>
+                      <Th style={{ minWidth: 180, textAlign: 'right' }}><Typography variant="sigma">Actions</Typography></Th>
+                    </Tr>
+                  </Thead>
+                  <Tbody>
+                    {pendingBatches.map((batch) => (
+                      <Tr key={batch.id}>
+                        <Td>
+                          <Typography fontWeight="bold">{batch.id}</Typography>
+                          <Typography variant="pi" textColor="neutral600" display="block">
+                            {new Date(batch.createdAt).toLocaleString()}
+                          </Typography>
+                        </Td>
+                        <Td>
+                          <Typography variant="omega">{batch.createdBy?.email || 'admin'}</Typography>
+                        </Td>
+                        <Td>
+                          <Typography variant="omega" fontWeight="semiBold">
+                            {batch.summary.attribute}: "{formatDisplayValue(batch.summary.value)}"
+                          </Typography>
+                          <Flex gap={1} alignItems="center" marginTop={1}>
+                            <Badge
+                              backgroundColor={batch.summary.publishOnApproval === false ? 'warning100' : 'success100'}
+                              textColor={batch.summary.publishOnApproval === false ? 'warning700' : 'success700'}
+                            >
+                              {batch.summary.publishOnApproval === false ? 'DRAFT ONLY' : 'AUTO-PUBLISH'}
+                            </Badge>
+                            <Typography variant="pi" textColor="neutral600">
+                              • {batch.summary.totalTargets} records across {Object.keys(batch.summary.collectionBreakdown || {}).length} collections
+                            </Typography>
+                          </Flex>
+                        </Td>
+                        <Td>
+                          {batch.status === 'pending_approval' && (
+                            <Badge backgroundColor="warning100" textColor="warning700">
+                              PENDING CHECKER APPROVAL
+                            </Badge>
+                          )}
+                          {batch.status === 'queued_offpeak' && (
+                            <Badge backgroundColor="primary100" textColor="primary700">
+                              QUEUED OFF-PEAK ({batch.scheduledFor || '18:00'})
+                            </Badge>
+                          )}
+                          {batch.status === 'approved' && (
+                            <Badge backgroundColor="success100" textColor="success700">
+                              APPROVED
+                            </Badge>
+                          )}
+                          {batch.status === 'rejected' && (
+                            <Badge backgroundColor="danger100" textColor="danger700">
+                              REJECTED
+                            </Badge>
+                          )}
+                          {batch.status === 'executed' && (
+                            <Badge backgroundColor="neutral200" textColor="neutral700">
+                              EXECUTED
+                            </Badge>
+                          )}
+                        </Td>
+                        <Td>
+                          <Typography variant="pi" textColor="neutral700">
+                            {batch.makerNotes || '—'}
+                            {batch.approval?.rejectionReason && (
+                              <span style={{ color: '#d9534f', display: 'block' }}>
+                                Rejection Reason: {batch.approval.rejectionReason}
+                              </span>
+                            )}
+                          </Typography>
+                        </Td>
+                        <Td style={{ textAlign: 'right' }}>
+                          <Flex gap={2} justifyContent="flex-end">
+                            {batch.status === 'pending_approval' && (
+                              <>
+                                <Button
+                                  size="S"
+                                  variant="success-light"
+                                  onClick={() => handleApproveBatch(batch.id)}
+                                  loading={approvingBatchId === batch.id}
+                                >
+                                  Approve &amp; Execute
+                                </Button>
+                                <Button
+                                  size="S"
+                                  variant="danger-light"
+                                  onClick={() => handleRejectBatch(batch.id)}
+                                  loading={rejectingBatchId === batch.id}
+                                >
+                                  Reject
+                                </Button>
+                              </>
+                            )}
+                            {batch.status === 'queued_offpeak' && (
+                              <Button
+                                size="S"
+                                variant="default"
+                                onClick={() => handleExecuteNow(batch.id)}
+                                loading={executingNowBatchId === batch.id}
+                              >
+                                Run Now
+                              </Button>
+                            )}
+                          </Flex>
+                        </Td>
+                      </Tr>
+                    ))}
+                  </Tbody>
+                </Table>
+              </Box>
+            )}
+          </Box>
+
+          {auditNotice && (
+            <Alert variant="warning" title="Audit Configuration Status" marginBottom={4}>
+              {auditNotice}
+            </Alert>
+          )}
+
+          {auditHistory.length === 0 && !auditLoading && (
+            <Box padding={8} background="neutral100" hasRadius style={{ textAlign: 'center' }}>
+              <Typography variant="beta" textColor="neutral600">
+                No batch operations recorded in the audit trail yet.
+              </Typography>
+              <Typography variant="pi" textColor="neutral500" display="block" marginTop={2}>
+                When you execute a bulk update in the editor, its transactional diff will be logged here.
+              </Typography>
+            </Box>
+          )}
+
+          {auditHistory.length > 0 && (
+            <Box className="bulk-updater-table-container" style={{ width: '100%', maxWidth: '100%', minWidth: 0, overflowX: 'auto' }}>
+              <Table colCount={6} rowCount={auditHistory.length + 1} style={{ width: '100%' }}>
+                <Thead>
+                  <Tr>
+                    <Th style={{ minWidth: 140 }}>
+                      <Typography variant="sigma">Date &amp; Time</Typography>
+                    </Th>
+                    <Th style={{ minWidth: 130 }}>
+                      <Typography variant="sigma">Performed By</Typography>
+                    </Th>
+                    <Th style={{ minWidth: 160 }}>
+                      <Typography variant="sigma">Attribute &amp; Value</Typography>
+                    </Th>
+                    <Th style={{ minWidth: 90 }}>
+                      <Typography variant="sigma">Impact</Typography>
+                    </Th>
+                    <Th style={{ minWidth: 120 }}>
+                      <Typography variant="sigma">Status</Typography>
+                    </Th>
+                    <Th style={{ minWidth: 160, textAlign: 'right' }}>
+                      <Typography variant="sigma">Actions</Typography>
+                    </Th>
+                  </Tr>
+                </Thead>
+                <Tbody>
+                  {auditHistory.map((rec) => {
+                    const isExpanded = expandedDiffBatchId === rec.batchId;
+                    const dateStr = new Date(rec.executedAt).toLocaleString();
+
+                    return (
+                      <React.Fragment key={rec.batchId}>
+                        <Tr
+                          style={{
+                            backgroundColor: rec.isRolledBack ? 'rgba(255, 255, 255, 0.04)' : undefined,
+                            opacity: rec.isRolledBack ? 0.85 : 1,
+                          }}
+                        >
+                          <Td style={{ minWidth: 140 }}>
+                            <Typography fontWeight="semiBold">{dateStr}</Typography>
+                            <Typography variant="pi" textColor="neutral500" display="block" style={{ wordBreak: 'break-all' }}>
+                              Batch ID: {rec.batchId}
+                            </Typography>
+                          </Td>
+                          <Td style={{ minWidth: 130 }}>
+                            <Typography fontWeight="semiBold">{rec.userName}</Typography>
+                            <Typography variant="pi" textColor="neutral500" display="block" style={{ wordBreak: 'break-all' }}>
+                              {rec.userEmail}
+                            </Typography>
+                          </Td>
+                          <Td style={{ minWidth: 160 }}>
+                            <Typography
+                              style={{
+                                display: 'inline-block',
+                                maxWidth: '100%',
+                                overflow: 'hidden',
+                                textOverflow: 'ellipsis',
+                                whiteSpace: 'nowrap',
+                              }}
+                              title={`${rec.attribute} → "${formatDisplayValue(rec.value)}"`}
+                            >
+                              <strong>{rec.attribute}</strong> &rarr; &ldquo;{formatDisplayValue(rec.value)}&rdquo;
+                            </Typography>
+                          </Td>
+                          <Td style={{ minWidth: 90, whiteSpace: 'nowrap' }}>
+                            <Badge backgroundColor="success100" textColor="success700">
+                              {rec.updatedCount} updated
+                            </Badge>
+                            {rec.skippedCount > 0 && (
+                              <Badge backgroundColor="warning100" textColor="warning700" style={{ marginLeft: 6 }}>
+                                {rec.skippedCount} skipped
+                              </Badge>
+                            )}
+                          </Td>
+                          <Td style={{ minWidth: 120 }}>
+                            {rec.isRolledBack ? (
+                              <Box>
+                                <Badge backgroundColor="neutral200" textColor="neutral700">
+                                  ROLLED BACK
+                                </Badge>
+                                {rec.rolledBackAt && (
+                                  <Typography variant="pi" textColor="neutral500" display="block" style={{ wordBreak: 'break-word', marginTop: 2 }}>
+                                    {new Date(rec.rolledBackAt).toLocaleTimeString()} by {rec.rolledBackBy || 'Admin'}
+                                  </Typography>
+                                )}
+                              </Box>
+                            ) : (
+                              <Badge backgroundColor="success100" textColor="success700">
+                                ACTIVE (APPLIED)
+                              </Badge>
+                            )}
+                          </Td>
+                          <Td style={{ minWidth: 160, textAlign: 'right', whiteSpace: 'nowrap' }}>
+                            <Flex gap={2} justifyContent="flex-end">
+                              <Button
+                                variant="tertiary"
+                                size="S"
+                                onClick={() =>
+                                  setExpandedDiffBatchId(isExpanded ? null : rec.batchId)
+                                }
+                              >
+                                {isExpanded ? 'Hide Diffs' : 'View Diffs'}
+                              </Button>
+                              {!rec.isRolledBack && (
+                                <Button
+                                  variant="danger"
+                                  size="S"
+                                  loading={rollingBackBatchId === rec.batchId}
+                                  onClick={() => handleRollback(rec.batchId)}
+                                >
+                                  Rollback
+                                </Button>
+                              )}
+                            </Flex>
+                          </Td>
+                        </Tr>
+
+                        {/* Expandable Diffs Breakdown */}
+                        {isExpanded && (
+                          <Tr>
+                            <Td colSpan={6} style={{ background: 'rgba(0, 0, 0, 0.06)', padding: 16 }}>
+                              <Box
+                                className="bulk-updater-table-container"
+                                padding={3}
+                                background="neutral0"
+                                hasRadius
+                                borderStyle="solid"
+                                borderWidth="1px"
+                                borderColor="neutral200"
+                                style={{ width: '100%', maxWidth: '100%', minWidth: 0, overflowX: 'auto' }}
+                              >
+                                <Typography variant="delta" fontWeight="bold" marginBottom={2}>
+                                  Detailed Before/After Snapshots for Batch {rec.batchId}:
+                                </Typography>
+                                <Table colCount={4} rowCount={rec.diffs.length + 1}>
+                                  <Thead>
+                                    <Tr>
+                                      <Th><Typography variant="sigma">Collection</Typography></Th>
+                                      <Th><Typography variant="sigma">Document / Entry</Typography></Th>
+                                      <Th><Typography variant="sigma">Previous Value</Typography></Th>
+                                      <Th><Typography variant="sigma">Applied Value</Typography></Th>
+                                    </Tr>
+                                  </Thead>
+                                  <Tbody>
+                                    {rec.diffs.map((d, dIdx) => (
+                                      <Tr key={dIdx}>
+                                        <Td><Typography fontWeight="semiBold">{d.collectionName}</Typography></Td>
+                                        <Td><Typography>{d.label}</Typography></Td>
+                                        <Td><Typography textColor="danger600">{formatDisplayValue(d.oldValue)}</Typography></Td>
+                                        <Td><Typography textColor="success600">{formatDisplayValue(d.newValue)}</Typography></Td>
+                                      </Tr>
+                                    ))}
+                                  </Tbody>
+                                </Table>
+                              </Box>
+                            </Td>
+                          </Tr>
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
+                </Tbody>
+              </Table>
+            </Box>
+          )}
+        </Box>
+      )}
+
+      {/* Confirmation Modal */}
+      {showConfirmModal && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(20, 20, 30, 0.65)',
+            backdropFilter: 'blur(2px)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 9999,
+            padding: 16,
+            boxSizing: 'border-box',
+            overflowY: 'auto',
+          }}
+          onClick={() => setShowConfirmModal(false)}
+        >
+          <Box
+            background="neutral0"
+            hasRadius
+            shadow="popupShadow"
+            style={{
+              maxWidth: 680,
+              width: '100%',
+              maxHeight: 'calc(100vh - 48px)',
+              display: 'flex',
+              flexDirection: 'column',
+              overflow: 'hidden',
+              position: 'relative',
+              boxShadow: '0 24px 48px rgba(0, 0, 0, 0.32), 0 0 1px rgba(0, 0, 0, 0.2)',
+            }}
+            onClick={(e: React.MouseEvent) => e.stopPropagation()}
+          >
+            {/* Modal Header - Fixed Top */}
+            <Box
+              padding={5}
+              background="neutral100"
+              style={{
+                borderBottom: '1px solid rgba(120, 120, 150, 0.2)',
+                flexShrink: 0,
+              }}
+            >
+              <Flex justifyContent="space-between" alignItems="center">
+                <Box>
+                  <Typography variant="delta" fontWeight="bold">
+                    Confirm Bulk Update
+                  </Typography>
+                  <Typography variant="pi" textColor="neutral600" display="block">
+                    Review target attributes, affected counts, and server execution policy before proceeding.
+                  </Typography>
+                </Box>
+                <Badge
+                  backgroundColor={license?.tier === 'enterprise' ? 'primary100' : 'neutral200'}
+                  textColor={license?.tier === 'enterprise' ? 'primary700' : 'neutral700'}
+                >
+                  {license?.tier === 'enterprise' ? 'ENTERPRISE 4-EYES' : 'STANDARD'}
+                </Badge>
+              </Flex>
+            </Box>
+
+            {/* Modal Body - Smooth Scrollable Middle */}
+            <Box
+              padding={5}
+              style={{
+                flex: '1 1 auto',
+                minHeight: 0,
+                overflowY: 'auto',
+                WebkitOverflowScrolling: 'touch',
+              }}
+            >
+              {/* Target Summary */}
+              <Box padding={4} background="neutral100" hasRadius marginBottom={4}>
+                <Typography variant="sigma" textColor="neutral600" marginBottom={2} display="block">
+                  UPDATE DETAILS
+                </Typography>
+                <Flex direction="column" gap={2}>
+                  <Flex justifyContent="space-between">
+                    <Typography fontWeight="semiBold">Target Attribute:</Typography>
+                    <Badge backgroundColor="primary100" textColor="primary700">
+                      {selectedAttribute}
+                    </Badge>
+                  </Flex>
+                  <Flex justifyContent="space-between" alignItems="center">
+                    <Typography fontWeight="semiBold">Target Value:</Typography>
+                    <Typography variant="omega" style={{ wordBreak: 'break-all', maxWidth: 360 }}>
+                      {relationsMeta[selectedAttribute] ? (
+                        <span>
+                          {selectedRelationDocId === '__clear__' ? (
+                            <Badge backgroundColor="danger100" textColor="danger700">Clear / Unlink Relation</Badge>
+                          ) : (
+                            <Badge backgroundColor="secondary100" textColor="secondary700">
+                              {relationsMeta[selectedAttribute].isMulti ? `[${relationMode.toUpperCase()}] ` : ''}
+                              {relationOptions.find((o) => o.documentId === selectedRelationDocId)?.label || selectedRelationDocId || '(none selected)'}
+                            </Badge>
+                          )}
+                        </span>
+                      ) : useRegex ? (
+                        <span>
+                          Replace <code>/{regexPattern}/g</code> with <strong>"{attributeValue}"</strong>
+                        </span>
+                      ) : (
+                        <strong>"{attributeValue || '(empty string)'}"</strong>
+                      )}
+                    </Typography>
+                  </Flex>
+                  <Flex justifyContent="space-between">
+                    <Typography fontWeight="semiBold">Total Selected Records:</Typography>
+                    <Typography fontWeight="bold" textColor="primary600">
+                      {totalSelectedCount} records
+                    </Typography>
+                  </Flex>
+                  <Flex justifyContent="space-between" alignItems="center">
+                    <Typography fontWeight="semiBold">Publishing Mode:</Typography>
+                    <Badge
+                      backgroundColor={publishOnApproval ? 'success100' : 'warning100'}
+                      textColor={publishOnApproval ? 'success700' : 'warning700'}
+                    >
+                      {publishOnApproval ? 'Publish Immediately' : 'Keep as Draft'}
+                    </Badge>
+                  </Flex>
+                </Flex>
+              </Box>
+
+              {/* Collections Breakdown */}
+              <Box marginBottom={4}>
+                <Typography variant="sigma" textColor="neutral600" marginBottom={2} display="block">
+                  COLLECTION BREAKDOWN
+                </Typography>
+                <Flex direction="column" gap={1}>
+                  {Object.entries(getSelectedBreakdown()).map(([name, count]) => (
+                    <Flex
+                      key={name}
+                      justifyContent="space-between"
+                      padding={2}
+                      background="neutral100"
+                      hasRadius
+                      style={{ border: '1px solid rgba(120, 120, 150, 0.15)' }}
+                    >
+                      <Typography variant="omega">{name}</Typography>
+                      <Badge backgroundColor="neutral200" textColor="neutral800">
+                        {count} {count === 1 ? 'record' : 'records'}
+                      </Badge>
+                    </Flex>
+                  ))}
+                </Flex>
+              </Box>
+
+              {/* Developer Server Execution Window Policy */}
+              <Box padding={4} hasRadius marginBottom={4} background={executionWindow?.isBusinessHours ? 'warning100' : 'success100'}>
+                <Flex direction="column" gap={1}>
+                  <Flex gap={2} alignItems="center">
+                    <Typography fontWeight="bold" textColor={executionWindow?.isBusinessHours ? 'warning700' : 'success700'}>
+                      {executionWindow?.isBusinessHours ? '⏰ Peak Business Hours Restriction Active' : '✅ Server Off-Peak Window Active'}
+                    </Typography>
+                  </Flex>
+                  <Typography variant="pi" textColor={executionWindow?.isBusinessHours ? 'warning700' : 'success700'}>
+                    {executionWindow?.policyMessage || (executionWindow?.isBusinessHours
+                      ? 'Server policy restricts bulk updates during peak business hours (09:00 - 18:00). Direct execution is paused to preserve API throughput.'
+                      : 'Currently outside peak business hours. Direct execution is permitted.')}
+                  </Typography>
+                </Flex>
+              </Box>
+
+              {/* Publish Immediately vs Keep as Draft Option */}
+              <Box
+                padding={4}
+                background="neutral100"
+                hasRadius
+                marginBottom={4}
+                style={{ border: '1px solid rgba(120, 120, 150, 0.15)' }}
+              >
+                <Flex gap={3} alignItems="flex-start">
+                  <Checkbox
+                    name="publishOnApproval"
+                    checked={publishOnApproval}
+                    onCheckedChange={(checked: boolean) => setPublishOnApproval(Boolean(checked))}
+                  />
+                  <Box style={{ cursor: 'pointer' }} onClick={() => setPublishOnApproval(!publishOnApproval)}>
+                    <Typography fontWeight="bold" display="block">
+                      Publish immediately upon checker approval / execution
+                    </Typography>
+                    <Typography variant="pi" textColor="neutral600">
+                      When checked (default), content types with Draft &amp; Publish enabled will have their updated documents published immediately upon execution. When unchecked, changes remain in Draft for further editorial review.
+                    </Typography>
+                  </Box>
+                </Flex>
+              </Box>
+
+              {/* Notes / Release Ticket (Maker Notes) */}
+              <Box marginBottom={2}>
+                <TextInput
+                  label="Change Request / Release Notes (Optional)"
+                  name="makerNotes"
+                  placeholder="e.g. REL-4021: Updating summer pricing & promo attributes"
+                  value={makerNotesInput}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setMakerNotesInput(e.target.value)}
+                />
+              </Box>
+            </Box>
+
+            {/* Modal Footer - Fixed Sticky Bottom CTAs */}
+            <Box
+              padding={4}
+              background="neutral100"
+              style={{
+                borderTop: '1px solid rgba(120, 120, 150, 0.2)',
+                flexShrink: 0,
+                position: 'sticky',
+                bottom: 0,
+                zIndex: 20,
+                boxShadow: '0 -4px 16px rgba(0, 0, 0, 0.08)',
+              }}
+            >
+              <Flex justifyContent="space-between" alignItems="center" gap={3} style={{ width: '100%' }}>
+                <Button variant="tertiary" size="M" onClick={() => setShowConfirmModal(false)}>
+                  Cancel
+                </Button>
+                <Flex gap={2} wrap="wrap" justifyContent="flex-end" alignItems="center">
+                  {/* Enterprise Maker-Checker Button */}
+                  {(license?.tier === 'enterprise' || license?.features?.includes('Maker-Checker Approval Workflow (4-Eyes Principle)')) && (
+                    <Button
+                      variant={executionWindow?.isBusinessHours ? 'default' : 'secondary'}
+                      size="M"
+                      onClick={() => executeBatchWithMode('maker_checker')}
+                      loading={updating}
+                    >
+                      Submit for Checker Approval
+                    </Button>
+                  )}
+
+                  {/* Scheduled Off-Peak Queue or Immediate Button */}
+                  {executionWindow?.isBusinessHours ? (
+                    <>
+                      <Button
+                        variant={license?.tier === 'enterprise' ? 'secondary' : 'default'}
+                        size="M"
+                        onClick={() => executeBatchWithMode('queue_offpeak')}
+                        loading={updating}
+                      >
+                        Queue for Off-Peak ({executionWindow?.offPeakStartTime || '18:00'})
+                      </Button>
+                      <Button
+                        variant="danger-light"
+                        size="S"
+                        onClick={() => executeBatchWithMode('immediate', true)}
+                        loading={updating}
+                      >
+                        Force Run Now
+                      </Button>
+                    </>
+                  ) : (
+                    <Button
+                      variant="default"
+                      size="M"
+                      onClick={() => executeBatchWithMode('immediate')}
+                      loading={updating}
+                    >
+                      Confirm &amp; Execute Now
+                    </Button>
+                  )}
+                </Flex>
+              </Flex>
+            </Box>
+          </Box>
+        </div>
+      )}
+    </Box>
+  );
+};
+
+export default BulkUpdater;
