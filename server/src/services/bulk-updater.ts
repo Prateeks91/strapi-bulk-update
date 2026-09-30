@@ -590,10 +590,21 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
         const configuredCollections = strapi.config.get(
           'plugin::bulk-updater.collections'
-        ) as string[] | undefined;
+        ) as string[] | string | undefined;
+
+        const isWildcard =
+          configuredCollections === '*' ||
+          configuredCollections === 'all' ||
+          (Array.isArray(configuredCollections) &&
+            (configuredCollections.includes('*') || configuredCollections.includes('all')));
 
         let targetUids: string[];
-        if (configuredCollections && Array.isArray(configuredCollections) && configuredCollections.length > 0) {
+        if (
+          !isWildcard &&
+          configuredCollections &&
+          Array.isArray(configuredCollections) &&
+          configuredCollections.length > 0
+        ) {
           targetUids = configuredCollections.filter((uid) => uid in allContentTypes);
         } else {
           targetUids = Object.keys(allContentTypes).filter(
