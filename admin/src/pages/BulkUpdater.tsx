@@ -18,7 +18,9 @@ import {
   Th,
   Td,
 } from '@strapi/design-system';
-import { Play, ArrowClockwise, Check } from '@strapi/icons';
+import { Play, ArrowClockwise, Check, Download } from '@strapi/icons';
+import ValidationRulesTab from './ValidationRulesTab';
+import CsvManagerTab from './CsvManagerTab';
 
 interface Entry {
   id: number | string;
@@ -54,12 +56,6 @@ interface CollectionPageState {
   pageCount: number;
   entries: Entry[];
   loading: boolean;
-}
-
-interface LicenseStatus {
-  isPro: boolean;
-  tier: 'free' | 'pro' | 'enterprise';
-  features: string[];
 }
 
 interface UpdateResult {
@@ -382,19 +378,19 @@ const BulkUpdater: React.FC = () => {
   const { get, post } = useFetchClient();
   const { toggleNotification } = useNotification();
 
-  // Active view tab: 'editor' | 'audit' (synced with ?tab= query param)
-  const getInitialTab = (): 'editor' | 'audit' => {
+  // Active view tab: 'editor' | 'audit' | 'rules' | 'csv' (synced with ?tab= query param)
+  const getInitialTab = (): 'editor' | 'audit' | 'rules' | 'csv' => {
     try {
       const params = new URLSearchParams(window.location.search);
       const t = params.get('tab');
-      if (t === 'audit' || t === 'editor') return t;
+      if (t === 'audit' || t === 'editor' || t === 'rules' || t === 'csv') return t as any;
     } catch {}
     return 'editor';
   };
 
-  const [activeTab, setActiveTabState] = useState<'editor' | 'audit'>(getInitialTab);
+  const [activeTab, setActiveTabState] = useState<'editor' | 'audit' | 'rules' | 'csv'>(getInitialTab);
 
-  const setActiveTab = (tab: 'editor' | 'audit') => {
+  const setActiveTab = (tab: 'editor' | 'audit' | 'rules' | 'csv') => {
     setActiveTabState(tab);
     try {
       const url = new URL(window.location.href);
@@ -407,7 +403,6 @@ const BulkUpdater: React.FC = () => {
   const [updating, setUpdating] = useState<boolean>(false);
   const [attributes, setAttributes] = useState<string[]>([]);
   const [collections, setCollections] = useState<CollectionModel[]>([]);
-  const [license, setLicense] = useState<LicenseStatus | null>(null);
   const [auditEnabled, setAuditEnabled] = useState<boolean>(false);
 
   // Execution Window & Maker-Checker State
@@ -527,7 +522,6 @@ const BulkUpdater: React.FC = () => {
         setAttributes(res.data.attributes || []);
         const cols: CollectionModel[] = res.data.collections || [];
         setCollections(cols);
-        setLicense(res.data.license || null);
         setAuditEnabled(Boolean(res.data.auditEnabled));
         if (res.data.executionWindow) {
           setExecutionWindow(res.data.executionWindow);
@@ -932,14 +926,6 @@ const BulkUpdater: React.FC = () => {
       return;
     }
 
-    if (useRegex && !license?.isPro) {
-      toggleNotification({
-        type: 'warning',
-        message: 'Regex replacement is a Pro feature. Please activate your license in Settings.',
-      });
-      return;
-    }
-
     const totalSelected = Object.values(selectedEntries).filter(Boolean).length;
     if (totalSelected === 0) {
       toggleNotification({
@@ -1224,12 +1210,6 @@ const BulkUpdater: React.FC = () => {
               <Typography variant="alpha" tag="h1" fontWeight="bold">
                 Bulk Attribute Updater
               </Typography>
-              <Badge
-                backgroundColor={license?.isPro ? 'success100' : 'neutral200'}
-                textColor={license?.isPro ? 'success700' : 'neutral700'}
-              >
-                {license?.isPro ? `${license.tier.toUpperCase()} EDITION` : 'COMMUNITY EDITION'}
-              </Badge>
               {auditEnabled && (
                 <Badge backgroundColor="secondary100" textColor="secondary700">
                   AUDIT &amp; ROLLBACK ACTIVE
@@ -1278,6 +1258,20 @@ const BulkUpdater: React.FC = () => {
             ) : (
               ''
             )}
+          </Button>
+          <Button
+            variant={activeTab === 'rules' ? 'default' : 'tertiary'}
+            onClick={() => setActiveTab('rules')}
+            size="M"
+          >
+            Validation &amp; Quota Rules
+          </Button>
+          <Button
+            variant={activeTab === 'csv' ? 'default' : 'tertiary'}
+            onClick={() => setActiveTab('csv')}
+            size="M"
+          >
+            CSV Import / Export &amp; Override
           </Button>
         </Flex>
 
@@ -1484,12 +1478,6 @@ const BulkUpdater: React.FC = () => {
                   >
                     <Typography fontWeight="bold">Enable Regex Find &amp; Replace</Typography>
                   </Checkbox>
-                  <Badge
-                    backgroundColor={license?.isPro ? 'success100' : 'warning100'}
-                    textColor={license?.isPro ? 'success700' : 'warning700'}
-                  >
-                    {license?.isPro ? 'PRO UNLOCKED' : 'PRO FEATURE'}
-                  </Badge>
                 </Flex>
                 {useRegex && (
                   <Box style={{ flex: 1, minWidth: 240 }}>
@@ -1499,18 +1487,10 @@ const BulkUpdater: React.FC = () => {
                       onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
                         setRegexPattern(e.target.value)
                       }
-                      disabled={!license?.isPro}
                     />
                   </Box>
                 )}
               </Flex>
-              {!license?.isPro && useRegex && (
-                <Box marginTop={2}>
-                  <Typography variant="pi" textColor="warning700">
-                    Regex replacement is locked to Pro license holders. Visit Settings &gt; Bulk Updater to activate your key.
-                  </Typography>
-                </Box>
-              )}
             </Box>
 
             {/* Selected Attribute Context Hint */}
@@ -1900,6 +1880,51 @@ const BulkUpdater: React.FC = () => {
                           onClick={() => setOpenColumnPickerUid(openColumnPickerUid === col.uid ? null : col.uid)}
                         >
                           Columns ({activeColumns.filter((c) => !c.isPermanent).length}/{availableColumns.filter((c) => !c.isPermanent).length})
+                        </Button>
+
+                        <Button
+                          variant="tertiary"
+                          size="S"
+                          startIcon={<Download />}
+                          onClick={async () => {
+                            try {
+                              const params = new URLSearchParams();
+                              if (selectedAttribute) params.set('attribute', selectedAttribute);
+                              if (filterOperator && filterOperator !== 'none') {
+                                params.set('filterOperator', filterOperator);
+                                if (filterQuery) params.set('filterQuery', filterQuery);
+                              }
+                              const res = await get(`/bulk-updater/csv/export/${col.uid}?${params.toString()}`);
+                              const csvStr = res.data?.csvContent || (typeof res.data === 'string' ? res.data : '');
+                              if (!csvStr) {
+                                toggleNotification({
+                                  type: 'warning',
+                                  message: 'No CSV content returned for this collection',
+                                });
+                                return;
+                              }
+                              const blob = new Blob([csvStr], { type: 'text/csv;charset=utf-8;' });
+                              const url = URL.createObjectURL(blob);
+                              const link = document.createElement('a');
+                              link.href = url;
+                              link.setAttribute('download', `${col.singularName || 'export'}_entries.csv`);
+                              document.body.appendChild(link);
+                              link.click();
+                              document.body.removeChild(link);
+                              URL.revokeObjectURL(url);
+                              toggleNotification({
+                                type: 'success',
+                                message: `Exported ${col.displayName} entries to CSV`,
+                              });
+                            } catch (e: any) {
+                              toggleNotification({
+                                type: 'danger',
+                                message: e.message || 'Failed exporting CSV',
+                              });
+                            }
+                          }}
+                        >
+                          Export CSV
                         </Button>
 
                         <Typography variant="pi" textColor="neutral500">
@@ -2578,6 +2603,16 @@ const BulkUpdater: React.FC = () => {
         </Box>
       )}
 
+      {/* Tab 3: Validation & Quota Rules */}
+      {activeTab === 'rules' && (
+        <ValidationRulesTab />
+      )}
+
+      {/* Tab 4: CSV Import / Export & Override */}
+      {activeTab === 'csv' && (
+        <CsvManagerTab />
+      )}
+
       {/* Confirmation Modal */}
       {showConfirmModal && (
         <div
@@ -2630,12 +2665,6 @@ const BulkUpdater: React.FC = () => {
                     Review target attributes, affected counts, and server execution policy before proceeding.
                   </Typography>
                 </Box>
-                <Badge
-                  backgroundColor={license?.tier === 'enterprise' ? 'primary100' : 'neutral200'}
-                  textColor={license?.tier === 'enterprise' ? 'primary700' : 'neutral700'}
-                >
-                  {license?.tier === 'enterprise' ? 'ENTERPRISE 4-EYES' : 'STANDARD'}
-                </Badge>
               </Flex>
             </Box>
 
@@ -2797,23 +2826,21 @@ const BulkUpdater: React.FC = () => {
                   Cancel
                 </Button>
                 <Flex gap={2} wrap="wrap" justifyContent="flex-end" alignItems="center">
-                  {/* Enterprise Maker-Checker Button */}
-                  {(license?.tier === 'enterprise' || license?.features?.includes('Maker-Checker Approval Workflow (4-Eyes Principle)')) && (
-                    <Button
-                      variant={executionWindow?.isBusinessHours ? 'default' : 'secondary'}
-                      size="M"
-                      onClick={() => executeBatchWithMode('maker_checker')}
-                      loading={updating}
-                    >
-                      Submit for Checker Approval
-                    </Button>
-                  )}
+                  {/* Maker-Checker Button */}
+                  <Button
+                    variant={executionWindow?.isBusinessHours ? 'default' : 'secondary'}
+                    size="M"
+                    onClick={() => executeBatchWithMode('maker_checker')}
+                    loading={updating}
+                  >
+                    Submit for Checker Approval
+                  </Button>
 
                   {/* Scheduled Off-Peak Queue or Immediate Button */}
                   {executionWindow?.isBusinessHours ? (
                     <>
                       <Button
-                        variant={license?.tier === 'enterprise' ? 'secondary' : 'default'}
+                        variant="secondary"
                         size="M"
                         onClick={() => executeBatchWithMode('queue_offpeak')}
                         loading={updating}

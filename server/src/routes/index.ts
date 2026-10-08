@@ -68,30 +68,6 @@ export default {
       },
       {
         method: 'GET',
-        path: '/license',
-        handler: 'license.getStatus',
-        config: {
-          policies: [],
-        },
-      },
-      {
-        method: 'POST',
-        path: '/license/verify',
-        handler: 'license.verify',
-        config: {
-          policies: [],
-        },
-      },
-      {
-        method: 'POST',
-        path: '/license/deactivate',
-        handler: 'license.deactivate',
-        config: {
-          policies: [],
-        },
-      },
-      {
-        method: 'GET',
         path: '/audit/history',
         handler: 'audit.getHistory',
         config: {
@@ -102,6 +78,78 @@ export default {
         method: 'POST',
         path: '/audit/:batchId/rollback',
         handler: 'audit.rollback',
+        config: {
+          policies: [],
+        },
+      },
+      {
+        method: 'GET',
+        path: '/validation-rules',
+        handler: 'validationRules.getRules',
+        config: {
+          policies: [],
+        },
+      },
+      {
+        method: 'POST',
+        path: '/validation-rules',
+        handler: 'validationRules.saveRule',
+        config: {
+          policies: [],
+        },
+      },
+      {
+        method: 'DELETE',
+        path: '/validation-rules/:id',
+        handler: 'validationRules.deleteRule',
+        config: {
+          policies: [],
+        },
+      },
+      {
+        method: 'POST',
+        path: '/validation-rules/:id/toggle',
+        handler: 'validationRules.toggleRule',
+        config: {
+          policies: [],
+        },
+      },
+      {
+        method: 'GET',
+        path: '/validation-rules/:id/scan',
+        handler: 'validationRules.scanViolations',
+        config: {
+          policies: [],
+        },
+      },
+      {
+        method: 'GET',
+        path: '/csv/template/:uid',
+        handler: 'csv.getTemplate',
+        config: {
+          policies: [],
+        },
+      },
+      {
+        method: 'GET',
+        path: '/csv/export/:uid',
+        handler: 'csv.exportCollection',
+        config: {
+          policies: [],
+        },
+      },
+      {
+        method: 'GET',
+        path: '/csv/export-violations/:ruleId',
+        handler: 'csv.exportViolations',
+        config: {
+          policies: [],
+        },
+      },
+      {
+        method: 'POST',
+        path: '/csv/import',
+        handler: 'csv.importCsv',
         config: {
           policies: [],
         },

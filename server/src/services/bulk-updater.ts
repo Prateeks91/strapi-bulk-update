@@ -256,15 +256,7 @@ async function executeBatchInternal(
     throw new Error('Attribute name is required.');
   }
 
-  const licenseService = strapi.plugin('bulk-updater').service('license');
-  const license = await licenseService.getLicenseStatus();
 
-  // Check Pro feature gating
-  if (isRegex && !license.isPro) {
-    throw new Error(
-      'Regex find & replace is a Pro feature. Please activate a Pro license in Plugin Settings.'
-    );
-  }
 
   const targetsMap = new Map<string, { uid: string; documentId: string }>();
 
@@ -742,24 +734,19 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         }
       }
 
-      // Get license status
-      const licenseService = strapi.plugin('bulk-updater').service('license');
-      const license = await licenseService.getLicenseStatus();
-
       const executionConfig = getExecutionWindowConfig(strapi);
       const windowStatus = checkBusinessHours(executionConfig);
       const pendingCount = Array.from(pendingBatches.values()).filter(
         (b) => b.status === 'pending_approval' || b.status === 'queued_offpeak'
       ).length;
 
-      const etag = `W/"models-${crypto.createHash('md5').update(`${signatures.join('|')}:${license.tier}:${pendingCount}:${windowStatus.isBusinessHours}:${windowStatus.currentServerTime}:${windowStatus.timeZone}`).digest('hex')}"`;
+      const etag = `W/"models-${crypto.createHash('md5').update(`${signatures.join('|')}:${pendingCount}:${windowStatus.isBusinessHours}:${windowStatus.currentServerTime}:${windowStatus.timeZone}`).digest('hex')}"`;
 
       return {
         success: true,
         attributes: staticSchemaCache.attributes,
         collections,
         relationsMeta: staticSchemaCache.relationsMeta,
-        license,
         executionWindow: {
           ...executionConfig,
           ...windowStatus,
@@ -1014,10 +1001,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       if (!attribute) {
         throw new Error('Attribute name is required.');
       }
-
-      const licenseService = strapi.plugin('bulk-updater').service('license');
-      const license = await licenseService.getLicenseStatus();
-      const isEnterprise = license.tier === 'enterprise';
 
       const executionConfig = getExecutionWindowConfig(strapi);
       const { isBusinessHours, policyMessage } = checkBusinessHours(executionConfig);

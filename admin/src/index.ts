@@ -19,7 +19,7 @@ export default {
       id: `${PLUGIN_ID}-settings`,
       intlLabel: {
         id: `${PLUGIN_ID}.settings.name`,
-        defaultMessage: 'Bulk Updater License',
+        defaultMessage: 'Bulk Updater Settings',
       },
       to: `${PLUGIN_ID}`,
       Component: () => import('./pages/SettingsPage'),
@@ -29,6 +29,23 @@ export default {
     app.registerPlugin({
       id: PLUGIN_ID,
       name: PLUGIN_ID,
+    });
+
+    app.customFields.register({
+      name: 'scoped-select',
+      pluginId: PLUGIN_ID,
+      type: 'string',
+      intlLabel: {
+        id: `${PLUGIN_ID}.scoped-select.label`,
+        defaultMessage: 'Scoped Quota Select',
+      },
+      intlDescription: {
+        id: `${PLUGIN_ID}.scoped-select.description`,
+        defaultMessage: 'Dropdown with dynamic cross-component usage quota enforcement',
+      },
+      components: {
+        Input: async () => import('./components/ScopedQuotaSelectInput'),
+      },
     });
   },
   bootstrap(app: any) {},

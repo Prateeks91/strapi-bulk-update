@@ -1,0 +1,92 @@
+import type { Core } from '@strapi/strapi';
+
+export default ({ strapi }: { strapi: Core.Strapi }) => ({
+  async getTemplate(ctx: any) {
+    try {
+      const { uid } = ctx.params;
+      const csvService = strapi.plugin('bulk-updater').service('csv');
+      const result = await csvService.getTemplateCsv(uid);
+      ctx.body = {
+        success: true,
+        filename: result.filename,
+        csvContent: result.csvContent,
+        headers: result.headers,
+      };
+    } catch (err: any) {
+      ctx.status = 500;
+      ctx.body = { success: false, error: err.message };
+    }
+  },
+
+  async exportCollection(ctx: any) {
+    try {
+      const { uid } = ctx.params;
+      const { search, attribute, filterOperator, filterQuery, limit } = ctx.query;
+      const csvService = strapi.plugin('bulk-updater').service('csv');
+      const result = await csvService.exportCollectionCsv(uid, {
+        search: search ? String(search) : undefined,
+        attribute: attribute ? String(attribute) : undefined,
+        filterOperator: filterOperator ? String(filterOperator) : undefined,
+        filterQuery: filterQuery !== undefined ? String(filterQuery) : undefined,
+        limit: limit ? Number(limit) : undefined,
+      });
+
+      ctx.body = {
+        success: true,
+        filename: result.filename,
+        csvContent: result.csvContent,
+        count: result.count,
+      };
+    } catch (err: any) {
+      ctx.status = 500;
+      ctx.body = { success: false, error: err.message };
+    }
+  },
+
+  async exportViolations(ctx: any) {
+    try {
+      const { ruleId } = ctx.params;
+      const csvService = strapi.plugin('bulk-updater').service('csv');
+      const result = await csvService.exportViolationsCsv(ruleId);
+
+      ctx.body = {
+        success: true,
+        filename: result.filename,
+        csvContent: result.csvContent,
+        count: result.count,
+        ruleName: result.ruleName,
+      };
+    } catch (err: any) {
+      ctx.status = 500;
+      ctx.body = { success: false, error: err.message };
+    }
+  },
+
+  async importCsv(ctx: any) {
+    try {
+      const { uid, csvText, mode, publish } = ctx.request.body;
+      if (!uid) {
+        ctx.status = 400;
+        ctx.body = { success: false, error: 'Target collection UID is required.' };
+        return;
+      }
+      if (!csvText || typeof csvText !== 'string') {
+        ctx.status = 400;
+        ctx.body = { success: false, error: 'CSV content is required.' };
+        return;
+      }
+
+      const csvService = strapi.plugin('bulk-updater').service('csv');
+      const result = await csvService.importCsv(uid, csvText, {
+        mode: mode === 'create_or_override' ? 'create_or_override' : 'update',
+        publish: publish !== false,
+        user: ctx.state.user,
+      });
+
+      ctx.body = result;
+    } catch (err: any) {
+      ctx.status = 500;
+      ctx.body = { success: false, error: err.message };
+    }
+  },
+});

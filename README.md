@@ -54,9 +54,9 @@ Strapi allows editing entries individually or applying bulk actions within a sin
   - **Tier 2 (Strapi Enterprise Bridge)**: Bridges events directly to native Strapi Enterprise Audit Logs (`admin::audit-logs`).
   - **Tier 3 (Custom Declarative Schema)**: Custom collection types and declarative column mappings.
   - **Deterministic Rollback**: Restores exact prior values and relationship links using Strapi v5 Document Service.
+- 🎯 **UI-Configurable Cross-Component Validation & Quotas**: Real-time cross-component quota enforcement (e.g. max one H1 heading across dynamic zones) configurable straight from the admin UI.
 - 🌓 **Adaptive Light & Dark Theme Design**: Built with native `@strapi/design-system` tokens with high-contrast text and sticky viewport-constrained modals.
 - ⚡ **Zero-Infra Strapi Cloud Ready**: In-memory caching, pod-level high-watermark ETags, zero external Redis/SQL requirements.
-- 💎 **Pro Monetization Tier**: License key activation, Regex Find & Replace within attributes, and priority SLA.
 
 ---
 
@@ -183,26 +183,37 @@ npm run develop
 
 ---
 
-## 💎 Monetization & License Tiers
+## 🎯 UI-Configurable Validation & Quota Rules & Legacy Violation Scanner
 
-| Feature | Community (Free) | Pro / Enterprise Tier |
-| :--- | :---: | :---: |
-| Dynamic schema & attribute introspection | ✅ | ✅ |
-| Cross-collection selection | ✅ | ✅ |
-| Conditional schema validation & skip safety | ✅ | ✅ |
-| Live execution report | ✅ | ✅ |
-| Draft & Publish control | ✅ | ✅ |
-| Per-collection column visibility | ✅ | ✅ |
-| Relational field bulk updates | ✅ | ✅ |
-| 3-Tier Audit Trail & Rollback | ✅ | ✅ |
-| Enterprise Maker-Checker flow | ✅ | ✅ |
-| Timezone-aware off-peak scheduling | ✅ | ✅ |
-| **Regex Find & Replace within attributes** | ❌ | ✅ |
-| **Audit log export (CSV / JSON)** | ❌ | ✅ |
-| **Commercial License & Priority SLA** | ❌ | ✅ |
+Define dynamic semantic constraints across components and dynamic zones right from the Strapi UI:
 
-### License Activation
-Enter your license key in **Settings > Bulk Updater License** to unlock Pro features.
+- Navigate to **Bulk Attribute Updater > Validation & Quota Rules** or **Settings > Bulk Updater Settings**.
+- Click **Create Rule**.
+- Set **Rule Name**, **Target Field Identifier** (e.g. `headingLevel`), and configure **Option Quotas** (e.g. `h1` = 1, `h2` = 3).
+- Toggle rules on/off or delete them at any time. Rules take effect immediately in both the Strapi Admin content editing form and backend Document Service create/update validations.
+- **Legacy Violation Scanner**:
+  - Click **Scan Violations** on any active rule card to instantly audit all existing legacy entries across target content types.
+  - Review non-compliant records and exact violation reasons (e.g. `Found 2 occurrences of "h1", exceeds quota limit of 1`).
+  - Click **Export Violations (CSV)** directly from the modal to take the affected records offline for correction or batch re-import.
+
+---
+
+## 📊 CSV Export / Import & Override Engine
+
+For high-volume operations or legacy data remediation, the plugin includes a full-featured CSV Management Center:
+
+1. **Direct Workspace Export**:
+   - On the primary workspace table, click the **Export CSV** button on any collection card to download the currently filtered view directly to your workstation.
+2. **Dedicated CSV Manager Tab**:
+   - Switch to the **CSV Import / Export** tab in the plugin header.
+   - Select any registered collection type.
+   - **Download Template**: Get a ready-to-use CSV file pre-populated with all schema column headers.
+   - **Export All Records**: Download the complete dataset with a single click.
+   - **Export Violations**: Filter and export only records violating a selected Validation Rule.
+3. **Flexible Import Modes**:
+   - **Update Existing Records (`documentId` matching)**: Match entries by `documentId` and selectively update specific scalar fields and relation references without touching other attributes.
+   - **Add / Override Multiple Records**: Insert fresh records in bulk directly from your spreadsheet without requiring pre-existing IDs.
+   - **Dry-Run Audit**: Real-time validation audit shows total rows parsed, records updated vs created, and immediate error reporting before committing to the database.
 
 ---
 
@@ -221,9 +232,15 @@ All routes are mounted under `/bulk-updater` and protected by Strapi Admin authe
 | `POST` | `/bulk-updater/pending-batches/:id/execute` | Executes an approved or off-peak queued batch. |
 | `GET` | `/bulk-updater/audit/history` | Fetches audit log history and diffs. |
 | `POST` | `/bulk-updater/audit/:batchId/rollback` | Rolls back a batch to its prior state. |
-| `GET` | `/bulk-updater/license` | Checks current license status. |
-| `POST` | `/bulk-updater/license/verify` | Activates and verifies a Pro license key. |
-| `POST` | `/bulk-updater/license/deactivate` | Deactivates an active Pro license key. |
+| `GET` | `/bulk-updater/validation-rules` | Retrieves all UI-configured validation and quota rules. |
+| `POST` | `/bulk-updater/validation-rules` | Creates or updates a validation and quota rule. |
+| `DELETE` | `/bulk-updater/validation-rules/:id` | Deletes a validation rule. |
+| `POST` | `/bulk-updater/validation-rules/:id/toggle` | Toggles rule active status. |
+| `POST` | `/bulk-updater/validation-rules/:id/scan` | Scans all existing records in target content types for violations. |
+| `GET` | `/bulk-updater/csv/template/:uid` | Generates a blank CSV template with content type headers. |
+| `GET` | `/bulk-updater/csv/export/:uid` | Exports all records for a collection type as CSV. |
+| `GET` | `/bulk-updater/csv/export-violations/:ruleId` | Exports only records violating the specified rule as CSV. |
+| `POST` | `/bulk-updater/csv/import` | Parses and applies or inserts records from uploaded CSV data. |
 
 ---
 

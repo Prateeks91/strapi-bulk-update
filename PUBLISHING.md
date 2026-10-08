@@ -107,13 +107,13 @@ npm publish --access public
 Once pushed and published, create a Git tag and GitHub release:
 
 ```bash
-git tag -a v1.0.0 -m "Release v1.0.0: Initial release of Strapi Bulk Attribute & Relation Updater"
-git push origin v1.0.0
+git tag -a v1.1.0 -m "Release v1.1.0: Cross-Component Quotas, Legacy Violation Scanner, and CSV Export/Import Engine"
+git push origin v1.1.0
 ```
 
 1. Go to [https://github.com/Prateeks91/strapi-bulk-update/releases/new](https://github.com/Prateeks91/strapi-bulk-update/releases/new).
-2. Select tag `v1.0.0`.
-3. Title: `v1.0.0 - Mass Attribute & Relation Updates for Strapi v5`
+2. Select tag `v1.1.0`.
+3. Title: `v1.1.0 - Validation Quotas, Violation Scanner & CSV Management Engine`
 4. Paste the feature highlights from `README.md`.
 5. Click **Publish release**.
 
