@@ -177,12 +177,26 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     const attrs = ct.attributes || {};
     const excluded = ['createdBy', 'updatedBy', 'localizations'];
 
-    // Discover exportable scalar fields
+    // Discover exportable scalar and component fields
     const exportFields: string[] = ['documentId'];
+    const compFieldsToPopulate: string[] = [];
     for (const [attrName, attrDef] of Object.entries(attrs) as any[]) {
       if (excluded.includes(attrName)) continue;
-      if (['component', 'dynamiczone', 'media'].includes(attrDef.type)) continue;
-      if (attrDef.type === 'relation') continue;
+      if (['dynamiczone', 'media', 'relation'].includes(attrDef.type)) continue;
+      if (attrDef.type === 'component') {
+        if (!attrDef.repeatable && attrDef.component) {
+          const comp = strapi.components[attrDef.component];
+          if (comp?.attributes) {
+            compFieldsToPopulate.push(attrName);
+            for (const [subKey, subDef] of Object.entries(comp.attributes) as any[]) {
+              if (excluded.includes(subKey)) continue;
+              if (['component', 'dynamiczone', 'media', 'relation'].includes(subDef.type)) continue;
+              exportFields.push(`${attrName}.${subKey}`);
+            }
+          }
+        }
+        continue;
+      }
       exportFields.push(attrName);
     }
 
@@ -233,10 +247,15 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       }
     }
 
+    const populateOption = compFieldsToPopulate.length > 0
+      ? compFieldsToPopulate.reduce((acc, k) => ({ ...acc, [k]: true }), {})
+      : undefined;
+
     const entries = await strapi.documents(uid as any).findMany({
       filters: Object.keys(filters).length > 0 ? filters : undefined,
       limit: options.limit || 5000,
       sort: { createdAt: 'desc' },
+      populate: populateOption,
     });
 
     const lines: string[] = [];
@@ -244,7 +263,14 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
     for (const entry of (entries || []) as any[]) {
       const rowValues = exportFields.map((field) => {
-        return escapeCsvValue(entry[field]);
+        let val: any;
+        if (field.includes('.')) {
+          const [parent, child] = field.split('.');
+          val = entry[parent]?.[child];
+        } else {
+          val = entry[field];
+        }
+        return escapeCsvValue(val);
       });
       lines.push(rowValues.join(','));
     }
@@ -355,6 +381,31 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       // Transform and cast row columns to schema field types
       for (const [key, rawVal] of Object.entries(row)) {
         if (key === 'documentId' || key === 'id') continue;
+
+        if (key.includes('.')) {
+          const [parent, child] = key.split('.');
+          const parentDef = attrs[parent];
+          if (parentDef?.type === 'component' && !parentDef.repeatable && parentDef.component) {
+            const comp = strapi.components[parentDef.component];
+            const childDef = comp?.attributes?.[child];
+            if (childDef) {
+              if (!payload[parent]) payload[parent] = {};
+              let val: any = rawVal;
+              if (rawVal === '' || rawVal === null || rawVal === undefined) {
+                val = null;
+              } else if (childDef.type === 'integer' || childDef.type === 'biginteger') {
+                val = parseInt(rawVal, 10);
+              } else if (childDef.type === 'float' || childDef.type === 'decimal') {
+                val = parseFloat(rawVal);
+              } else if (childDef.type === 'boolean') {
+                val = rawVal.toLowerCase() === 'true' || rawVal === '1';
+              }
+              payload[parent][child] = val;
+            }
+          }
+          continue;
+        }
+
         const attrDef = attrs[key];
         if (!attrDef) continue; // Skip unknown columns
 
@@ -412,9 +463,16 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             continue;
           }
 
+          const mergedPayload = { ...payload };
+          for (const key of Object.keys(payload)) {
+            if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
+              mergedPayload[key] = { ...((existing as any)[key] || {}), ...payload[key] };
+            }
+          }
+
           await strapi.documents(uid as any).update({
             documentId: docId,
-            data: payload,
+            data: mergedPayload,
           });
 
           if (publish && ct.options?.draftAndPublish) {
@@ -445,9 +503,16 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             });
 
             if (existing) {
+              const mergedPayload = { ...payload };
+              for (const key of Object.keys(payload)) {
+                if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
+                  mergedPayload[key] = { ...((existing as any)[key] || {}), ...payload[key] };
+                }
+              }
+
               await strapi.documents(uid as any).update({
                 documentId: docId,
-                data: payload,
+                data: mergedPayload,
               });
 
               if (publish && ct.options?.draftAndPublish) {

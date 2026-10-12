@@ -332,12 +332,41 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             rollbackPayload = item.oldValue;
           }
 
-          await strapi.documents(item.uid as any).update({
-            documentId: item.documentId,
-            data: {
-              [item.attribute]: rollbackPayload,
-            },
-          });
+          if (item.attribute.includes('.')) {
+            const [parentKey, childKey] = item.attribute.split('.');
+            const ct = strapi.contentTypes[item.uid];
+            if (ct?.attributes?.[parentKey]?.type === 'component') {
+              const currentDoc: any = await strapi.documents(item.uid as any).findOne({
+                documentId: item.documentId,
+                populate: [parentKey],
+              });
+              const currentParent = currentDoc?.[parentKey] || {};
+              const restoredParent = {
+                ...currentParent,
+                [childKey]: rollbackPayload,
+              };
+              await strapi.documents(item.uid as any).update({
+                documentId: item.documentId,
+                data: {
+                  [parentKey]: restoredParent,
+                },
+              });
+            } else {
+              await strapi.documents(item.uid as any).update({
+                documentId: item.documentId,
+                data: {
+                  [item.attribute]: rollbackPayload,
+                },
+              });
+            }
+          } else {
+            await strapi.documents(item.uid as any).update({
+              documentId: item.documentId,
+              data: {
+                [item.attribute]: rollbackPayload,
+              },
+            });
+          }
 
           const ct = strapi.contentTypes[item.uid];
           if (ct?.options?.draftAndPublish) {
@@ -349,7 +378,10 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           }
 
           try {
-            strapi.plugin('bulk-updater').service('bulkUpdater').invalidateCollectionCache(item.uid);
+            const bulkService = strapi.plugin('bulk-updater').service('bulkUpdater');
+            if (bulkService?.invalidateCache) {
+              bulkService.invalidateCache(item.uid);
+            }
           } catch {}
 
           revertedCount++;

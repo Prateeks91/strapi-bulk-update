@@ -322,10 +322,81 @@ async function executeBatchInternal(
           currentEntry?.email ||
           `Entry #${target.documentId}`;
 
+        const isNested = attribute.includes('.');
+        let isComponentNested = false;
+        let parentKey = '';
+        let childKey = '';
+
+        if (isNested) {
+          const parts = attribute.split('.');
+          parentKey = parts[0];
+          childKey = parts[1];
+          const parentAttrDef = contentType?.attributes?.[parentKey];
+          if (parentAttrDef?.type === 'component' && !parentAttrDef.repeatable && parentAttrDef.component) {
+            const compSchema = strapi.components[parentAttrDef.component];
+            if (compSchema?.attributes?.[childKey]) {
+              isComponentNested = true;
+            }
+          }
+        }
+
         const attrDef = contentType?.attributes?.[attribute];
-        const hasAttribute = Boolean(attrDef);
+        const hasAttribute = Boolean(attrDef) || isComponentNested;
 
         if (hasAttribute) {
+          if (isComponentNested) {
+            // Retrieve current component state with populate for safe deep merge
+            const currentEntryWithPopulate: any = await strapi.documents(target.uid as any).findOne({
+              documentId: target.documentId,
+              populate: [parentKey],
+            });
+            const existingParent = currentEntryWithPopulate?.[parentKey] || {};
+            const currentVal = existingParent?.[childKey];
+
+            let newValue = value;
+            if (regexObj && typeof currentVal === 'string') {
+              newValue = currentVal.replace(regexObj, value);
+            }
+
+            const updatedParent = {
+              ...existingParent,
+              [childKey]: newValue,
+            };
+
+            await strapi.documents(target.uid as any).update({
+              documentId: target.documentId,
+              data: {
+                [parentKey]: updatedParent,
+              },
+            });
+
+            // If publishOnApproval is true and content type has draftAndPublish enabled, publish the document
+            const isDraftAndPublishComp = Boolean(contentType?.options?.draftAndPublish);
+            if (publishOnApproval && isDraftAndPublishComp) {
+              try {
+                await (strapi.documents(target.uid as any) as any).publish({
+                  documentId: target.documentId,
+                });
+              } catch (publishErr) {
+                strapi.log.warn(`[bulk-updater] Failed to auto-publish ${target.uid}/${target.documentId}:`, publishErr);
+              }
+            }
+
+            invalidateCollectionCache(target.uid);
+
+            return {
+              uid: target.uid,
+              collectionName: displayName,
+              documentId: target.documentId,
+              label: entryLabel,
+              attribute,
+              oldValue: currentVal ?? null,
+              newValue,
+              status: 'updated' as const,
+              message: `Successfully updated nested field ${attribute}`,
+            };
+          }
+
           if (attrDef.type === 'relation') {
             const isMulti = attrDef.relation === 'oneToMany' || attrDef.relation === 'manyToMany';
 
@@ -618,9 +689,27 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           const rawAttrs = contentType.attributes || {};
           const relationsByAttr: Record<string, RelationMeta> = {};
 
+          const nestedComponentAttrs: string[] = [];
+
           const validAttrs = Object.keys(rawAttrs).filter((attrKey) => {
             if (systemFields.includes(attrKey)) return false;
-            if (rawAttrs[attrKey].type === 'component' || rawAttrs[attrKey].type === 'dynamiczone') return false;
+            if (rawAttrs[attrKey].type === 'dynamiczone') return false;
+
+            if (rawAttrs[attrKey].type === 'component') {
+              const compDef = rawAttrs[attrKey];
+              // Support non-repeatable components
+              if (!compDef.repeatable && compDef.component) {
+                const componentSchema = strapi.components[compDef.component];
+                if (componentSchema && componentSchema.attributes) {
+                  for (const [subKey, subAttr] of Object.entries(componentSchema.attributes) as any[]) {
+                    if (systemFields.includes(subKey)) continue;
+                    if (['component', 'dynamiczone', 'relation'].includes(subAttr.type)) continue;
+                    nestedComponentAttrs.push(`${attrKey}.${subKey}`);
+                  }
+                }
+              }
+              return false;
+            }
 
             if (rawAttrs[attrKey].type === 'relation') {
               const rel = rawAttrs[attrKey];
@@ -643,7 +732,8 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
             return true;
           });
 
-          validAttrs.forEach((attr) => allAttributesSet.add(attr));
+          const allColAttrs = [...validAttrs, ...nestedComponentAttrs];
+          allColAttrs.forEach((attr) => allAttributesSet.add(attr));
 
           metaByUid[uid] = {
             uid,
@@ -652,7 +742,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
             singularName: contentType.info?.singularName || uid,
             pluralName: contentType.info?.pluralName || uid,
             displayName: contentType.info?.displayName || uid,
-            attributes: validAttrs,
+            attributes: allColAttrs,
             relations: relationsByAttr,
           };
         }
@@ -687,10 +777,13 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           let entries: any[] = [];
           let totalCount = 0;
           try {
+            const ctAttrs = allContentTypes[uid]?.attributes || {};
             const relKeys = Object.keys(meta.relations || {});
-            const populateOption = relKeys.length > 0
-              ? relKeys.reduce((acc, k) => ({ ...acc, [k]: true }), {})
-              : undefined;
+            const compKeys = Object.keys(ctAttrs).filter((k) => ctAttrs[k].type === 'component');
+            const populateOptionObj: Record<string, any> = {};
+            relKeys.forEach((k) => { populateOptionObj[k] = true; });
+            compKeys.forEach((k) => { populateOptionObj[k] = true; });
+            const populateOption = Object.keys(populateOptionObj).length > 0 ? populateOptionObj : undefined;
 
             if (meta.isSingleType) {
               const singleDoc: any = await (strapi.documents(uid as any) as any).findFirst({
@@ -789,7 +882,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         throw new Error(`Collection with UID "${uid}" does not exist.`);
       }
 
-      const limit = Math.min(Math.max(Number(pageSize) || 10, 1), 100);
+      const limit = Math.min(Math.max(Number(pageSize) || 10, 1), 500);
       const currentPage = Math.max(Number(page) || 1, 1);
       const start = (currentPage - 1) * limit;
 
@@ -812,8 +905,132 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
       let result: any;
 
+      // Build database filters pushdown
+      const filters: Record<string, any> = {};
+
+      const attrs = contentType.attributes || {};
+      let colHasAttribute = false;
+      let isNestedAttr = false;
+      let parentKey = '';
+      let childKey = '';
+
+      if (attribute) {
+        if (attribute.includes('.')) {
+          [parentKey, childKey] = attribute.split('.');
+          if (attrs[parentKey]?.type === 'component' && !attrs[parentKey].repeatable && attrs[parentKey].component) {
+            const compSchema = strapi.components[attrs[parentKey].component];
+            if (compSchema?.attributes?.[childKey]) {
+              colHasAttribute = true;
+              isNestedAttr = true;
+            }
+          }
+        } else if (attrs[attribute]) {
+          colHasAttribute = true;
+        }
+      }
+
+      const normOp = (filterOperator || '').toLowerCase().replace(/_/g, '');
+
+      // If a specific attribute filter is active, check if the collection actually has the attribute
+      if (normOp && normOp !== 'none') {
+        if (!colHasAttribute) {
+          // Collection does not possess this attribute: return 0 matching entries
+          result = {
+            uid,
+            displayName: contentType.info?.displayName || uid,
+            isSingleType,
+            entries: [],
+            pagination: {
+              page: 1,
+              pageSize: limit,
+              total: 0,
+              pageCount: 0,
+            },
+          };
+          queryCache.set(cacheKey, { signature, data: result, timestamp: Date.now() });
+          return { ...result, cached: false, etag };
+        }
+
+        let condition: any = undefined;
+        const q = (filterQuery || '').trim();
+
+        if (normOp === 'empty') {
+          condition = { $or: [{ $null: true }, { $eq: '' }] };
+        } else if (normOp === 'notempty') {
+          condition = { $and: [{ $notNull: true }, { $ne: '' }] };
+        } else if (q !== '') {
+          switch (normOp) {
+            case 'equals':
+              condition = { $containsi: q };
+              break;
+            case 'notequals':
+              condition = { $notContainsi: q };
+              break;
+            case 'contains':
+              condition = { $containsi: q };
+              break;
+            case 'notcontains':
+              condition = { $notContainsi: q };
+              break;
+            case 'startswith':
+              condition = { $startsWith: q };
+              break;
+            case 'endswith':
+              condition = { $endsWith: q };
+              break;
+          }
+        }
+
+        if (condition !== undefined) {
+          if (isNestedAttr) {
+            filters[parentKey] = {
+              [childKey]: condition,
+            };
+          } else {
+            if (normOp === 'empty') {
+              filters.$or = [
+                { [attribute]: { $null: true } },
+                { [attribute]: { $eq: '' } },
+              ];
+            } else if (normOp === 'notempty') {
+              filters[attribute] = { $notNull: true, $ne: '' };
+            } else {
+              filters[attribute] = condition;
+            }
+          }
+        }
+      }
+
+      if (search && search.trim() !== '') {
+        const q = search.trim();
+        const searchableAttrs = Object.keys(attrs).filter((k) =>
+          ['string', 'text', 'email', 'uid'].includes(attrs[k]?.type)
+        );
+
+        if (searchableAttrs.length > 0) {
+          const orList = searchableAttrs.slice(0, 6).map((k) => ({
+            [k]: { $containsi: q },
+          }));
+
+          if (Object.keys(filters).length > 0) {
+            const existingFilters = { ...filters };
+            Object.keys(filters).forEach((k) => delete filters[k]);
+            filters.$and = [existingFilters, { $or: orList }];
+          } else {
+            filters.$or = orList;
+          }
+        }
+      }
+
       if (isSingleType) {
-        const singleDoc: any = await (strapi.documents(uid as any) as any).findFirst();
+        let singleDoc: any = null;
+        try {
+          singleDoc = await (strapi.documents(uid as any) as any).findFirst({
+            filters: Object.keys(filters).length > 0 ? filters : undefined,
+          });
+        } catch {
+          singleDoc = null;
+        }
         result = {
           uid,
           displayName: contentType.info?.displayName || uid,
@@ -827,65 +1044,26 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           },
         };
       } else {
-        // Build database filters pushdown
-        const filters: Record<string, any> = {};
 
-        if (attribute && filterOperator && filterQuery !== undefined && filterQuery !== '') {
-          switch (filterOperator) {
-            case 'equals':
-              filters[attribute] = { $eq: filterQuery };
-              break;
-            case 'notEquals':
-              filters[attribute] = { $ne: filterQuery };
-              break;
-            case 'contains':
-              filters[attribute] = { $containsi: filterQuery };
-              break;
-            case 'notContains':
-              filters[attribute] = { $notContainsi: filterQuery };
-              break;
-            case 'startsWith':
-              filters[attribute] = { $startsWith: filterQuery };
-              break;
-            case 'endsWith':
-              filters[attribute] = { $endsWith: filterQuery };
-              break;
-            case 'empty':
-              filters[attribute] = { $null: true };
-              break;
-            case 'notEmpty':
-              filters[attribute] = { $notNull: true };
-              break;
+        const sortClause: any = {};
+        if (sortField && sortField.includes('.')) {
+          const [parent, child] = sortField.split('.');
+          if (contentType.attributes?.[parent]?.type === 'component') {
+            sortClause[parent] = { [child]: sortOrder };
+          } else {
+            sortClause['createdAt'] = 'desc';
           }
-        }
-
-        if (search && search.trim() !== '') {
-          const stringAttrs = Object.keys(contentType.attributes || {}).filter(
-            (k) =>
-              contentType.attributes[k].type === 'string' ||
-              contentType.attributes[k].type === 'text' ||
-              contentType.attributes[k].type === 'email'
-          );
-
-          if (stringAttrs.length > 0) {
-            filters.$or = stringAttrs.slice(0, 5).map((attr) => ({
-              [attr]: { $containsi: search.trim() },
-            }));
-          }
-        }
-
-        const sortClause: Record<string, 'asc' | 'desc'> = {};
-        if (sortField && contentType.attributes?.[sortField]) {
+        } else if (sortField && contentType.attributes?.[sortField]) {
           sortClause[sortField] = sortOrder;
         } else {
           sortClause['createdAt'] = 'desc';
         }
 
-        const relationAttrs = Object.keys(contentType.attributes || {}).filter(
-          (k) => contentType.attributes[k].type === 'relation'
+        const populateAttrs = Object.keys(contentType.attributes || {}).filter(
+          (k) => contentType.attributes[k].type === 'relation' || contentType.attributes[k].type === 'component'
         );
-        const populateOption = relationAttrs.length > 0
-          ? relationAttrs.reduce((acc, k) => ({ ...acc, [k]: true }), {})
+        const populateOption = populateAttrs.length > 0
+          ? populateAttrs.reduce((acc, k) => ({ ...acc, [k]: true }), {})
           : undefined;
 
         const [entries, totalEntries] = await Promise.all([
@@ -1291,6 +1469,10 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         modelsCache.clear();
         staticSchemaCache = null;
       }
+    },
+
+    invalidateCollectionCache(uid: string) {
+      invalidateCollectionCache(uid);
     },
   };
 };

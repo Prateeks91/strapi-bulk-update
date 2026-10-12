@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { useFetchClient, useNotification } from '@strapi/strapi/admin';
 import {
   Box,
@@ -143,6 +143,15 @@ export interface ColumnDef {
 }
 
 /**
+ * Safely resolves a nested dot-notation property (e.g. "defaultSeo.metaDescription")
+ */
+export function getNestedValue(obj: any, path: string): any {
+  if (!obj || !path) return undefined;
+  if (!path.includes('.')) return obj[path];
+  return path.split('.').reduce((acc, part) => (acc && typeof acc === 'object' ? acc[part] : undefined), obj);
+}
+
+/**
  * Flat helper: Generates the list of available columns for a given collection model.
  * Zero deep nesting: returns a flat array of ColumnDef.
  */
@@ -171,7 +180,9 @@ export function getAvailableColumnsForCollection(
     if (attr === 'name' || attr === 'title' || attr === selectedAttribute) {
       return;
     }
-    const formattedLabel = attr.charAt(0).toUpperCase() + attr.slice(1);
+    const formattedLabel = attr.includes('.')
+      ? attr.split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ')
+      : attr.charAt(0).toUpperCase() + attr.slice(1);
     cols.push({
       key: `attr_${attr}`,
       label: formattedLabel,
@@ -316,7 +327,7 @@ function renderCellContent(
     }
 
     case 'target_attr': {
-      const val = entry[selectedAttribute];
+      const val = getNestedValue(entry, selectedAttribute);
       const displayStr = formatDisplayValue(val);
       const isUnset = displayStr === '(empty / not set)' || displayStr === '(empty / unlinked)';
       return (
@@ -360,7 +371,7 @@ function renderCellContent(
 
     default: {
       const attrName = colDef.key.replace('attr_', '');
-      const rawVal = entry[attrName];
+      const rawVal = getNestedValue(entry, attrName);
       const displayStr = formatDisplayValue(rawVal);
       return (
         <Typography
@@ -450,7 +461,12 @@ const BulkUpdater: React.FC = () => {
   type FilterOperator = 'none' | 'empty' | 'not_empty' | 'equals' | 'contains' | 'starts_with';
   const [filterOperator, setFilterOperator] = useState<FilterOperator>('none');
   const [filterQuery, setFilterQuery] = useState<string>('');
-  const [hideNonMatching, setHideNonMatching] = useState<boolean>(false);
+  const [entrySearch, setEntrySearch] = useState<string>('');
+
+  const isFilterActive =
+    (filterOperator !== 'none' &&
+      (['empty', 'not_empty'].includes(filterOperator) || Boolean(filterQuery.trim()))) ||
+    Boolean(entrySearch.trim());
 
   // Result state
   const [lastResults, setLastResults] = useState<UpdateResult[] | null>(null);
@@ -575,13 +591,21 @@ const BulkUpdater: React.FC = () => {
     targetPage: number,
     customPageSize?: number,
     customSortField?: string,
-    customSortOrder?: 'asc' | 'desc'
+    customSortOrder?: 'asc' | 'desc',
+    overrideFilterOp?: FilterOperator,
+    overrideFilterQuery?: string,
+    overrideEntrySearch?: string,
+    autoSelectReturned = true
   ) => {
     const currentPageState = collectionPages[colUid];
     const size = customPageSize || currentPageState?.pageSize || defaultPageSize;
     const currentSort = collectionSorts[colUid] || { field: 'createdAt', order: 'desc' };
     const sortField = customSortField !== undefined ? customSortField : currentSort.field;
     const sortOrder = customSortOrder !== undefined ? customSortOrder : currentSort.order;
+
+    const op = overrideFilterOp !== undefined ? overrideFilterOp : filterOperator;
+    const q = overrideFilterQuery !== undefined ? overrideFilterQuery : filterQuery;
+    const s = overrideEntrySearch !== undefined ? overrideEntrySearch : entrySearch;
 
     setCollectionPages((prev) => ({
       ...prev,
@@ -597,9 +621,12 @@ const BulkUpdater: React.FC = () => {
         pageSize: String(size),
       });
       if (selectedAttribute) params.set('attribute', selectedAttribute);
-      if (filterOperator && filterOperator !== 'none') {
-        params.set('filterOperator', filterOperator);
-        if (filterQuery) params.set('filterQuery', filterQuery);
+      if (op && op !== 'none') {
+        params.set('filterOperator', op);
+        if (q) params.set('filterQuery', q);
+      }
+      if (s && s.trim()) {
+        params.set('search', s.trim());
       }
       if (sortField) {
         params.set('sortField', sortField);
@@ -607,7 +634,8 @@ const BulkUpdater: React.FC = () => {
       }
 
       const res = await get(`/bulk-updater/collections/${colUid}/entries?${params.toString()}`);
-      if (res.data && res.data.success) {
+      if (res.data && (res.data.success || res.data.entries !== undefined)) {
+        const fetchedEntries: Entry[] = res.data.entries || [];
         setCollectionPages((prev) => ({
           ...prev,
           [colUid]: {
@@ -615,10 +643,24 @@ const BulkUpdater: React.FC = () => {
             pageSize: res.data.pagination.pageSize,
             total: res.data.pagination.total,
             pageCount: res.data.pagination.pageCount,
-            entries: res.data.entries || [],
+            entries: fetchedEntries,
             loading: false,
           },
         }));
+
+        // If a filter or search is active, pre-select all returned matching entries!
+        const isFilterActiveNow =
+          (op !== 'none' && (['empty', 'not_empty'].includes(op) || Boolean(q.trim()))) ||
+          Boolean(s.trim());
+        if (isFilterActiveNow && autoSelectReturned) {
+          setSelectedEntries((prev) => {
+            const next = { ...prev };
+            fetchedEntries.forEach((e) => {
+              next[`${colUid}${KEY_SEP}${e.documentId}`] = true;
+            });
+            return next;
+          });
+        }
       }
     } catch (err: any) {
       toggleNotification({
@@ -688,6 +730,43 @@ const BulkUpdater: React.FC = () => {
     }
   }, [activeTab]);
 
+  const isInitialFilterMount = useRef(true);
+  useEffect(() => {
+    if (isInitialFilterMount.current) {
+      isInitialFilterMount.current = false;
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      if (collections.length > 0) {
+        const isFilterActiveNow =
+          (filterOperator !== 'none' &&
+            (['empty', 'not_empty'].includes(filterOperator) || Boolean(filterQuery.trim()))) ||
+          Boolean(entrySearch.trim());
+
+        if (isFilterActiveNow) {
+          setSelectedEntries({});
+        }
+
+        collections.forEach((col) => {
+          loadCollectionPage(
+            col.uid,
+            1,
+            undefined,
+            undefined,
+            undefined,
+            filterOperator,
+            filterQuery,
+            entrySearch,
+            true
+          );
+        });
+      }
+    }, 350);
+
+    return () => clearTimeout(timer);
+  }, [filterOperator, filterQuery, entrySearch]);
+
   const KEY_SEP = '@@@';
 
   // Handle attribute selection change: unchecks all existing selections if attribute changes
@@ -697,7 +776,7 @@ const BulkUpdater: React.FC = () => {
       setSelectedEntries({});
       setFilterOperator('none');
       setFilterQuery('');
-      setHideNonMatching(false);
+      setEntrySearch('');
       setSelectedRelationDocId('');
       setAttributeValue('');
 
@@ -722,7 +801,7 @@ const BulkUpdater: React.FC = () => {
   );
 
   const handleGlobalPageSizeChange = (newSize: number) => {
-    const capped = Math.min(100, Math.max(1, newSize));
+    const capped = Math.min(500, Math.max(1, newSize));
     setDefaultPageSize(capped);
     collections.forEach((col) => {
       if (!col.isSingleType) {
@@ -732,7 +811,7 @@ const BulkUpdater: React.FC = () => {
   };
 
   const handleCollectionPageSizeChange = (colUid: string, newSize: number) => {
-    const capped = Math.min(100, Math.max(1, newSize));
+    const capped = Math.min(500, Math.max(1, newSize));
     loadCollectionPage(colUid, 1, capped);
   };
 
@@ -762,7 +841,7 @@ const BulkUpdater: React.FC = () => {
   // Value filter evaluation
   const entryMatchesFilter = (entry: Entry, attr: string): boolean => {
     if (filterOperator === 'none') return true;
-    const val = entry[attr];
+    const val = getNestedValue(entry, attr);
     const displayStr = formatDisplayValue(val);
     const isValEmpty =
       val === undefined ||
@@ -790,42 +869,29 @@ const BulkUpdater: React.FC = () => {
 
   const getVisibleEntries = (col: CollectionModel) => {
     const pageState = collectionPages[col.uid];
-    const entries = pageState ? pageState.entries : (col.entries || []);
-    if (!hideNonMatching || filterOperator === 'none') {
-      return entries;
-    }
-    return entries.filter((e) => entryMatchesFilter(e, selectedAttribute));
+    return pageState ? pageState.entries : (col.entries || []);
   };
 
   const matchingEntriesCount = React.useMemo(() => {
-    if (filterOperator === 'none') return 0;
+    if (!isFilterActive) return 0;
     let count = 0;
     filteredCollections.forEach((col) => {
-      if (col.attributes.includes(selectedAttribute)) {
-        const pageState = collectionPages[col.uid];
-        const entries = pageState ? pageState.entries : (col.entries || []);
-        entries.forEach((entry) => {
-          if (entryMatchesFilter(entry, selectedAttribute)) {
-            count++;
-          }
-        });
+      const pageState = collectionPages[col.uid];
+      if (pageState) {
+        count += pageState.total;
       }
     });
     return count;
-  }, [filteredCollections, collectionPages, selectedAttribute, filterOperator, filterQuery]);
+  }, [filteredCollections, collectionPages, isFilterActive]);
 
   const selectAllMatching = () => {
     const updated = { ...selectedEntries };
     filteredCollections.forEach((col) => {
-      if (col.attributes.includes(selectedAttribute)) {
-        const pageState = collectionPages[col.uid];
-        const entries = pageState ? pageState.entries : (col.entries || []);
-        entries.forEach((e) => {
-          if (entryMatchesFilter(e, selectedAttribute)) {
-            updated[`${col.uid}${KEY_SEP}${e.documentId}`] = true;
-          }
-        });
-      }
+      const pageState = collectionPages[col.uid];
+      const entries = pageState ? pageState.entries : (col.entries || []);
+      entries.forEach((e) => {
+        updated[`${col.uid}${KEY_SEP}${e.documentId}`] = true;
+      });
     });
     setSelectedEntries(updated);
   };
@@ -833,15 +899,11 @@ const BulkUpdater: React.FC = () => {
   const deselectAllMatching = () => {
     const updated = { ...selectedEntries };
     filteredCollections.forEach((col) => {
-      if (col.attributes.includes(selectedAttribute)) {
-        const pageState = collectionPages[col.uid];
-        const entries = pageState ? pageState.entries : (col.entries || []);
-        entries.forEach((e) => {
-          if (entryMatchesFilter(e, selectedAttribute)) {
-            delete updated[`${col.uid}${KEY_SEP}${e.documentId}`];
-          }
-        });
-      }
+      const pageState = collectionPages[col.uid];
+      const entries = pageState ? pageState.entries : (col.entries || []);
+      entries.forEach((e) => {
+        delete updated[`${col.uid}${KEY_SEP}${e.documentId}`];
+      });
     });
     setSelectedEntries(updated);
   };
@@ -849,9 +911,10 @@ const BulkUpdater: React.FC = () => {
   const clearFilter = () => {
     setFilterOperator('none');
     setFilterQuery('');
-    setHideNonMatching(false);
+    setEntrySearch('');
+    setSelectedEntries({});
     collections.forEach((col) => {
-      loadCollectionPage(col.uid, 1);
+      loadCollectionPage(col.uid, 1, undefined, undefined, undefined, 'none', '', '', false);
     });
   };
 
@@ -994,6 +1057,7 @@ const BulkUpdater: React.FC = () => {
           });
 
           await fetchModels();
+          await fetchAuditHistory();
         }
       } else {
         toggleNotification({
@@ -1308,7 +1372,7 @@ const BulkUpdater: React.FC = () => {
                 ACTIVE BATCH
               </Badge>
               <Typography variant="pi" textColor="neutral700">
-                <code>{latestActiveBatch.batchId}</code> ({latestActiveBatch.recordCount} entries updated by {latestActiveBatch.userEmail})
+                <code>{latestActiveBatch.batchId}</code> ({latestActiveBatch.updatedCount} entries updated by {latestActiveBatch.userEmail})
               </Typography>
             </Flex>
             <Flex gap={2}>
@@ -1548,7 +1612,7 @@ const BulkUpdater: React.FC = () => {
               </Flex>
             </Flex>
 
-            {/* Target Value Filter Bar ("Find items by value first") */}
+            {/* Target Value Filter & Search Bar */}
             <Box
               padding={4}
               background="neutral100"
@@ -1560,30 +1624,30 @@ const BulkUpdater: React.FC = () => {
                 <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={2}>
                   <Flex gap={2} alignItems="center">
                     <Typography variant="omega" fontWeight="bold">
-                      Find Targets by Current Value:
+                      Search &amp; Filter Targets:
                     </Typography>
-                    {filterOperator !== 'none' && (
+                    {isFilterActive && (
                       <Badge backgroundColor="primary100" textColor="primary700">
-                        {matchingEntriesCount} matching {matchingEntriesCount === 1 ? 'entry' : 'entries'}
+                        {matchingEntriesCount} matching {matchingEntriesCount === 1 ? 'entry' : 'entries'} found in database
                       </Badge>
                     )}
                   </Flex>
-                  {filterOperator !== 'none' && (
+                  {isFilterActive && (
                     <Button variant="ghost" size="S" onClick={clearFilter}>
-                      Clear Filter
+                      Clear Search &amp; Filter
                     </Button>
                   )}
                 </Flex>
 
                 <Flex gap={3} alignItems="flex-end" wrap="wrap">
                   {/* Operator Select */}
-                  <Box style={{ width: 240, minWidth: 200 }}>
+                  <Box style={{ width: 220, minWidth: 180 }}>
                     <SingleSelect
                       label={`Filter condition for "${selectedAttribute}"`}
                       value={filterOperator}
                       onChange={(val) => setFilterOperator(String(val) as FilterOperator)}
                     >
-                      <SingleSelectOption value="none">Show All (No Filter)</SingleSelectOption>
+                      <SingleSelectOption value="none">Show All (No Attribute Filter)</SingleSelectOption>
                       <SingleSelectOption value="empty">Is Empty or Null</SingleSelectOption>
                       <SingleSelectOption value="not_empty">Is Not Empty</SingleSelectOption>
                       <SingleSelectOption value="equals">Equals Exact Text</SingleSelectOption>
@@ -1594,9 +1658,9 @@ const BulkUpdater: React.FC = () => {
 
                   {/* Value query input if needed */}
                   {(filterOperator === 'equals' || filterOperator === 'contains' || filterOperator === 'starts_with') && (
-                    <Box style={{ flex: 1, minWidth: 220 }}>
+                    <Box style={{ flex: 1, minWidth: 200 }}>
                       <TextInput
-                        label="Value to Search"
+                        label={`Value for "${selectedAttribute}"`}
                         placeholder="Type value to match..."
                         value={filterQuery}
                         onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFilterQuery(e.target.value)}
@@ -1604,8 +1668,18 @@ const BulkUpdater: React.FC = () => {
                     </Box>
                   )}
 
+                  {/* Full-text search across entries */}
+                  <Box style={{ flex: 1, minWidth: 200 }}>
+                    <TextInput
+                      label="Full-text Entry Search"
+                      placeholder="Search title, name, or text across records..."
+                      value={entrySearch}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setEntrySearch(e.target.value)}
+                    />
+                  </Box>
+
                   {/* Quick Action Buttons when filter is active */}
-                  {filterOperator !== 'none' && (
+                  {isFilterActive && (
                     <Flex gap={2} alignItems="center">
                       <Button
                         variant="default"
@@ -1613,7 +1687,7 @@ const BulkUpdater: React.FC = () => {
                         onClick={selectAllMatching}
                         disabled={matchingEntriesCount === 0}
                       >
-                        Select Matching ({matchingEntriesCount})
+                        Select All Loaded
                       </Button>
                       <Button
                         variant="tertiary"
@@ -1621,23 +1695,17 @@ const BulkUpdater: React.FC = () => {
                         onClick={deselectAllMatching}
                         disabled={matchingEntriesCount === 0}
                       >
-                        Deselect Matching
+                        Deselect All Loaded
                       </Button>
                     </Flex>
                   )}
                 </Flex>
 
-                {/* Filter Options: Toggle hide non-matching */}
-                {filterOperator !== 'none' && (
+                {isFilterActive && (
                   <Flex gap={2} alignItems="center" marginTop={1}>
-                    <Checkbox
-                      checked={hideNonMatching}
-                      onCheckedChange={(checked: boolean) => setHideNonMatching(Boolean(checked))}
-                    >
-                      <Typography variant="pi" textColor="neutral700">
-                        Only display matching entries in tables (hide non-matching)
-                      </Typography>
-                    </Checkbox>
+                    <Badge backgroundColor="success100" textColor="success700" size="S">
+                      ✓ Filter active: Showing only matching entries. All returned matching records are pre-selected.
+                    </Badge>
                   </Flex>
                 )}
               </Flex>
@@ -1746,9 +1814,9 @@ const BulkUpdater: React.FC = () => {
               )}
               <Flex gap={2} alignItems="center" style={{ marginLeft: 'auto' }}>
                 <Typography variant="pi" textColor="neutral600">
-                  Default page size (max 100):
+                  Default page size (max 500):
                 </Typography>
-                <Box style={{ width: 120 }}>
+                <Box style={{ width: 130 }}>
                   <SingleSelect
                     size="S"
                     value={String(defaultPageSize)}
@@ -1759,6 +1827,8 @@ const BulkUpdater: React.FC = () => {
                     <SingleSelectOption value="25">25 / page</SingleSelectOption>
                     <SingleSelectOption value="50">50 / page</SingleSelectOption>
                     <SingleSelectOption value="100">100 / page</SingleSelectOption>
+                    <SingleSelectOption value="250">250 / page</SingleSelectOption>
+                    <SingleSelectOption value="500">500 / page</SingleSelectOption>
                   </SingleSelect>
                 </Box>
               </Flex>
@@ -1894,6 +1964,9 @@ const BulkUpdater: React.FC = () => {
                                 params.set('filterOperator', filterOperator);
                                 if (filterQuery) params.set('filterQuery', filterQuery);
                               }
+                              if (entrySearch && entrySearch.trim()) {
+                                params.set('search', entrySearch.trim());
+                              }
                               const res = await get(`/bulk-updater/csv/export/${col.uid}?${params.toString()}`);
                               const csvStr = res.data?.csvContent || (typeof res.data === 'string' ? res.data : '');
                               if (!csvStr) {
@@ -1930,8 +2003,8 @@ const BulkUpdater: React.FC = () => {
                         <Typography variant="pi" textColor="neutral500">
                           {col.isSingleType
                             ? '1 single entry'
-                            : filterOperator !== 'none'
-                            ? `${matchingColCount} matching of ${totalEntries} entries`
+                            : isFilterActive
+                            ? `${totalEntries} matching entries in DB`
                             : `${totalEntries} entries`}
                         </Typography>
                       </Flex>
@@ -2020,7 +2093,7 @@ const BulkUpdater: React.FC = () => {
                             visibleEntries.map((entry) => {
                               const key = `${col.uid}${KEY_SEP}${entry.documentId}`;
                               const isSelected = Boolean(selectedEntries[key]);
-                              const isMatch = filterOperator !== 'none' && entryMatchesFilter(entry, selectedAttribute);
+                              const isMatch = isFilterActive;
 
                               return (
                                 <Tr
@@ -2065,11 +2138,11 @@ const BulkUpdater: React.FC = () => {
                       <Flex justifyContent="space-between" alignItems="center" marginTop={4} wrap="wrap" gap={3}>
                         <Flex gap={3} alignItems="center" wrap="wrap">
                           <Typography variant="pi" textColor="neutral600">
-                            Showing {totalEntries === 0 ? 0 : Math.min((page - 1) * pageSize + 1, totalEntries)} to {Math.min(page * pageSize, totalEntries)} of {totalEntries} entries
+                            Showing {totalEntries === 0 ? 0 : Math.min((page - 1) * pageSize + 1, totalEntries)} to {Math.min(page * pageSize, totalEntries)} of {totalEntries} {isFilterActive ? 'matching entries' : 'entries'}
                           </Typography>
                           <Flex gap={1} alignItems="center">
                             <Typography variant="pi" textColor="neutral600">Show:</Typography>
-                            <Box style={{ width: 80 }}>
+                            <Box style={{ width: 85 }}>
                               <SingleSelect
                                 size="S"
                                 value={String(pageSize)}
@@ -2080,10 +2153,21 @@ const BulkUpdater: React.FC = () => {
                                 <SingleSelectOption value="25">25</SingleSelectOption>
                                 <SingleSelectOption value="50">50</SingleSelectOption>
                                 <SingleSelectOption value="100">100</SingleSelectOption>
+                                <SingleSelectOption value="250">250</SingleSelectOption>
+                                <SingleSelectOption value="500">500</SingleSelectOption>
                               </SingleSelect>
                             </Box>
                             <Typography variant="pi" textColor="neutral500">per page</Typography>
                           </Flex>
+                          {totalEntries > visibleEntries.length && (
+                            <Button
+                              variant="tertiary"
+                              size="S"
+                              onClick={() => handleCollectionPageSizeChange(col.uid, Math.min(totalEntries, 500))}
+                            >
+                              Load all {totalEntries} entries
+                            </Button>
+                          )}
                         </Flex>
 
                         {pageCount > 1 && (

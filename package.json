@@ -1,6 +1,6 @@
 {
   "name": "strapi-plugin-bulk-updater",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Bulk update attributes and relationships across multiple collection types in Strapi v5 with schema validation, CSV export/import & override, legacy violation scanning, maker-checker governance, off-peak scheduling, and 3-tier audit rollback.",
   "strapi": {
     "displayName": "Bulk Attribute & Relation Updater",

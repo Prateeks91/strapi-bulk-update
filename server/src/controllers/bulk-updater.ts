@@ -49,7 +49,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         }
       }
 
-      ctx.body = data;
+      ctx.body = { success: true, ...data };
     } catch (err: any) {
       ctx.status = 500;
       ctx.body = { success: false, error: err.message };

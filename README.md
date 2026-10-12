@@ -54,7 +54,13 @@ Strapi allows editing entries individually or applying bulk actions within a sin
   - **Tier 2 (Strapi Enterprise Bridge)**: Bridges events directly to native Strapi Enterprise Audit Logs (`admin::audit-logs`).
   - **Tier 3 (Custom Declarative Schema)**: Custom collection types and declarative column mappings.
   - **Deterministic Rollback**: Restores exact prior values and relationship links using Strapi v5 Document Service.
-- 🎯 **UI-Configurable Cross-Component Validation & Quotas**: Real-time cross-component quota enforcement (e.g. max one H1 heading across dynamic zones) configurable straight from the admin UI.
+- 🧩 **Deep Nested Component Support**:
+  - Full dot-notation introspection (e.g. `metaFields.metaDescription`, `defaultSeo.metaTitle`) in attribute dropdown and table views.
+  - Non-destructive deep merging preserves sibling component properties during bulk updates and rollbacks.
+- ⚡ **Server-Side Filter & Full-Text Search Pushdown**:
+  - Pushes text searches and attribute filters (`equals`, `contains`, `empty`, `starts_with`) directly to the database.
+  - Automatically hides non-matching records and pre-selects matching rows with real-time match counters.
+  - Scalable server-side pagination up to 500 records per page with a one-click "Load all entries" button.
 - 🌓 **Adaptive Light & Dark Theme Design**: Built with native `@strapi/design-system` tokens with high-contrast text and sticky viewport-constrained modals.
 - ⚡ **Zero-Infra Strapi Cloud Ready**: In-memory caching, pod-level high-watermark ETags, zero external Redis/SQL requirements.
 
