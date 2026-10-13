@@ -43,7 +43,7 @@ export default function CsvManagerTab() {
   const [selectedRuleId, setSelectedRuleId] = useState<string>('');
 
   // Import states
-  const [importMode, setImportMode] = useState<'update' | 'create_or_override'>('update');
+  const [importMode, setImportMode] = useState<'auto' | 'update' | 'create_or_override'>('auto');
   const [publishOnImport, setPublishOnImport] = useState<boolean>(true);
   const [csvRawText, setCsvRawText] = useState<string>('');
   const [fileName, setFileName] = useState<string>('');
@@ -213,9 +213,14 @@ export default function CsvManagerTab() {
 
       if (res.data && res.data.success) {
         setImportResult(res.data);
+        const stats = res.data.stats;
+        let notifMsg = `CSV Import complete: ${stats.created} created, ${stats.updated} updated.`;
+        if (stats.newWithoutDocId && stats.newWithoutDocId > 0) {
+          notifMsg += ` (${stats.newWithoutDocId} new entries created due to omitted documentId)`;
+        }
         toggleNotification({
           type: 'success',
-          message: `CSV Import complete: ${res.data.stats.created} created, ${res.data.stats.updated} updated.`,
+          message: notifMsg,
         });
       } else {
         throw new Error(res.data?.error || 'Import failed');
@@ -348,7 +353,20 @@ export default function CsvManagerTab() {
               <Typography variant="pi" fontWeight="bold" textColor="neutral800" marginBottom={2}>
                 Operation Mode
               </Typography>
-              <Flex gap={4}>
+              <Flex gap={4} wrap="wrap">
+                <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+                  <input
+                    type="radio"
+                    name="importMode"
+                    value="auto"
+                    checked={importMode === 'auto'}
+                    onChange={() => setImportMode('auto')}
+                  />
+                  <Typography variant="omega" fontWeight={importMode === 'auto' ? 'bold' : 'normal'}>
+                    Smart Auto-Detect (Auto-updates matching documentId, creates new if missing)
+                  </Typography>
+                </label>
+
                 <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
                   <input
                     type="radio"
@@ -358,7 +376,7 @@ export default function CsvManagerTab() {
                     onChange={() => setImportMode('update')}
                   />
                   <Typography variant="omega" fontWeight={importMode === 'update' ? 'bold' : 'normal'}>
-                    Update Existing (Matches by documentId)
+                    Update Existing Only (Requires documentId)
                   </Typography>
                 </label>
 
@@ -420,53 +438,113 @@ export default function CsvManagerTab() {
           </Box>
 
           {/* Parsed Preview Table */}
-          {parsedPreview.length > 0 && (
-            <Box marginTop={4} background="neutral0" padding={4} hasRadius>
-              <Flex justifyContent="space-between" alignItems="center" marginBottom={3}>
-                <Typography variant="sigma" textColor="neutral700">
-                  FILE PREVIEW (FIRST {parsedPreview.length} ROWS)
-                </Typography>
-                <Badge backgroundColor="neutral150" textColor="neutral800">
-                  Ready to Import
-                </Badge>
-              </Flex>
+          {parsedPreview.length > 0 && (() => {
+            const missingDocIdCount = parsedPreview.filter(
+              (row) => !(row.documentId || row.id || '').trim()
+            ).length;
+            const headers = Object.keys(parsedPreview[0]);
 
-              <Table colCount={Object.keys(parsedPreview[0]).length} rowCount={parsedPreview.length + 1}>
-                <Thead>
-                  <Tr>
-                    {Object.keys(parsedPreview[0]).map((h) => (
-                      <Th key={h}>
-                        <Typography variant="sigma">{h}</Typography>
+            return (
+              <Box marginTop={4} background="neutral0" padding={4} hasRadius>
+                <Flex justifyContent="space-between" alignItems="center" marginBottom={3}>
+                  <Box>
+                    <Typography variant="sigma" textColor="neutral700">
+                      FILE PREVIEW (FIRST {parsedPreview.length} ROWS)
+                    </Typography>
+                    <Typography variant="pi" textColor="neutral500" display="block">
+                      {parsedPreview.length} previewed row{parsedPreview.length > 1 ? 's' : ''} •{' '}
+                      {missingDocIdCount > 0
+                        ? `${missingDocIdCount} row${missingDocIdCount > 1 ? 's' : ''} missing documentId (will be created as new entries)`
+                        : 'All previewed rows contain document IDs'}
+                    </Typography>
+                  </Box>
+                  <Badge backgroundColor={missingDocIdCount > 0 ? 'warning100' : 'success100'} textColor={missingDocIdCount > 0 ? 'warning700' : 'success700'}>
+                    {missingDocIdCount > 0 ? `${missingDocIdCount} New (No ID)` : 'Ready to Import'}
+                  </Badge>
+                </Flex>
+
+                {missingDocIdCount > 0 && (
+                  <Box marginBottom={3}>
+                    <Alert
+                      variant={importMode === 'update' ? 'warning' : 'default'}
+                      title={importMode === 'update' ? 'Warning: Missing Document IDs' : 'Smart Auto-Detect Active'}
+                    >
+                      <Typography variant="omega">
+                        {missingDocIdCount} row{missingDocIdCount > 1 ? 's have' : ' has'} no <code>documentId</code>.{' '}
+                        {importMode === 'auto'
+                          ? 'Because no documentId is provided, the engine will automatically treat them as new entries and generate new database IDs for them.'
+                          : importMode === 'update'
+                          ? 'In "Update Existing Only" mode, rows without a documentId will be skipped. Switch to "Smart Auto-Detect" to automatically create them as new entries.'
+                          : 'These will be created as new entries.'}
+                      </Typography>
+                    </Alert>
+                  </Box>
+                )}
+
+                <Table colCount={headers.length + 1} rowCount={parsedPreview.length + 1}>
+                  <Thead>
+                    <Tr>
+                      <Th style={{ width: 140 }}>
+                        <Typography variant="sigma">Detected Action</Typography>
                       </Th>
-                    ))}
-                  </Tr>
-                </Thead>
-                <Tbody>
-                  {parsedPreview.map((row, rIdx) => (
-                    <Tr key={rIdx}>
-                      {Object.keys(parsedPreview[0]).map((h) => (
-                        <Td key={h}>
-                          <Typography variant="omega">{row[h] || '-'}</Typography>
-                        </Td>
+                      {headers.map((h) => (
+                        <Th key={h}>
+                          <Typography variant="sigma">{h}</Typography>
+                        </Th>
                       ))}
                     </Tr>
-                  ))}
-                </Tbody>
-              </Table>
+                  </Thead>
+                  <Tbody>
+                    {parsedPreview.map((row, rIdx) => {
+                      const hasDocId = !!(row.documentId || row.id || '').trim();
+                      return (
+                        <Tr key={rIdx}>
+                          <Td>
+                            {hasDocId ? (
+                              <Badge backgroundColor="primary100" textColor="primary700">
+                                🔄 Match / Update
+                              </Badge>
+                            ) : (
+                              <Badge backgroundColor="warning100" textColor="warning700">
+                                ➕ New Entry
+                              </Badge>
+                            )}
+                          </Td>
+                          {headers.map((h) => (
+                            <Td key={h}>
+                              {(h === 'documentId' || h === 'id') && !row[h]?.trim() ? (
+                                <Typography variant="pi" textColor="warning700" fontWeight="bold">
+                                  (Auto-generate ID)
+                                </Typography>
+                              ) : (
+                                <Typography variant="omega">{row[h] || '-'}</Typography>
+                              )}
+                            </Td>
+                          ))}
+                        </Tr>
+                      );
+                    })}
+                  </Tbody>
+                </Table>
 
-              <Flex justifyContent="flex-end" marginTop={4}>
-                <Button
-                  variant="default"
-                  size="L"
-                  startIcon={<Check />}
-                  onClick={handleExecuteImport}
-                  loading={importing}
-                >
-                  {importMode === 'update' ? 'Execute Bulk Update' : 'Execute Add / Override'}
-                </Button>
-              </Flex>
-            </Box>
-          )}
+                <Flex justifyContent="flex-end" marginTop={4}>
+                  <Button
+                    variant="default"
+                    size="L"
+                    startIcon={<Check />}
+                    onClick={handleExecuteImport}
+                    loading={importing}
+                  >
+                    {importMode === 'auto'
+                      ? 'Execute Smart Import (Auto-Detect)'
+                      : importMode === 'update'
+                      ? 'Execute Bulk Update'
+                      : 'Execute Add / Override'}
+                  </Button>
+                </Flex>
+              </Box>
+            );
+          })()}
 
           {/* Execution Result Banner */}
           {importResult && (
@@ -476,10 +554,20 @@ export default function CsvManagerTab() {
                 title="CSV Import Results"
               >
                 <Typography variant="omega" display="block" marginBottom={1}>
-                  Successfully processed: <strong>{importResult.stats.created} created</strong>,{' '}
-                  <strong>{importResult.stats.updated} updated</strong>,{' '}
+                  Successfully processed: <strong>{importResult.stats.created} created</strong>
+                  {importResult.stats.newWithoutDocId > 0 && (
+                    <span> ({importResult.stats.newWithoutDocId} created as new entries because documentId was omitted)</span>
+                  )}
+                  , <strong>{importResult.stats.updated} updated</strong>,{' '}
                   <strong>{importResult.stats.skipped} skipped</strong> out of {importResult.stats.total} total rows.
                 </Typography>
+                {importResult.stats.newWithoutDocId > 0 && (
+                  <Box marginTop={2} padding={2} background="neutral100" hasRadius>
+                    <Typography variant="pi" textColor="neutral700">
+                      ℹ️ <strong>Note on new entries:</strong> {importResult.stats.newWithoutDocId} row{importResult.stats.newWithoutDocId > 1 ? 's' : ''} had no <code>documentId</code> specified in the CSV. The engine generated brand-new database entries with assigned document IDs. If you export this collection now, you will see their generated document IDs.
+                    </Typography>
+                  </Box>
+                )}
                 {importResult.stats.errors.length > 0 && (
                   <Box marginTop={2}>
                     <Typography variant="pi" textColor="danger700" fontWeight="bold">

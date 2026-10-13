@@ -340,7 +340,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     uid: string,
     csvText: string,
     options: {
-      mode: 'update' | 'create_or_override';
+      mode?: 'auto' | 'update' | 'create_or_override';
       publish?: boolean;
       user?: any;
     }
@@ -356,13 +356,14 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     }
 
     const attrs = ct.attributes || {};
-    const { mode, publish = true, user } = options;
+    const { mode = 'auto', publish = true, user } = options;
 
     const stats = {
       total: parsedRows.length,
       created: 0,
       updated: 0,
       skipped: 0,
+      newWithoutDocId: 0,
       errors: [] as Array<{ row: number; error: string; documentId?: string }>,
       diffs: [] as Array<any>,
     };
@@ -444,7 +445,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             stats.skipped++;
             stats.errors.push({
               row: rowNumber,
-              error: 'Missing documentId for Update mode.',
+              error: 'Missing documentId for Update mode. (Tip: Use Smart Auto-Detect mode to auto-add entries without document IDs).',
             });
             continue;
           }
@@ -495,8 +496,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             status: 'updated',
             message: `Updated via CSV import (row ${rowNumber})`,
           });
-        } else {
-          // mode === 'create_or_override'
+        } else if (mode === 'create_or_override') {
           if (docId) {
             const existing = await strapi.documents(uid as any).findOne({
               documentId: docId,
@@ -553,6 +553,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           }
 
           stats.created++;
+          if (!docId) {
+            stats.newWithoutDocId++;
+          }
           stats.diffs.push({
             uid,
             collectionName: ct.info?.displayName || uid,
@@ -562,7 +565,84 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             oldValue: null,
             newValue: payload,
             status: 'updated',
-            message: `Created via CSV import (row ${rowNumber})`,
+            message: docId
+              ? `Created via CSV import (row ${rowNumber})`
+              : `Created as new entry (no documentId provided in CSV - row ${rowNumber})`,
+          });
+        } else {
+          // Default: Smart Auto-Detect ('auto')
+          if (docId) {
+            const existing = await strapi.documents(uid as any).findOne({
+              documentId: docId,
+            });
+
+            if (existing) {
+              const mergedPayload = { ...payload };
+              for (const key of Object.keys(payload)) {
+                if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
+                  mergedPayload[key] = { ...((existing as any)[key] || {}), ...payload[key] };
+                }
+              }
+
+              await strapi.documents(uid as any).update({
+                documentId: docId,
+                data: mergedPayload,
+              });
+
+              if (publish && ct.options?.draftAndPublish) {
+                try {
+                  await (strapi.documents(uid as any) as any).publish({ documentId: docId });
+                } catch (pubErr) {
+                  strapi.log.warn(`[bulk-updater] Auto-publish failed for ${docId}:`, pubErr);
+                }
+              }
+
+              stats.updated++;
+              stats.diffs.push({
+                uid,
+                collectionName: ct.info?.displayName || uid,
+                documentId: docId,
+                label: (existing as any).title || (existing as any).name || `Entry #${docId}`,
+                attribute: Object.keys(payload).join(', '),
+                oldValue: existing,
+                newValue: payload,
+                status: 'updated',
+                message: `Updated existing entry via smart match (row ${rowNumber})`,
+              });
+              continue;
+            }
+          }
+
+          // Missing docId OR provided docId does not exist in DB -> create new
+          const created: any = await strapi.documents(uid as any).create({
+            data: payload,
+          });
+
+          const newDocId = created?.documentId || docId;
+          if (publish && ct.options?.draftAndPublish && newDocId) {
+            try {
+              await (strapi.documents(uid as any) as any).publish({ documentId: newDocId });
+            } catch (pubErr) {
+              strapi.log.warn(`[bulk-updater] Auto-publish failed for ${newDocId}:`, pubErr);
+            }
+          }
+
+          stats.created++;
+          if (!docId) {
+            stats.newWithoutDocId++;
+          }
+          stats.diffs.push({
+            uid,
+            collectionName: ct.info?.displayName || uid,
+            documentId: newDocId,
+            label: created?.title || created?.name || `New Entry #${newDocId}`,
+            attribute: Object.keys(payload).join(', '),
+            oldValue: null,
+            newValue: payload,
+            status: 'updated',
+            message: docId
+              ? `Created as new entry (documentId "${docId}" not found in database - row ${rowNumber})`
+              : `Created as new entry (no documentId provided in CSV - row ${rowNumber})`,
           });
         }
       } catch (err: any) {

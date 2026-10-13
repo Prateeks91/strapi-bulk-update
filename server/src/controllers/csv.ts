@@ -78,7 +78,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
       const csvService = strapi.plugin('bulk-updater').service('csv');
       const result = await csvService.importCsv(uid, csvText, {
-        mode: mode === 'create_or_override' ? 'create_or_override' : 'update',
+        mode: mode === 'update' ? 'update' : mode === 'create_or_override' ? 'create_or_override' : 'auto',
         publish: publish !== false,
         user: ctx.state.user,
       });
