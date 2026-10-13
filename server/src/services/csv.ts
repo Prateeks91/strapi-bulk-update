@@ -666,18 +666,37 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     if (stats.updated > 0 || stats.created > 0) {
       try {
         const auditService = strapi.plugin('bulk-updater').service('audit');
-        if (auditService && auditService.isAuditEnabled()) {
-          await auditService.logOperation({
-            batchId,
-            attribute: 'CSV_IMPORT',
-            value: `Mode: ${mode} (${stats.created} created, ${stats.updated} updated)`,
-            userEmail,
-            userName,
-            updatedCount: stats.updated + stats.created,
-            skippedCount: stats.skipped,
-            totalTargets: stats.total,
-            diffs: stats.diffs,
-          });
+        if (auditService) {
+          const isEnabled = typeof auditService.isAuditEnabled === 'function'
+            ? auditService.isAuditEnabled()
+            : Boolean(auditService.getAuditConfig?.().enabled ?? true);
+
+          if (isEnabled) {
+            const batchSummary = {
+              batchId,
+              attribute: 'CSV_IMPORT',
+              value: `Mode: ${mode} (${stats.created} created, ${stats.updated} updated)`,
+              updatedCount: stats.updated + stats.created,
+              skippedCount: stats.skipped,
+              totalTargets: stats.total,
+            };
+
+            const userObj = {
+              email: userEmail || 'admin@strapi.io',
+              firstname: userName || 'Admin',
+            };
+
+            if (typeof auditService.recordBatch === 'function') {
+              await auditService.recordBatch(batchSummary, stats.diffs, userObj);
+            } else if (typeof auditService.logOperation === 'function') {
+              await auditService.logOperation({
+                ...batchSummary,
+                userEmail,
+                userName,
+                diffs: stats.diffs,
+              });
+            }
+          }
         }
       } catch (auditErr) {
         strapi.log.warn('[bulk-updater] Failed logging CSV import audit:', auditErr);

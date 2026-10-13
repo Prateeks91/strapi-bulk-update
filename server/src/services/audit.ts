@@ -125,6 +125,45 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
   },
 
   /**
+   * Checks whether audit logging is enabled.
+   */
+  isAuditEnabled(): boolean {
+    const config = this.getAuditConfig();
+    return Boolean(config && config.enabled);
+  },
+
+  /**
+   * Convenience alias to log an operation into the audit trail.
+   */
+  async logOperation(data: {
+    batchId: string;
+    attribute: string;
+    value: string;
+    userEmail?: string;
+    userName?: string;
+    updatedCount: number;
+    skippedCount: number;
+    totalTargets: number;
+    diffs?: any[];
+  }) {
+    return this.recordBatch(
+      {
+        batchId: data.batchId,
+        attribute: data.attribute,
+        value: data.value,
+        updatedCount: data.updatedCount,
+        skippedCount: data.skippedCount,
+        totalTargets: data.totalTargets,
+      },
+      data.diffs || [],
+      {
+        email: data.userEmail,
+        firstname: data.userName,
+      }
+    );
+  },
+
+  /**
    * Optionally writes an audit event directly to Strapi Enterprise's native Audit Logs table.
    */
   async recordToEnterpriseNative(
