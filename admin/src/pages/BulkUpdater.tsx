@@ -25,6 +25,7 @@ import {
 import { Play, ArrowClockwise, Check, Download } from '@strapi/icons';
 import ValidationRulesTab from './ValidationRulesTab';
 import CsvManagerTab from './CsvManagerTab';
+import ProcessingDashboardModal from '../components/ProcessingDashboardModal';
 
 interface Entry {
   id: number | string;
@@ -430,6 +431,12 @@ const BulkUpdater: React.FC = () => {
   const [executingNowBatchId, setExecutingNowBatchId] = useState<string | null>(null);
   const [makerNotesInput, setMakerNotesInput] = useState<string>('');
   const [publishOnApproval, setPublishOnApproval] = useState<boolean>(true);
+
+  // Processing Dashboard & Status Tracking State
+  const [showProcessingDashboard, setShowProcessingDashboard] = useState<boolean>(false);
+  const [dashboardBatchId, setDashboardBatchId] = useState<string>('');
+  const [dashboardJob, setDashboardJob] = useState<any>(null);
+  const [isSubmittingBatch, setIsSubmittingBatch] = useState<boolean>(false);
 
   // Managed Cache Keys
   const MODELS_CACHE_KEY = 'strapi_bulk_updater_models_cache';
@@ -1152,7 +1159,29 @@ const BulkUpdater: React.FC = () => {
     try {
       setUpdating(true);
       setShowConfirmModal(false);
+      setShowProcessingDashboard(true);
+      setIsSubmittingBatch(true);
       setLastResults(null);
+
+      // Initialize live dashboard job tracker
+      const tempBatchId = `batch_${Date.now()}`;
+      setDashboardBatchId(tempBatchId);
+      setDashboardJob({
+        id: tempBatchId,
+        createdAt: new Date().toISOString(),
+        status: 'processing',
+        executionMode,
+        attribute: selectedAttribute,
+        value: attributeValue,
+        totalTargets: targets.length,
+        processedCount: 0,
+        updatedCount: 0,
+        skippedCount: 0,
+        failedCount: 0,
+        isLive: false,
+        publishOnApproval,
+        results: [],
+      });
 
       const payload = {
         attribute: selectedAttribute,
@@ -1168,21 +1197,63 @@ const BulkUpdater: React.FC = () => {
 
       const res = await post('/bulk-updater/batch-update', payload);
 
+      setIsSubmittingBatch(false);
+
       if (res.data && res.data.success) {
         setSelectedEntries({});
+        const finalBatchId = res.data.batchId;
+        setDashboardBatchId(finalBatchId);
+
         if (res.data.pending) {
+          setDashboardJob({
+            id: finalBatchId,
+            createdAt: new Date().toISOString(),
+            status: res.data.status || 'pending_approval',
+            executionMode,
+            scheduledFor: res.data.scheduledFor,
+            attribute: selectedAttribute,
+            value: attributeValue,
+            totalTargets: targets.length,
+            processedCount: 0,
+            updatedCount: 0,
+            skippedCount: 0,
+            failedCount: 0,
+            isLive: false,
+            publishOnApproval,
+            makerNotes: makerNotesInput,
+            policyMessage: res.data.message,
+            results: [],
+          });
+
           toggleNotification({
             type: 'success',
             message: res.data.message || 'Batch submitted successfully.',
           });
           await fetchPendingBatches();
-          setActiveTab('audit');
         } else {
           setLastResults(res.data.results || []);
           setUpdateSummary({
             updatedCount: res.data.updatedCount || 0,
             skippedCount: res.data.skippedCount || 0,
             batchId: res.data.batchId,
+          });
+
+          setDashboardJob({
+            id: finalBatchId,
+            createdAt: new Date().toISOString(),
+            completedAt: new Date().toISOString(),
+            status: res.data.status || 'successful',
+            executionMode: 'immediate',
+            attribute: selectedAttribute,
+            value: attributeValue,
+            totalTargets: res.data.totalTargets || targets.length,
+            processedCount: res.data.results?.length || targets.length,
+            updatedCount: res.data.updatedCount || 0,
+            skippedCount: res.data.skippedCount || 0,
+            failedCount: res.data.failedCount || 0,
+            isLive: res.data.isLive !== false && (res.data.updatedCount > 0),
+            publishOnApproval,
+            results: res.data.results || [],
           });
 
           toggleNotification({
@@ -1194,15 +1265,28 @@ const BulkUpdater: React.FC = () => {
           await fetchAuditHistory();
         }
       } else {
+        setIsSubmittingBatch(false);
+        setDashboardJob((prev: any) => ({
+          ...prev,
+          status: 'failed',
+          error: res.data?.error || 'Batch update encountered an error',
+        }));
         toggleNotification({
           type: 'danger',
           message: res.data?.error || 'Batch update encountered an error',
         });
       }
     } catch (err: any) {
+      setIsSubmittingBatch(false);
+      const errMsg = err.response?.data?.error || err.message || 'Batch update failed';
+      setDashboardJob((prev: any) => ({
+        ...prev,
+        status: 'failed',
+        error: errMsg,
+      }));
       toggleNotification({
         type: 'danger',
-        message: err.response?.data?.error || err.message || 'Batch update failed',
+        message: errMsg,
       });
     } finally {
       setUpdating(false);
@@ -1421,6 +1505,15 @@ const BulkUpdater: React.FC = () => {
             </Typography>
           </Box>
           <Flex gap={2}>
+            <Button
+              startIcon={<Download />}
+              variant="secondary"
+              onClick={() => {
+                setShowProcessingDashboard(true);
+              }}
+            >
+              Processing Tracker &amp; Reports
+            </Button>
             <Button
               startIcon={<ArrowClockwise />}
               variant="tertiary"
@@ -2877,6 +2970,17 @@ const BulkUpdater: React.FC = () => {
                           <Td style={{ minWidth: 160, textAlign: 'right', whiteSpace: 'nowrap' }}>
                             <Flex gap={2} justifyContent="flex-end">
                               <Button
+                                variant="secondary"
+                                size="S"
+                                startIcon={<Download />}
+                                onClick={() => {
+                                  setDashboardBatchId(rec.batchId);
+                                  setShowProcessingDashboard(true);
+                                }}
+                              >
+                                Report
+                              </Button>
+                              <Button
                                 variant="tertiary"
                                 size="S"
                                 onClick={() =>
@@ -3219,6 +3323,15 @@ const BulkUpdater: React.FC = () => {
           </Box>
         </div>
       )}
+
+      {/* Processing Dashboard & Status Tracker Modal */}
+      <ProcessingDashboardModal
+        isOpen={showProcessingDashboard}
+        onClose={() => setShowProcessingDashboard(false)}
+        batchId={dashboardBatchId}
+        initialJob={dashboardJob}
+        isSubmitting={isSubmittingBatch}
+      />
     </Box>
   );
 };

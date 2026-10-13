@@ -68,6 +68,30 @@ export default {
       },
       {
         method: 'GET',
+        path: '/batches/recent',
+        handler: 'bulkUpdater.getRecentBatches',
+        config: {
+          policies: [],
+        },
+      },
+      {
+        method: 'GET',
+        path: '/batches/:batchId/status',
+        handler: 'bulkUpdater.getBatchStatus',
+        config: {
+          policies: [],
+        },
+      },
+      {
+        method: 'GET',
+        path: '/batches/:batchId/report',
+        handler: 'bulkUpdater.getBatchReport',
+        config: {
+          policies: [],
+        },
+      },
+      {
+        method: 'GET',
         path: '/audit/history',
         handler: 'audit.getHistory',
         config: {

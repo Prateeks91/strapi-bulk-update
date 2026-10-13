@@ -152,7 +152,43 @@ export interface PendingBatch {
   executionResult?: any;
 }
 
+export interface BatchJobState {
+  id: string;
+  createdAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  createdBy: { id?: string | number; email?: string; firstname?: string; lastname?: string; username?: string };
+  status: 'pending_approval' | 'queued_offpeak' | 'processing' | 'successful' | 'partial_failure' | 'failed';
+  executionMode: 'immediate' | 'maker_checker' | 'queue_offpeak';
+  scheduledFor?: string;
+  attribute: string;
+  value: string;
+  totalTargets: number;
+  processedCount: number;
+  updatedCount: number;
+  skippedCount: number;
+  failedCount: number;
+  isLive: boolean;
+  publishOnApproval: boolean;
+  policyMessage?: string;
+  makerNotes?: string;
+  results: Array<{
+    uid: string;
+    collectionName: string;
+    documentId: string;
+    label: string;
+    attribute: string;
+    oldValue: any;
+    newValue: any;
+    status: 'updated' | 'skipped' | 'error';
+    message: string;
+    isLive?: boolean;
+  }>;
+  error?: string;
+}
+
 const pendingBatches = new Map<string, PendingBatch>();
+const batchJobsMap = new Map<string, BatchJobState>();
 let isRunnerRunning = false;
 let runnerInterval: NodeJS.Timeout | null = null;
 
@@ -285,6 +321,34 @@ async function executeBatchInternal(
   const results: any[] = [];
   let updatedCount = 0;
   let skippedCount = 0;
+
+  const jobState: BatchJobState = {
+    id: batchId,
+    createdAt: new Date().toISOString(),
+    startedAt: new Date().toISOString(),
+    createdBy: currentUser
+      ? {
+          id: currentUser.id,
+          email: currentUser.email,
+          firstname: currentUser.firstname,
+          lastname: currentUser.lastname,
+          username: currentUser.username,
+        }
+      : { email: 'admin@system.local' },
+    status: 'processing',
+    executionMode: 'immediate',
+    attribute,
+    value,
+    totalTargets: targetsMap.size,
+    processedCount: 0,
+    updatedCount: 0,
+    skippedCount: 0,
+    failedCount: 0,
+    isLive: false,
+    publishOnApproval: Boolean(publishOnApproval),
+    results: [],
+  };
+  batchJobsMap.set(batchId, jobState);
 
   let regexObj: RegExp | null = null;
   if (isRegex && regexPattern) {
@@ -563,6 +627,10 @@ async function executeBatchInternal(
       else if (res.status === 'skipped') skippedCount++;
       results.push(res);
     }
+    jobState.processedCount = results.length;
+    jobState.updatedCount = updatedCount;
+    jobState.skippedCount = skippedCount;
+    jobState.failedCount = results.filter((r) => r.status === 'error').length;
   }
 
   // Invalidate local in-process cache for all affected collection UIDs
@@ -570,6 +638,23 @@ async function executeBatchInternal(
   affectedUids.forEach((uid) => {
     invalidateCollectionCache(uid);
   });
+
+  const failedCount = results.filter((r) => r.status === 'error').length;
+  jobState.failedCount = failedCount;
+  jobState.completedAt = new Date().toISOString();
+  jobState.isLive = updatedCount > 0;
+  jobState.status =
+    failedCount === 0 && updatedCount > 0
+      ? 'successful'
+      : failedCount > 0 && updatedCount > 0
+      ? 'partial_failure'
+      : failedCount > 0
+      ? 'failed'
+      : 'successful';
+  jobState.results = results.map((r) => ({
+    ...r,
+    isLive: r.status === 'updated',
+  }));
 
   const batchSummary = {
     batchId,
@@ -595,7 +680,10 @@ async function executeBatchInternal(
     value,
     updatedCount,
     skippedCount,
+    failedCount,
     totalTargets: targetsMap.size,
+    isLive: jobState.isLive,
+    status: jobState.status,
     results,
   };
 }
@@ -1238,6 +1326,24 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         };
 
         pendingBatches.set(batchId, batch);
+        batchJobsMap.set(batchId, {
+          id: batchId,
+          createdAt: batch.createdAt,
+          createdBy: batch.createdBy,
+          status: 'pending_approval',
+          executionMode: 'maker_checker',
+          attribute,
+          value,
+          totalTargets: summary.totalTargets,
+          processedCount: 0,
+          updatedCount: 0,
+          skippedCount: 0,
+          failedCount: 0,
+          isLive: false,
+          publishOnApproval: Boolean(publishOnApproval),
+          makerNotes,
+          results: [],
+        });
 
         return {
           success: true,
@@ -1284,6 +1390,25 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         };
 
         pendingBatches.set(batchId, batch);
+        batchJobsMap.set(batchId, {
+          id: batchId,
+          createdAt: batch.createdAt,
+          createdBy: batch.createdBy,
+          status: 'queued_offpeak',
+          executionMode: 'queue_offpeak',
+          scheduledFor: executionConfig.offPeakStartTime,
+          attribute,
+          value,
+          totalTargets: summary.totalTargets,
+          processedCount: 0,
+          updatedCount: 0,
+          skippedCount: 0,
+          failedCount: 0,
+          isLive: false,
+          publishOnApproval: Boolean(publishOnApproval),
+          makerNotes,
+          results: [],
+        });
 
         return {
           success: true,
@@ -1331,6 +1456,26 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         };
 
         pendingBatches.set(batchId, batch);
+        batchJobsMap.set(batchId, {
+          id: batchId,
+          createdAt: batch.createdAt,
+          createdBy: batch.createdBy,
+          status: 'queued_offpeak',
+          executionMode: 'queue_offpeak',
+          scheduledFor: executionConfig.offPeakStartTime,
+          attribute,
+          value,
+          totalTargets: summary.totalTargets,
+          processedCount: 0,
+          updatedCount: 0,
+          skippedCount: 0,
+          failedCount: 0,
+          isLive: false,
+          publishOnApproval: Boolean(publishOnApproval),
+          policyMessage,
+          makerNotes: 'Automatically queued due to peak business hours restriction.',
+          results: [],
+        });
 
         return {
           success: true,
@@ -1479,6 +1624,251 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         message: 'Batch executed immediately.',
         batch,
         result,
+      };
+    },
+
+    /**
+     * Get real-time or historical processing status of a batch job
+     */
+    async getBatchStatus(batchId: string) {
+      if (!batchId) throw new Error('batchId is required');
+
+      let job = batchJobsMap.get(batchId);
+      if (job) {
+        return { success: true, batch: job };
+      }
+
+      const pending = pendingBatches.get(batchId);
+      if (pending) {
+        const pendingJob: BatchJobState = {
+          id: pending.id,
+          createdAt: pending.createdAt,
+          createdBy: pending.createdBy,
+          status: pending.status as any,
+          executionMode: pending.executionMode,
+          scheduledFor: pending.scheduledFor,
+          attribute: pending.payload.attribute,
+          value: pending.payload.value,
+          totalTargets: pending.summary.totalTargets,
+          processedCount: 0,
+          updatedCount: 0,
+          skippedCount: 0,
+          failedCount: 0,
+          isLive: false,
+          publishOnApproval: Boolean(pending.payload.publishOnApproval),
+          policyMessage: pending.makerNotes,
+          results: [],
+        };
+        return { success: true, batch: pendingJob };
+      }
+
+      // Fallback: Query historical audit log
+      try {
+        const auditService = strapi.plugin('bulk-updater').service('audit');
+        const historyData = await auditService.getHistory();
+        const records = Array.isArray(historyData?.history) ? historyData.history : [];
+        const found = records.find((r: any) => r.batchId === batchId);
+
+        if (found) {
+          const total = found.totalTargets || (found.updatedCount + found.skippedCount) || 1;
+          const historicalJob: BatchJobState = {
+            id: found.batchId,
+            createdAt: found.executedAt || found.createdAt || new Date().toISOString(),
+            startedAt: found.executedAt || found.createdAt,
+            completedAt: found.executedAt || found.createdAt,
+            createdBy: {
+              email: found.userEmail || 'admin@strapi.io',
+              firstname: found.userName || 'Admin',
+            },
+            status: found.isRolledBack ? 'failed' : 'successful',
+            executionMode: 'immediate',
+            attribute: found.attribute,
+            value: found.value,
+            totalTargets: total,
+            processedCount: total,
+            updatedCount: found.updatedCount || 0,
+            skippedCount: found.skippedCount || 0,
+            failedCount: 0,
+            isLive: !found.isRolledBack && found.updatedCount > 0,
+            publishOnApproval: true,
+            results: (found.diffs || []).map((d: any) => ({
+              uid: d.uid,
+              collectionName: d.collectionName || d.uid,
+              documentId: d.documentId,
+              label: d.label || `Entry #${d.documentId}`,
+              attribute: d.attribute || found.attribute,
+              oldValue: d.oldValue,
+              newValue: d.newValue,
+              status: d.status || 'updated',
+              isLive: !found.isRolledBack,
+              message: d.message || 'Updated via bulk update',
+            })),
+          };
+          batchJobsMap.set(batchId, historicalJob);
+          return { success: true, batch: historicalJob };
+        }
+      } catch (err) {
+        // Fallthrough
+      }
+
+      throw new Error(`Batch with ID "${batchId}" was not found.`);
+    },
+
+    /**
+     * Downloadable execution report (CSV or JSON)
+     */
+    async getBatchReport(batchId: string, format: string = 'csv') {
+      const statusRes = await this.getBatchStatus(batchId);
+      const batch = statusRes.batch;
+
+      function escapeCsvVal(val: any): string {
+        if (val === null || val === undefined) return '';
+        let str = typeof val === 'object' ? JSON.stringify(val) : String(val);
+        if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
+          return `"${str.replace(/"/g, '""')}"`;
+        }
+        return str;
+      }
+
+      const headers = [
+        'Batch ID',
+        'Collection UID',
+        'Collection Name',
+        'Document ID',
+        'Record Title / Identifier',
+        'Attribute Name',
+        'Previous Value',
+        'New Live Value',
+        'Processing Status',
+        'Live On Server',
+        'Details / Message',
+        'Executed At',
+        'Operator',
+      ];
+
+      const rows: string[] = [headers.join(',')];
+
+      for (const item of batch.results || []) {
+        const row = [
+          escapeCsvVal(batch.id),
+          escapeCsvVal(item.uid),
+          escapeCsvVal(item.collectionName),
+          escapeCsvVal(item.documentId),
+          escapeCsvVal(item.label),
+          escapeCsvVal(item.attribute),
+          escapeCsvVal(item.oldValue),
+          escapeCsvVal(item.newValue),
+          escapeCsvVal(item.status === 'updated' ? 'Updated' : item.status === 'error' ? 'Failed' : 'Skipped'),
+          escapeCsvVal(item.isLive ? 'YES (Live on Site)' : 'NO'),
+          escapeCsvVal(item.message),
+          escapeCsvVal(batch.completedAt || batch.createdAt),
+          escapeCsvVal(batch.createdBy?.email || 'admin@strapi.io'),
+        ];
+        rows.push(row.join(','));
+      }
+
+      const safeBatchId = batch.id.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const filename = `bulk_update_report_${safeBatchId}_${new Date().toISOString().slice(0, 10)}.csv`;
+
+      return {
+        success: true,
+        filename,
+        csvContent: rows.join('\n'),
+        summary: {
+          batchId: batch.id,
+          status: batch.status,
+          isLive: batch.isLive,
+          totalTargets: batch.totalTargets,
+          updatedCount: batch.updatedCount,
+          skippedCount: batch.skippedCount,
+          failedCount: batch.failedCount,
+          executedAt: batch.completedAt || batch.createdAt,
+          operator: batch.createdBy?.email || 'admin@strapi.io',
+        },
+        batch,
+      };
+    },
+
+    /**
+     * Get recent batch jobs for the processing dashboard
+     */
+    async getRecentBatches() {
+      const mergedMap = new Map<string, any>();
+
+      // 1. From in-memory batchJobsMap
+      for (const [id, job] of batchJobsMap.entries()) {
+        mergedMap.set(id, {
+          id: job.id,
+          createdAt: job.createdAt,
+          completedAt: job.completedAt,
+          status: job.status,
+          isLive: job.isLive,
+          executionMode: job.executionMode,
+          attribute: job.attribute,
+          value: job.value,
+          totalTargets: job.totalTargets,
+          updatedCount: job.updatedCount,
+          skippedCount: job.skippedCount,
+          failedCount: job.failedCount,
+          operator: job.createdBy?.email || 'admin@strapi.io',
+        });
+      }
+
+      // 2. From pendingBatches
+      for (const [id, p] of pendingBatches.entries()) {
+        if (!mergedMap.has(id)) {
+          mergedMap.set(id, {
+            id: p.id,
+            createdAt: p.createdAt,
+            status: p.status,
+            isLive: false,
+            executionMode: p.executionMode,
+            attribute: p.payload.attribute,
+            value: p.payload.value,
+            totalTargets: p.summary.totalTargets,
+            updatedCount: 0,
+            skippedCount: 0,
+            failedCount: 0,
+            operator: p.createdBy?.email || 'admin@strapi.io',
+          });
+        }
+      }
+
+      // 3. From audit history
+      try {
+        const auditService = strapi.plugin('bulk-updater').service('audit');
+        const historyData = await auditService.getHistory();
+        const records = Array.isArray(historyData?.history) ? historyData.history : [];
+        for (const r of records) {
+          if (!mergedMap.has(r.batchId)) {
+            mergedMap.set(r.batchId, {
+              id: r.batchId,
+              createdAt: r.executedAt || r.createdAt,
+              completedAt: r.executedAt,
+              status: r.isRolledBack ? 'failed' : 'successful',
+              isLive: !r.isRolledBack && r.updatedCount > 0,
+              executionMode: 'immediate',
+              attribute: r.attribute,
+              value: r.value,
+              totalTargets: r.totalTargets || (r.updatedCount + r.skippedCount) || 1,
+              updatedCount: r.updatedCount || 0,
+              skippedCount: r.skippedCount || 0,
+              failedCount: 0,
+              operator: r.userEmail || 'admin@strapi.io',
+            });
+          }
+        }
+      } catch {
+        // Ignore
+      }
+
+      const batches = Array.from(mergedMap.values()).sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      );
+
+      return {
+        success: true,
+        batches: batches.slice(0, 50),
       };
     },
 

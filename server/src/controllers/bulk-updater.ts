@@ -136,4 +136,40 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       ctx.body = { success: false, error: err.message };
     }
   },
+
+  async getBatchStatus(ctx: any) {
+    try {
+      const { batchId } = ctx.params;
+      const service = strapi.plugin('bulk-updater').service('bulkUpdater');
+      const result = await service.getBatchStatus(batchId);
+      ctx.body = result;
+    } catch (err: any) {
+      ctx.status = 404;
+      ctx.body = { success: false, error: err.message };
+    }
+  },
+
+  async getBatchReport(ctx: any) {
+    try {
+      const { batchId } = ctx.params;
+      const { format = 'csv' } = ctx.query;
+      const service = strapi.plugin('bulk-updater').service('bulkUpdater');
+      const result = await service.getBatchReport(batchId, format);
+      ctx.body = result;
+    } catch (err: any) {
+      ctx.status = 500;
+      ctx.body = { success: false, error: err.message };
+    }
+  },
+
+  async getRecentBatches(ctx: any) {
+    try {
+      const service = strapi.plugin('bulk-updater').service('bulkUpdater');
+      const result = await service.getRecentBatches();
+      ctx.body = result;
+    } catch (err: any) {
+      ctx.status = 500;
+      ctx.body = { success: false, error: err.message };
+    }
+  },
 });
