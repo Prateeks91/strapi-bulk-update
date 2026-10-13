@@ -31,9 +31,12 @@ Strapi allows editing entries individually or applying bulk actions within a sin
 ## ✨ Features at a Glance
 
 - 🔍 **Dynamic Cross-Collection Discovery**: Introspects all registered content types and attributes in your Strapi v5 instance.
+- 🔎 **Searchable Combobox Attribute & Entity Picker**:
+  - Instant fuzzy and substring search across all scalar fields, relations, and nested component paths.
+  - Interactive visual badges for relation targets (`relation ➔ Target`) and components.
 - 🔗 **Full Relational Field Support**:
   - Supports `manyToOne`, `oneToOne`, `oneToMany`, and `manyToMany` relations.
-  - Interactive target entity dropdown populated directly from target collection records.
+  - Interactive searchable target entity dropdown populated directly from target collection records.
   - Relational update modes: **Set / Overwrite**, **Add / Connect**, **Remove / Disconnect**, and **Clear / Unlink**.
   - Human-readable relation labels (`formatDisplayValue`) throughout the UI, confirmation modal, queue, and audit diffs.
 - 👥 **Enterprise Maker-Checker Governance**:
@@ -49,10 +52,10 @@ Strapi allows editing entries individually or applying bulk actions within a sin
 - 👁️ **Per-Collection Dynamic Column Visibility**:
   - Customizable visible columns per collection type with zero deep nesting architecture.
   - Independent column selections, responsive horizontal scrolling, and accessible table headers.
-- 🛡️ **Flexible 3-Tier Audit Architecture & One-Click Rollback**:
-  - **Tier 1 (Zero-Config)**: Auto-detects standard audit collections (`api::audit-log.audit-log`).
-  - **Tier 2 (Strapi Enterprise Bridge)**: Bridges events directly to native Strapi Enterprise Audit Logs (`admin::audit-logs`).
-  - **Tier 3 (Custom Declarative Schema)**: Custom collection types and declarative column mappings.
+- 🛡️ **Zero-Config Built-In Audit Trail & One-Click Rollback**:
+  - **Native Plugin Schema**: Automatically provisions `bulk_updater_audit_logs` in your database on startup — **zero caller setup required**.
+  - **Convention Auto-Discovery**: Seamlessly detects and mirrors custom app collections (`api::audit-log.audit-log`).
+  - **Strapi Enterprise Bridge**: Bridges events directly to native Strapi Enterprise Audit Logs (`admin::audit-logs`).
   - **Deterministic Rollback**: Restores exact prior values and relationship links using Strapi v5 Document Service.
 - 🧩 **Deep Nested Component Support**:
   - Full dot-notation introspection (e.g. `metaFields.metaDescription`, `defaultSeo.metaTitle`) in attribute dropdown and table views.
