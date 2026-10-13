@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState, useRef, useMemo } from 'react';
 import { useFetchClient, useNotification } from '@strapi/strapi/admin';
 import {
   Box,
@@ -494,8 +494,13 @@ const BulkUpdater: React.FC = () => {
   const [collectionPages, setCollectionPages] = useState<Record<string, CollectionPageState>>({});
   const [collectionSearch, setCollectionSearch] = useState<string>('');
 
-  // Content Type visibility filter
+  // Content Type visibility filter & search
   const [visibleTypeUids, setVisibleTypeUids] = useState<Record<string, boolean>>({});
+  const [typeVisibilitySearch, setTypeVisibilitySearch] = useState<string>('');
+
+  // Attribute Info breakdown state
+  const [attributeInfoExpanded, setAttributeInfoExpanded] = useState<boolean>(false);
+  const [attributeInfoSearch, setAttributeInfoSearch] = useState<string>('');
 
   // Pagination & Sorting state (capped at 100)
   const [defaultPageSize, setDefaultPageSize] = useState<number>(10);
@@ -793,7 +798,14 @@ const BulkUpdater: React.FC = () => {
           setSelectedEntries({});
         }
 
-        collections.forEach((col) => {
+        // Targeted Collection Querying: Only query visible collections possessing the attribute
+        const targetCols = collections.filter((col) => {
+          if (visibleTypeUids[col.uid] === false) return false;
+          if (filterOperator !== 'none' && !col.attributes.includes(selectedAttribute)) return false;
+          return true;
+        });
+
+        targetCols.forEach((col) => {
           loadCollectionPage(
             col.uid,
             1,
@@ -834,7 +846,17 @@ const BulkUpdater: React.FC = () => {
         setRelationOptions([]);
       }
 
-      collections.forEach((col) => {
+      // Performance Optimization for 100+ collections:
+      // When no filter is active, loaded collections already hold their rows in memory.
+      // Only fetch entries for visible collections that possess the new attribute and have not loaded yet.
+      const collectionsToLoad = collections.filter(
+        (col) =>
+          visibleTypeUids[col.uid] !== false &&
+          col.attributes.includes(newAttr) &&
+          (!collectionPages[col.uid]?.entries || collectionPages[col.uid].entries.length === 0)
+      );
+
+      collectionsToLoad.forEach((col) => {
         loadCollectionPage(col.uid, 1);
       });
     }
@@ -847,6 +869,69 @@ const BulkUpdater: React.FC = () => {
         c.displayName.toLowerCase().includes(collectionSearch.toLowerCase().trim()) ||
         c.uid.toLowerCase().includes(collectionSearch.toLowerCase().trim()))
   );
+
+  // Memoized collections classification for 100+ collection enterprise UX
+  const supportedCollections = useMemo(() => {
+    return collections.filter((c) => c.attributes.includes(selectedAttribute));
+  }, [collections, selectedAttribute]);
+
+  const unsupportedCollections = useMemo(() => {
+    return collections.filter((c) => !c.attributes.includes(selectedAttribute));
+  }, [collections, selectedAttribute]);
+
+  // One-click helper: focus workspace visibility strictly on collections supporting the attribute
+  const handleFocusOnlySupported = () => {
+    const newVis: Record<string, boolean> = {};
+    collections.forEach((c) => {
+      newVis[c.uid] = c.attributes.includes(selectedAttribute);
+    });
+    setVisibleTypeUids(newVis);
+    toggleNotification({
+      type: 'info',
+      message: `Workspace focused: Showing ${supportedCollections.length} of ${collections.length} collections supporting "${selectedAttribute}".`,
+    });
+  };
+
+  const handleShowAllTypes = () => {
+    const newVis: Record<string, boolean> = {};
+    collections.forEach((c) => {
+      newVis[c.uid] = true;
+    });
+    setVisibleTypeUids(newVis);
+  };
+
+  const handleHideAllTypes = () => {
+    const newVis: Record<string, boolean> = {};
+    collections.forEach((c) => {
+      newVis[c.uid] = false;
+    });
+    setVisibleTypeUids(newVis);
+  };
+
+  // Memoized Combobox options to guarantee 60fps typing even with 1000+ attributes
+  const memoizedComboboxOptions = useMemo(() => {
+    return attributes.map((attr) => {
+      const rel = relationsMeta[attr];
+      return (
+        <ComboboxOption key={attr} value={attr} textValue={attr}>
+          <Flex justifyContent="space-between" alignItems="center" width="100%" gap={2}>
+            <Typography variant="omega" fontWeight={attr === selectedAttribute ? 'bold' : 'regular'}>
+              {attr}
+            </Typography>
+            {rel ? (
+              <Badge backgroundColor="secondary100" textColor="secondary700" size="S">
+                relation ➔ {rel.targetDisplayName}
+              </Badge>
+            ) : attr.includes('.') ? (
+              <Badge backgroundColor="neutral150" textColor="neutral700" size="S">
+                component
+              </Badge>
+            ) : null}
+          </Flex>
+        </ComboboxOption>
+      );
+    });
+  }, [attributes, relationsMeta, selectedAttribute]);
 
   const handleGlobalPageSizeChange = (newSize: number) => {
     const capped = Math.min(500, Math.max(1, newSize));
@@ -1084,6 +1169,7 @@ const BulkUpdater: React.FC = () => {
       const res = await post('/bulk-updater/batch-update', payload);
 
       if (res.data && res.data.success) {
+        setSelectedEntries({});
         if (res.data.pending) {
           toggleNotification({
             type: 'success',
@@ -1130,6 +1216,7 @@ const BulkUpdater: React.FC = () => {
       setApprovingBatchId(batchId);
       const res = await post(`/bulk-updater/batches/${batchId}/approve`, { executeImmediately: true });
       if (res.data && res.data.success) {
+        setSelectedEntries({});
         toggleNotification({
           type: 'success',
           message: res.data.message || `Batch ${batchId} approved and executed successfully!`,
@@ -1187,6 +1274,7 @@ const BulkUpdater: React.FC = () => {
       setExecutingNowBatchId(batchId);
       const res = await post(`/bulk-updater/batches/${batchId}/execute-now`);
       if (res.data && res.data.success) {
+        setSelectedEntries({});
         toggleNotification({
           type: 'success',
           message: `Batch ${batchId} executed immediately!`,
@@ -1500,27 +1588,7 @@ const BulkUpdater: React.FC = () => {
                       }
                     }}
                   >
-                    {attributes.map((attr) => {
-                      const rel = relationsMeta[attr];
-                      return (
-                        <ComboboxOption key={attr} value={attr} textValue={attr}>
-                          <Flex justifyContent="space-between" alignItems="center" width="100%" gap={2}>
-                            <Typography variant="omega" fontWeight={attr === selectedAttribute ? 'bold' : 'regular'}>
-                              {attr}
-                            </Typography>
-                            {rel ? (
-                              <Badge backgroundColor="secondary100" textColor="secondary700" size="S">
-                                relation ➔ {rel.targetDisplayName}
-                              </Badge>
-                            ) : attr.includes('.') ? (
-                              <Badge backgroundColor="neutral150" textColor="neutral700" size="S">
-                                component
-                              </Badge>
-                            ) : null}
-                          </Flex>
-                        </ComboboxOption>
-                      );
-                    })}
+                    {memoizedComboboxOptions}
                   </Combobox>
                 </Field.Root>
               </Box>
@@ -1652,29 +1720,86 @@ const BulkUpdater: React.FC = () => {
               </Flex>
             </Box>
 
-            {/* Selected Attribute Context Hint */}
+            {/* Selected Attribute Context & Schema Intelligence Dashboard */}
             {selectedAttribute && (
-              <Box marginTop={4} padding={3} background="neutral100" hasRadius>
-                <Flex gap={2} alignItems="center" wrap="wrap">
-                  <Typography variant="pi" fontWeight="bold">
-                    Attribute Info:
-                  </Typography>
-                  <Typography variant="pi">
-                    Targeting attribute <strong>{selectedAttribute}</strong>.
-                  </Typography>
-                  {collections.map((c) => {
-                    const hasAttr = c.attributes.includes(selectedAttribute);
-                    return (
-                      <Badge
-                        key={c.uid}
-                        backgroundColor={hasAttr ? 'success100' : 'neutral200'}
-                        textColor={hasAttr ? 'success700' : 'neutral600'}
-                      >
-                        {c.displayName}: {hasAttr ? 'Attribute exists' : 'Not in schema'}
+              <Box marginTop={4} padding={4} background="neutral100" hasRadius style={{ border: '1px solid #eaeaef' }}>
+                <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={3}>
+                  <Flex gap={2} alignItems="center" wrap="wrap">
+                    <Typography variant="pi" fontWeight="bold">
+                      Attribute Info:
+                    </Typography>
+                    <Typography variant="pi">
+                      Targeting attribute <strong><code>{selectedAttribute}</code></strong>
+                    </Typography>
+                    <Badge backgroundColor="success100" textColor="success700">
+                      ✓ Supported in {supportedCollections.length} of {collections.length} Collections
+                    </Badge>
+                    {unsupportedCollections.length > 0 && (
+                      <Badge backgroundColor="neutral200" textColor="neutral700">
+                        — Not in schema: {unsupportedCollections.length}
                       </Badge>
-                    );
-                  })}
+                    )}
+                  </Flex>
+
+                  <Flex gap={2} alignItems="center">
+                    <Button
+                      variant="secondary"
+                      size="S"
+                      onClick={handleFocusOnlySupported}
+                    >
+                      Focus Workspace: Show Supported Only ({supportedCollections.length})
+                    </Button>
+                    <Button
+                      variant="tertiary"
+                      size="S"
+                      onClick={() => setAttributeInfoExpanded((prev) => !prev)}
+                    >
+                      {attributeInfoExpanded ? 'Hide Schema Breakdown ▲' : 'Inspect Breakdown ▼'}
+                    </Button>
+                  </Flex>
                 </Flex>
+
+                {attributeInfoExpanded && (
+                  <Box marginTop={3} paddingTop={3} style={{ borderTop: '1px solid #dcdce4' }}>
+                    <Flex justifyContent="space-between" alignItems="center" marginBottom={3} wrap="wrap" gap={2}>
+                      <Typography variant="pi" textColor="neutral600">
+                        Showing collection types schema compatibility. Type to filter:
+                      </Typography>
+                      <Box style={{ width: 220 }}>
+                        <TextInput
+                          placeholder="Filter collection name..."
+                          size="S"
+                          value={attributeInfoSearch}
+                          onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                            setAttributeInfoSearch(e.target.value)
+                          }
+                        />
+                      </Box>
+                    </Flex>
+                    <Flex wrap="wrap" gap={2} alignItems="center" style={{ maxHeight: 180, overflowY: 'auto' }}>
+                      {collections
+                        .filter(
+                          (c) =>
+                            !attributeInfoSearch.trim() ||
+                            c.displayName.toLowerCase().includes(attributeInfoSearch.toLowerCase().trim()) ||
+                            c.uid.toLowerCase().includes(attributeInfoSearch.toLowerCase().trim())
+                        )
+                        .map((c) => {
+                          const hasAttr = c.attributes.includes(selectedAttribute);
+                          return (
+                            <Badge
+                              key={c.uid}
+                              backgroundColor={hasAttr ? 'success100' : 'neutral200'}
+                              textColor={hasAttr ? 'success700' : 'neutral600'}
+                              size="S"
+                            >
+                              {c.displayName}: {hasAttr ? '✓ Supported' : '— Not in schema'}
+                            </Badge>
+                          );
+                        })}
+                    </Flex>
+                  </Box>
+                )}
               </Box>
             )}
           </Box>
@@ -1806,90 +1931,133 @@ const BulkUpdater: React.FC = () => {
               </Flex>
             </Box>
 
-            {/* Advanced Content Type Visibility Filter */}
+            {/* Advanced Content Type Visibility Filter - Enterprise High-Density UX */}
             {collections.length > 0 && (
               <Box
                 padding={4}
                 background="neutral100"
                 hasRadius
                 marginBottom={4}
-                style={{ width: '100%', maxWidth: '100%', boxSizing: 'border-box' }}
+                style={{ width: '100%', maxWidth: '100%', boxSizing: 'border-box', border: '1px solid #eaeaef' }}
               >
-                <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={2} marginBottom={3}>
-                  <Flex gap={2} alignItems="center">
+                <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={3} marginBottom={3}>
+                  <Flex gap={2} alignItems="center" wrap="wrap">
                     <Typography variant="omega" fontWeight="bold">
                       Filter Visible Content Types:
                     </Typography>
                     <Badge backgroundColor="primary100" textColor="primary700">
                       {filteredCollections.length} of {collections.length} visible
                     </Badge>
+                    <Badge backgroundColor="success100" textColor="success700">
+                      {supportedCollections.filter((c) => visibleTypeUids[c.uid] !== false).length} of {supportedCollections.length} supported visible
+                    </Badge>
                   </Flex>
-                  <Flex gap={2} alignItems="center">
+
+                  {/* Inline Quick Search & Action Buttons */}
+                  <Flex gap={2} alignItems="center" wrap="wrap">
+                    <Box style={{ width: 220 }}>
+                      <TextInput
+                        placeholder="Search types..."
+                        size="S"
+                        value={typeVisibilitySearch}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                          setTypeVisibilitySearch(e.target.value)
+                        }
+                      />
+                    </Box>
                     <Button
-                      variant="tertiary"
+                      variant="secondary"
                       size="S"
-                      onClick={() => {
-                        const allVis: Record<string, boolean> = {};
-                        collections.forEach((c) => (allVis[c.uid] = true));
-                        setVisibleTypeUids(allVis);
-                      }}
+                      onClick={handleFocusOnlySupported}
                     >
-                      Show All Types
+                      Show Supported Only ({supportedCollections.length})
                     </Button>
                     <Button
                       variant="tertiary"
                       size="S"
-                      onClick={() => {
-                        const allVis: Record<string, boolean> = {};
-                        collections.forEach((c) => (allVis[c.uid] = false));
-                        setVisibleTypeUids(allVis);
-                      }}
+                      onClick={handleShowAllTypes}
                     >
-                      Hide All Types
+                      Show All
+                    </Button>
+                    <Button
+                      variant="tertiary"
+                      size="S"
+                      onClick={handleHideAllTypes}
+                    >
+                      Hide All
                     </Button>
                   </Flex>
                 </Flex>
 
-                <Flex wrap="wrap" gap={2} alignItems="center">
-                  {collections.map((col) => {
-                    const isVisible = visibleTypeUids[col.uid] !== false;
-                    return (
-                      <Box
-                        key={col.uid}
-                        padding={2}
-                        paddingLeft={3}
-                        paddingRight={3}
-                        background={isVisible ? 'neutral0' : 'neutral200'}
-                        hasRadius
-                        borderStyle="solid"
-                        borderWidth="1px"
-                        borderColor={isVisible ? 'primary200' : 'neutral300'}
-                      >
-                        <Flex gap={2} alignItems="center">
-                          <Checkbox
-                            checked={isVisible}
-                            onCheckedChange={(checked: boolean) =>
-                              setVisibleTypeUids((prev) => ({ ...prev, [col.uid]: Boolean(checked) }))
-                            }
-                          >
-                            <Typography fontWeight={isVisible ? 'semiBold' : 'regular'}>
-                              {col.displayName}
-                            </Typography>
-                          </Checkbox>
-                          {col.isSingleType ? (
-                            <Badge backgroundColor="secondary100" textColor="secondary700" size="S">
-                              Single Type
-                            </Badge>
-                          ) : (
-                            <Badge backgroundColor="neutral150" textColor="neutral600" size="S">
-                              Collection
-                            </Badge>
-                          )}
-                        </Flex>
-                      </Box>
-                    );
-                  })}
-                </Flex>
+                {/* High-Density Scrollable Responsive Grid */}
+                <Box
+                  style={{
+                    maxHeight: 220,
+                    overflowY: 'auto',
+                    padding: 8,
+                    background: '#ffffff',
+                    borderRadius: 4,
+                    border: '1px solid #dcdce4',
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))',
+                    gap: 8,
+                  }}
+                >
+                  {collections
+                    .filter(
+                      (col) =>
+                        !typeVisibilitySearch.trim() ||
+                        col.displayName.toLowerCase().includes(typeVisibilitySearch.toLowerCase().trim()) ||
+                        col.uid.toLowerCase().includes(typeVisibilitySearch.toLowerCase().trim())
+                    )
+                    .map((col) => {
+                      const isVisible = visibleTypeUids[col.uid] !== false;
+                      const hasAttr = col.attributes.includes(selectedAttribute);
+                      return (
+                        <Box
+                          key={col.uid}
+                          padding={2}
+                          paddingLeft={3}
+                          paddingRight={3}
+                          background={isVisible ? '#f0f0ff' : '#f6f6f9'}
+                          hasRadius
+                          style={{
+                            border: isVisible ? '1px solid #4945ff' : '1px solid #eaeaef',
+                            transition: 'all 0.15s ease',
+                          }}
+                        >
+                          <Flex justifyContent="space-between" alignItems="center" gap={2}>
+                            <Checkbox
+                              checked={isVisible}
+                              onCheckedChange={(checked: boolean) =>
+                                setVisibleTypeUids((prev) => ({ ...prev, [col.uid]: Boolean(checked) }))
+                              }
+                            >
+                              <Typography variant="pi" fontWeight={isVisible ? 'bold' : 'regular'}>
+                                {col.displayName}
+                              </Typography>
+                            </Checkbox>
+                            <Flex gap={1} alignItems="center">
+                              {col.isSingleType ? (
+                                <Badge backgroundColor="secondary100" textColor="secondary700" size="S">
+                                  Single
+                                </Badge>
+                              ) : null}
+                              {hasAttr ? (
+                                <Badge backgroundColor="success100" textColor="success700" size="S">
+                                  ✓ Supports
+                                </Badge>
+                              ) : (
+                                <Badge backgroundColor="neutral150" textColor="neutral600" size="S">
+                                  —
+                                </Badge>
+                              )}
+                            </Flex>
+                          </Flex>
+                        </Box>
+                      );
+                    })}
+                </Box>
               </Box>
             )}
 

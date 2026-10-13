@@ -758,80 +758,88 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       const collections = [];
       const signatures: string[] = [];
 
-      // 2. High-watermark check per collection in parallel
-      const collectionResults = await Promise.all(
-        staticSchemaCache.targetUids.map(async (uid) => {
-          const meta = staticSchemaCache!.metaByUid[uid];
-          if (!meta) return null;
+      // 2. High-watermark check per collection with throttled concurrency (batches of 10)
+      // Prevents database connection pool exhaustion and file locks on 100+ collection schemas
+      const BATCH_CONCURRENCY = 10;
+      const collectionResults: Array<any> = [];
 
-          const signature = await getCollectionSignature(strapi, uid);
-          const cached = modelsCache.get(uid);
-          if (cached && cached.signature === signature) {
+      for (let i = 0; i < staticSchemaCache.targetUids.length; i += BATCH_CONCURRENCY) {
+        const batchUids = staticSchemaCache.targetUids.slice(i, i + BATCH_CONCURRENCY);
+        const batchRes = await Promise.all(
+          batchUids.map(async (uid) => {
+            const meta = staticSchemaCache!.metaByUid[uid];
+            if (!meta) return null;
+
+            const signature = await getCollectionSignature(strapi, uid);
+            const cached = modelsCache.get(uid);
+            if (cached && cached.signature === signature) {
+              return {
+                collection: {
+                  ...meta,
+                  totalEntries: cached.totalCount,
+                  entries: cached.entries,
+                },
+                signature: `${uid}=${signature}`,
+              };
+            }
+
+            let entries: any[] = [];
+            let totalCount = 0;
+            try {
+              const ctAttrs = allContentTypes[uid]?.attributes || {};
+              const relKeys = Object.keys(meta.relations || {});
+              const compKeys = Object.keys(ctAttrs).filter((k) => ctAttrs[k].type === 'component');
+              const populateOptionObj: Record<string, any> = {};
+              relKeys.forEach((k) => { populateOptionObj[k] = true; });
+              compKeys.forEach((k) => { populateOptionObj[k] = true; });
+              const populateOption = Object.keys(populateOptionObj).length > 0 ? populateOptionObj : undefined;
+
+              if (meta.isSingleType) {
+                const singleDoc: any = await (strapi.documents(uid as any) as any).findFirst({
+                  populate: populateOption,
+                });
+                if (singleDoc) {
+                  entries = [singleDoc];
+                  totalCount = 1;
+                }
+              } else {
+                totalCount = await strapi.documents(uid as any).count();
+                entries = await strapi.documents(uid as any).findMany({
+                  limit: 10,
+                  sort: { createdAt: 'desc' },
+                  populate: populateOption,
+                });
+              }
+            } catch (err) {
+              strapi.log.error(`[bulk-updater] Failed to fetch entries for ${uid}:`, err);
+              entries = [];
+              totalCount = 0;
+            }
+
+            const formattedEntries = (entries || []).map((entry: any) => ({
+              id: entry.id,
+              documentId: entry.documentId,
+              ...entry,
+            }));
+
+            modelsCache.set(uid, {
+              signature,
+              totalCount,
+              entries: formattedEntries,
+            });
+
             return {
               collection: {
                 ...meta,
-                totalEntries: cached.totalCount,
-                entries: cached.entries,
+                totalEntries: totalCount,
+                entries: formattedEntries,
               },
               signature: `${uid}=${signature}`,
             };
-          }
-
-          let entries: any[] = [];
-          let totalCount = 0;
-          try {
-            const ctAttrs = allContentTypes[uid]?.attributes || {};
-            const relKeys = Object.keys(meta.relations || {});
-            const compKeys = Object.keys(ctAttrs).filter((k) => ctAttrs[k].type === 'component');
-            const populateOptionObj: Record<string, any> = {};
-            relKeys.forEach((k) => { populateOptionObj[k] = true; });
-            compKeys.forEach((k) => { populateOptionObj[k] = true; });
-            const populateOption = Object.keys(populateOptionObj).length > 0 ? populateOptionObj : undefined;
-
-            if (meta.isSingleType) {
-              const singleDoc: any = await (strapi.documents(uid as any) as any).findFirst({
-                populate: populateOption,
-              });
-              if (singleDoc) {
-                entries = [singleDoc];
-                totalCount = 1;
-              }
-            } else {
-              totalCount = await strapi.documents(uid as any).count();
-              entries = await strapi.documents(uid as any).findMany({
-                limit: 10,
-                sort: { createdAt: 'desc' },
-                populate: populateOption,
-              });
-            }
-          } catch (err) {
-            strapi.log.error(`[bulk-updater] Failed to fetch entries for ${uid}:`, err);
-            entries = [];
-            totalCount = 0;
-          }
-
-          const formattedEntries = (entries || []).map((entry: any) => ({
-            id: entry.id,
-            documentId: entry.documentId,
-            ...entry,
-          }));
-
-          modelsCache.set(uid, {
-            signature,
-            totalCount,
-            entries: formattedEntries,
-          });
-
-          return {
-            collection: {
-              ...meta,
-              totalEntries: totalCount,
-              entries: formattedEntries,
-            },
-            signature: `${uid}=${signature}`,
-          };
-        })
-      );
+          })
+        );
+        collectionResults.push(...batchRes);
+      }
 
       for (const res of collectionResults) {
         if (res) {
