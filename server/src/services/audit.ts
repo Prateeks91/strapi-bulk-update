@@ -2,7 +2,7 @@ import type { Core } from '@strapi/strapi';
 
 export interface AuditConfig {
   enabled: boolean;
-  mode?: 'custom' | 'default' | 'enterprise_native' | 'disabled';
+  mode?: 'custom' | 'default' | 'enterprise_native' | 'store' | 'disabled';
   contentType?: string;
   fields?: Record<string, string>;
   isEnterpriseNativeAvailable?: boolean;
@@ -51,6 +51,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
    * 1. Explicit consumer custom schema (full declarative control)
    * 2. Zero-config convention auto-detection (api::audit-log.audit-log)
    * 3. Strapi Enterprise native audit log bridge
+   * 4. Zero-config plugin core store (works out of the box in 100% of Strapi installations)
    */
   getAuditConfig(): AuditConfig {
     const rawConfig = strapi.config.get('plugin::bulk-updater.audit') as any;
@@ -114,13 +115,11 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       };
     }
 
-    // Tier 4: Audit disabled / unconfigured
+    // Tier 4: Zero-config core store fallback (always available in all Strapi installations)
     return {
-      enabled: false,
-      mode: 'disabled',
+      enabled: true,
+      mode: 'store',
       isEnterpriseNativeAvailable: false,
-      error:
-        'No audit collection configured or detected. To enable rollback, provide a collection or use Strapi Enterprise.',
     };
   },
 
@@ -185,8 +184,47 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       user
     );
 
-    // 2. Persist to rollback-capable collection type if available
-    if (!config.enabled || !config.contentType || !config.fields) {
+    // 2. Persist to rollback-capable storage
+    if (!config.enabled) {
+      return null;
+    }
+
+    if (config.mode === 'store') {
+      try {
+        const store = strapi.store({ type: 'plugin', name: 'bulk-updater', key: 'audit-history' });
+        const stored = (await store.get({})) || { history: [] };
+        const history = Array.isArray(stored.history) ? stored.history : [];
+
+        const newRecord = {
+          id: batchSummary.batchId,
+          documentId: batchSummary.batchId,
+          batchId: batchSummary.batchId,
+          attribute: batchSummary.attribute,
+          value: batchSummary.value,
+          userEmail: user?.email || 'admin@strapi.io',
+          userName: user?.firstname
+            ? `${user.firstname} ${user.lastname || ''}`.trim()
+            : user?.email || 'Admin',
+          updatedCount: batchSummary.updatedCount,
+          skippedCount: batchSummary.skippedCount,
+          totalTargets: batchSummary.totalTargets,
+          diffs: results,
+          isRolledBack: false,
+          rolledBackAt: null,
+          rolledBackBy: null,
+          executedAt: new Date().toISOString(),
+        };
+
+        const updatedHistory = [newRecord, ...history].slice(0, 200);
+        await store.set({ value: { history: updatedHistory } });
+        return newRecord;
+      } catch (err: any) {
+        strapi.log.error(`[bulk-updater] Failed to record audit log in core store: ${err.message}`);
+        return null;
+      }
+    }
+
+    if (!config.contentType || !config.fields) {
       return null;
     }
 
@@ -234,6 +272,27 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           'Strapi Enterprise Native Audit Logs active. Batch events are recorded directly to Strapi Settings > Audit Logs. (To enable one-click document rollback, declare or add an audit-log collection).',
         history: [],
       };
+    }
+
+    if (config.mode === 'store') {
+      try {
+        const store = strapi.store({ type: 'plugin', name: 'bulk-updater', key: 'audit-history' });
+        const stored = (await store.get({})) || { history: [] };
+        const history = Array.isArray(stored.history) ? stored.history : [];
+
+        return {
+          enabled: true,
+          mode: 'store',
+          isEnterpriseNativeAvailable: config.isEnterpriseNativeAvailable,
+          history,
+        };
+      } catch (err: any) {
+        return {
+          enabled: false,
+          message: `Failed to read audit history from core store: ${err.message}`,
+          history: [],
+        };
+      }
     }
 
     if (!config.enabled || !config.contentType || !config.fields) {
@@ -287,35 +346,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
   },
 
   /**
-   * Performs deterministic rollback of a batch
+   * Helper to revert diff items back to original values
    */
-  async rollbackBatch(batchId: string, currentUser?: any) {
-    const config = this.getAuditConfig();
-    if (!config.enabled || !config.contentType || !config.fields) {
-      throw new Error('Audit trail is not configured or disabled.');
-    }
-
-    const f = config.fields;
-    const records: any[] = await strapi.documents(config.contentType as any).findMany({
-      filters: {
-        [f.batchId]: { $eq: batchId },
-      } as any,
-    });
-
-    const record = records?.[0];
-    if (!record) {
-      throw new Error(`Batch record with ID "${batchId}" was not found in audit trail.`);
-    }
-
-    if (record[f.isRolledBack]) {
-      throw new Error(`Batch "${batchId}" has already been rolled back.`);
-    }
-
-    const diffs =
-      typeof record[f.diffs] === 'string'
-        ? JSON.parse(record[f.diffs])
-        : record[f.diffs] || [];
-
+  async revertDiffItems(diffs: any[]) {
     let revertedCount = 0;
     const rollbackDetails = [];
 
@@ -404,6 +437,96 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         }
       }
     }
+
+    return { revertedCount, rollbackDetails };
+  },
+
+  /**
+   * Performs deterministic rollback of a batch
+   */
+  async rollbackBatch(batchId: string, currentUser?: any) {
+    const config = this.getAuditConfig();
+    if (!config.enabled) {
+      throw new Error('Audit trail is not configured or disabled.');
+    }
+
+    if (config.mode === 'store') {
+      const store = strapi.store({ type: 'plugin', name: 'bulk-updater', key: 'audit-history' });
+      const stored = (await store.get({})) || { history: [] };
+      const history = Array.isArray(stored.history) ? stored.history : [];
+
+      const recordIndex = history.findIndex((r: any) => r.batchId === batchId);
+      if (recordIndex === -1) {
+        throw new Error(`Batch record with ID "${batchId}" was not found in audit trail.`);
+      }
+
+      const record = history[recordIndex];
+      if (record.isRolledBack) {
+        throw new Error(`Batch "${batchId}" has already been rolled back.`);
+      }
+
+      const diffs = Array.isArray(record.diffs) ? record.diffs : [];
+      const { revertedCount, rollbackDetails } = await this.revertDiffItems(diffs);
+
+      record.isRolledBack = true;
+      record.rolledBackAt = new Date().toISOString();
+      record.rolledBackBy = currentUser?.email || 'Admin';
+      history[recordIndex] = record;
+      await store.set({ value: { history } });
+
+      try {
+        const affectedUids = new Set(rollbackDetails.map((d: any) => d.uid));
+        const bulkService = strapi.plugin('bulk-updater').service('bulkUpdater');
+        affectedUids.forEach((uid: any) => {
+          if (uid && bulkService?.invalidateCache) {
+            bulkService.invalidateCache(uid);
+          }
+        });
+      } catch {}
+
+      await this.recordToEnterpriseNative(
+        'bulk-updater.rollback',
+        {
+          batchId,
+          revertedCount,
+        },
+        currentUser
+      );
+
+      return {
+        success: true,
+        batchId,
+        revertedCount,
+        details: rollbackDetails,
+      };
+    }
+
+    if (!config.contentType || !config.fields) {
+      throw new Error('Audit trail is not configured or disabled.');
+    }
+
+    const f = config.fields;
+    const records: any[] = await strapi.documents(config.contentType as any).findMany({
+      filters: {
+        [f.batchId]: { $eq: batchId },
+      } as any,
+    });
+
+    const record = records?.[0];
+    if (!record) {
+      throw new Error(`Batch record with ID "${batchId}" was not found in audit trail.`);
+    }
+
+    if (record[f.isRolledBack]) {
+      throw new Error(`Batch "${batchId}" has already been rolled back.`);
+    }
+
+    const diffs =
+      typeof record[f.diffs] === 'string'
+        ? JSON.parse(record[f.diffs])
+        : record[f.diffs] || [];
+
+    const { revertedCount, rollbackDetails } = await this.revertDiffItems(diffs);
 
     const updateData: any = {};
     if (f.isRolledBack) updateData[f.isRolledBack] = true;

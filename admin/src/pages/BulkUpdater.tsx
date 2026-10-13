@@ -1424,6 +1424,7 @@ const BulkUpdater: React.FC = () => {
                 <Field.Root>
                   <Field.Label>Attribute to Update</Field.Label>
                   <Combobox
+                    autocomplete={{ type: 'list', filter: 'contains' }}
                     placeholder="Search attribute by name or relation..."
                     value={selectedAttribute}
                     onChange={(val: any) => {
@@ -1434,7 +1435,8 @@ const BulkUpdater: React.FC = () => {
                   >
                     {attributes.map((attr) => {
                       const rel = relationsMeta[attr];
-                      const labelText = `${attr}${rel ? ` (relation ➔ ${rel.targetDisplayName})` : ''}`;
+                      const cleanParts = attr.includes('.') ? attr.split('.').join(' ') : '';
+                      const labelText = `${attr} ${cleanParts} ${rel ? `relation ${rel.targetDisplayName}` : ''}`.trim();
                       return (
                         <ComboboxOption key={attr} value={attr} textValue={labelText}>
                           <Flex justifyContent="space-between" alignItems="center" width="100%" gap={2}>
@@ -1480,6 +1482,7 @@ const BulkUpdater: React.FC = () => {
                         <Field.Root>
                           <Field.Label>{`Choose ${relationsMeta[selectedAttribute].targetDisplayName}`}</Field.Label>
                           <Combobox
+                            autocomplete={{ type: 'list', filter: 'contains' }}
                             placeholder={relationOptionsLoading ? 'Loading entities...' : `Search & pick ${relationsMeta[selectedAttribute].targetDisplayName}...`}
                             value={selectedRelationDocId}
                             onChange={(val: any) => {
