@@ -26,6 +26,7 @@ const DEFAULT_FIELDS: Record<string, string> = {
 };
 
 const DEFAULT_CANDIDATE_TYPES = [
+  'plugin::bulk-updater.audit-log',
   'api::audit-log.audit-log',
   'api::audit.audit',
   'api::bulk-audit-log.bulk-audit-log',

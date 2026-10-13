@@ -1,4 +1,5 @@
 import routes from './routes';
+import contentTypes from './content-types';
 import bulkUpdaterController from './controllers/bulk-updater';
 import auditController from './controllers/audit';
 import validationRulesController from './controllers/validation-rules';
@@ -157,6 +158,7 @@ export default {
     });
   },
   routes,
+  contentTypes,
   controllers: {
     bulkUpdater: bulkUpdaterController,
     audit: auditController,
