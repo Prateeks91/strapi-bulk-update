@@ -17,6 +17,9 @@ import {
   Tr,
   Th,
   Td,
+  Combobox,
+  ComboboxOption,
+  Field,
 } from '@strapi/design-system';
 import { Play, ArrowClockwise, Check, Download } from '@strapi/icons';
 import ValidationRulesTab from './ValidationRulesTab';
@@ -1416,23 +1419,43 @@ const BulkUpdater: React.FC = () => {
             </Typography>
 
             <Flex gap={4} alignItems="flex-end" wrap="wrap">
-              {/* Attribute Dropdown */}
-              <Box style={{ minWidth: 260 }}>
-                <SingleSelect
-                  label="Attribute to Update"
-                  placeholder="Select an attribute..."
-                  value={selectedAttribute}
-                  onChange={(val) => handleAttributeChange(String(val))}
-                >
-                  {attributes.map((attr) => {
-                    const rel = relationsMeta[attr];
-                    return (
-                      <SingleSelectOption key={attr} value={attr}>
-                        {attr} {rel ? `(relation ➔ ${rel.targetDisplayName})` : ''}
-                      </SingleSelectOption>
-                    );
-                  })}
-                </SingleSelect>
+              {/* Attribute Dropdown (Searchable Combobox) */}
+              <Box style={{ minWidth: 280, flex: 1, maxWidth: 440 }}>
+                <Field.Root>
+                  <Field.Label>Attribute to Update</Field.Label>
+                  <Combobox
+                    placeholder="Search attribute by name or relation..."
+                    value={selectedAttribute}
+                    onChange={(val: any) => {
+                      if (val && typeof val === 'string') {
+                        handleAttributeChange(val);
+                      }
+                    }}
+                  >
+                    {attributes.map((attr) => {
+                      const rel = relationsMeta[attr];
+                      const labelText = `${attr}${rel ? ` (relation ➔ ${rel.targetDisplayName})` : ''}`;
+                      return (
+                        <ComboboxOption key={attr} value={attr} textValue={labelText}>
+                          <Flex justifyContent="space-between" alignItems="center" width="100%" gap={2}>
+                            <Typography variant="omega" fontWeight={attr === selectedAttribute ? 'bold' : 'regular'}>
+                              {attr}
+                            </Typography>
+                            {rel ? (
+                              <Badge backgroundColor="secondary100" textColor="secondary700" size="S">
+                                relation ➔ {rel.targetDisplayName}
+                              </Badge>
+                            ) : attr.includes('.') ? (
+                              <Badge backgroundColor="neutral150" textColor="neutral700" size="S">
+                                component
+                              </Badge>
+                            ) : null}
+                          </Flex>
+                        </ComboboxOption>
+                      );
+                    })}
+                  </Combobox>
+                </Field.Root>
               </Box>
 
               {/* New Value Input or Relation Target Selector */}
@@ -1454,28 +1477,32 @@ const BulkUpdater: React.FC = () => {
                     </Flex>
                     <Flex gap={2} alignItems="center" style={{ width: '100%' }}>
                       <Box style={{ flex: 1, minWidth: 200 }}>
-                        <SingleSelect
-                          label={`Choose ${relationsMeta[selectedAttribute].targetDisplayName}`}
-                          placeholder={relationOptionsLoading ? 'Loading entities...' : `Pick a ${relationsMeta[selectedAttribute].targetDisplayName}...`}
-                          value={selectedRelationDocId}
-                          onChange={(val) => {
-                            const docId = String(val);
-                            setSelectedRelationDocId(docId);
-                            if (docId === '__clear__') {
-                              setAttributeValue(JSON.stringify({ mode: 'clear', label: '(clear relation)' }));
-                            } else {
-                              const opt = relationOptions.find((o) => o.documentId === docId);
-                              setAttributeValue(JSON.stringify({ mode: relationMode, documentIds: [docId], label: opt?.label || docId }));
-                            }
-                          }}
-                        >
-                          <SingleSelectOption value="__clear__">-- Clear / Unlink Relation --</SingleSelectOption>
-                          {relationOptions.map((opt) => (
-                            <SingleSelectOption key={opt.documentId} value={opt.documentId}>
-                              {opt.label}
-                            </SingleSelectOption>
-                          ))}
-                        </SingleSelect>
+                        <Field.Root>
+                          <Field.Label>{`Choose ${relationsMeta[selectedAttribute].targetDisplayName}`}</Field.Label>
+                          <Combobox
+                            placeholder={relationOptionsLoading ? 'Loading entities...' : `Search & pick ${relationsMeta[selectedAttribute].targetDisplayName}...`}
+                            value={selectedRelationDocId}
+                            onChange={(val: any) => {
+                              const docId = val ? String(val) : '';
+                              setSelectedRelationDocId(docId);
+                              if (docId === '__clear__') {
+                                setAttributeValue(JSON.stringify({ mode: 'clear', label: '(clear relation)' }));
+                              } else {
+                                const opt = relationOptions.find((o) => o.documentId === docId);
+                                setAttributeValue(JSON.stringify({ mode: relationMode, documentIds: [docId], label: opt?.label || docId }));
+                              }
+                            }}
+                          >
+                            <ComboboxOption value="__clear__" textValue="Clear / Unlink Relation">
+                              -- Clear / Unlink Relation --
+                            </ComboboxOption>
+                            {relationOptions.map((opt) => (
+                              <ComboboxOption key={opt.documentId} value={opt.documentId} textValue={opt.label}>
+                                {opt.label}
+                              </ComboboxOption>
+                            ))}
+                          </Combobox>
+                        </Field.Root>
                       </Box>
                       {relationsMeta[selectedAttribute].isMulti && (
                         <Box style={{ width: 170 }}>
