@@ -601,7 +601,7 @@ const BulkUpdater: React.FC = () => {
     const resolvedAttr =
       storedAttr && attrs.includes(storedAttr)
         ? storedAttr
-        : (attrs.includes(selectedAttribute) ? selectedAttribute : attrs[0] || 'metaDescription');
+        : (selectedAttribute && attrs.includes(selectedAttribute) ? selectedAttribute : '');
 
     setSelectedAttribute(resolvedAttr);
     if (resolvedAttr && data.relationsMeta && data.relationsMeta[resolvedAttr]) {
@@ -838,7 +838,11 @@ const BulkUpdater: React.FC = () => {
     if (newAttr !== selectedAttribute) {
       setSelectedAttribute(newAttr);
       try {
-        localStorage.setItem(LAST_ATTR_KEY, newAttr);
+        if (newAttr) {
+          localStorage.setItem(LAST_ATTR_KEY, newAttr);
+        } else {
+          localStorage.removeItem(LAST_ATTR_KEY);
+        }
       } catch {}
       setSelectedEntries({});
       setFilterOperator('none');
@@ -847,25 +851,24 @@ const BulkUpdater: React.FC = () => {
       setSelectedRelationDocId('');
       setAttributeValue('');
 
-      if (relationsMeta[newAttr]) {
+      if (newAttr && relationsMeta[newAttr]) {
         fetchRelationOptions(relationsMeta[newAttr].targetUid);
       } else {
         setRelationOptions([]);
       }
 
-      // Performance Optimization for 100+ collections:
-      // When no filter is active, loaded collections already hold their rows in memory.
-      // Only fetch entries for visible collections that possess the new attribute and have not loaded yet.
-      const collectionsToLoad = collections.filter(
-        (col) =>
-          visibleTypeUids[col.uid] !== false &&
-          col.attributes.includes(newAttr) &&
-          (!collectionPages[col.uid]?.entries || collectionPages[col.uid].entries.length === 0)
-      );
+      if (newAttr) {
+        const collectionsToLoad = collections.filter(
+          (col) =>
+            visibleTypeUids[col.uid] !== false &&
+            col.attributes.includes(newAttr) &&
+            (!collectionPages[col.uid]?.entries || collectionPages[col.uid].entries.length === 0)
+        );
 
-      collectionsToLoad.forEach((col) => {
-        loadCollectionPage(col.uid, 1);
-      });
+        collectionsToLoad.forEach((col) => {
+          loadCollectionPage(col.uid, 1);
+        });
+      }
     }
   };
 
@@ -915,9 +918,43 @@ const BulkUpdater: React.FC = () => {
     setVisibleTypeUids(newVis);
   };
 
+  const [attributeSearch, setAttributeSearch] = useState('');
+
+  // Filtered attributes based on user search query (handles camelCase, dot-notation, relations)
+  const filteredAttributes = useMemo(() => {
+    if (!attributeSearch.trim()) {
+      return attributes;
+    }
+    const q = attributeSearch.toLowerCase().trim();
+    const cleanQ = q.replace(/[^a-z0-9]/g, '');
+
+    return attributes.filter((attr) => {
+      const lower = attr.toLowerCase();
+      const cleanLower = lower.replace(/[^a-z0-9]/g, '');
+      const rel = relationsMeta[attr];
+      const relTarget = (rel?.targetDisplayName || '').toLowerCase();
+
+      return (
+        lower.includes(q) ||
+        cleanLower.includes(cleanQ) ||
+        relTarget.includes(q)
+      );
+    });
+  }, [attributes, attributeSearch, relationsMeta]);
+
   // Memoized Combobox options to guarantee 60fps typing even with 1000+ attributes
   const memoizedComboboxOptions = useMemo(() => {
-    return attributes.map((attr) => {
+    if (filteredAttributes.length === 0) {
+      return (
+        <ComboboxOption value="__none__" disabled textValue="No matching attributes found">
+          <Typography variant="pi" textColor="neutral600">
+            No matching attributes found for "{attributeSearch}"
+          </Typography>
+        </ComboboxOption>
+      );
+    }
+
+    return filteredAttributes.map((attr) => {
       const rel = relationsMeta[attr];
       return (
         <ComboboxOption key={attr} value={attr} textValue={attr}>
@@ -938,7 +975,7 @@ const BulkUpdater: React.FC = () => {
         </ComboboxOption>
       );
     });
-  }, [attributes, relationsMeta, selectedAttribute]);
+  }, [filteredAttributes, relationsMeta, selectedAttribute, attributeSearch]);
 
   const handleGlobalPageSizeChange = (newSize: number) => {
     const capped = Math.min(500, Math.max(1, newSize));
@@ -1669,15 +1706,28 @@ const BulkUpdater: React.FC = () => {
                 <Field.Root>
                   <Field.Label>Attribute to Update</Field.Label>
                   <Combobox
-                    autocomplete={{ type: 'list', filter: 'contains' }}
+                    autocomplete="none"
                     placeholder="Search attribute by name or relation..."
-                    value={selectedAttribute}
-                    textValue={selectedAttribute}
+                    value={selectedAttribute || undefined}
+                    clearLabel="Clear attribute selection"
+                    onClear={() => {
+                      handleAttributeChange('');
+                      setAttributeSearch('');
+                    }}
+                    onInputChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+                      setAttributeSearch(e.target.value);
+                    }}
+                    onOpenChange={(isOpen: boolean) => {
+                      if (!isOpen) {
+                        setAttributeSearch('');
+                      }
+                    }}
                     loading={loading && attributes.length === 0}
                     loadingMessage="Discovering schema attributes..."
                     onChange={(val: any) => {
-                      if (val && typeof val === 'string') {
+                      if (val && typeof val === 'string' && val !== '__none__') {
                         handleAttributeChange(val);
+                        setAttributeSearch('');
                       }
                     }}
                   >
@@ -1956,7 +2006,7 @@ const BulkUpdater: React.FC = () => {
                   {/* Operator Select */}
                   <Box style={{ width: 220, minWidth: 180 }}>
                     <SingleSelect
-                      label={`Filter condition for "${selectedAttribute}"`}
+                      label={selectedAttribute ? `Filter condition for "${selectedAttribute}"` : 'Filter condition'}
                       value={filterOperator}
                       onChange={(val) => setFilterOperator(String(val) as FilterOperator)}
                     >
@@ -1973,7 +2023,7 @@ const BulkUpdater: React.FC = () => {
                   {(filterOperator === 'equals' || filterOperator === 'contains' || filterOperator === 'starts_with') && (
                     <Box style={{ flex: 1, minWidth: 200 }}>
                       <TextInput
-                        label={`Value for "${selectedAttribute}"`}
+                        label={selectedAttribute ? `Value for "${selectedAttribute}"` : 'Value to match'}
                         placeholder="Type value to match..."
                         value={filterQuery}
                         onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFilterQuery(e.target.value)}
@@ -2105,7 +2155,7 @@ const BulkUpdater: React.FC = () => {
                     )
                     .map((col) => {
                       const isVisible = visibleTypeUids[col.uid] !== false;
-                      const hasAttr = col.attributes.includes(selectedAttribute);
+                      const hasAttr = selectedAttribute ? col.attributes.includes(selectedAttribute) : false;
                       return (
                         <Box
                           key={col.uid}
@@ -2204,9 +2254,9 @@ const BulkUpdater: React.FC = () => {
                 const page = pageState ? pageState.page : 1;
                 const pageCount = pageState ? pageState.pageCount : 1;
                 const pageSize = pageState ? pageState.pageSize : defaultPageSize;
-                const hasAttr = col.attributes.includes(selectedAttribute);
+                const hasAttr = selectedAttribute ? col.attributes.includes(selectedAttribute) : false;
                 const visibleEntries = getVisibleEntries(col);
-                const matchingColCount = entries.filter((e) => entryMatchesFilter(e, selectedAttribute)).length;
+                const matchingColCount = selectedAttribute ? entries.filter((e) => entryMatchesFilter(e, selectedAttribute)).length : 0;
                 const isFullySelected = isCollectionFullySelected(col);
                 const isPartiallySelected = isCollectionPartiallySelected(col);
                 const currentSort = collectionSorts[col.uid] || { field: 'createdAt', order: 'desc' };
@@ -2244,7 +2294,7 @@ const BulkUpdater: React.FC = () => {
                           <Badge backgroundColor="secondary100" textColor="secondary700">
                             Single Type
                           </Badge>
-                        ) : (
+                        ) : selectedAttribute ? (
                           <Badge
                             backgroundColor={hasAttr ? 'success100' : 'warning100'}
                             textColor={hasAttr ? 'success700' : 'warning700'}
@@ -2253,7 +2303,7 @@ const BulkUpdater: React.FC = () => {
                               ? `Schema has "${selectedAttribute}"`
                               : `Schema lacks "${selectedAttribute}" (will skip)`}
                           </Badge>
-                        )}
+                        ) : null}
                       </Flex>
 
                       <Flex gap={3} alignItems="center" wrap="wrap">
