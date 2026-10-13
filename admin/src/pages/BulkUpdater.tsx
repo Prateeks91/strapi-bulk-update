@@ -20,6 +20,7 @@ import {
   Combobox,
   ComboboxOption,
   Field,
+  Loader,
 } from '@strapi/design-system';
 import { Play, ArrowClockwise, Check, Download } from '@strapi/icons';
 import ValidationRulesTab from './ValidationRulesTab';
@@ -430,8 +431,19 @@ const BulkUpdater: React.FC = () => {
   const [makerNotesInput, setMakerNotesInput] = useState<string>('');
   const [publishOnApproval, setPublishOnApproval] = useState<boolean>(true);
 
+  // Managed Cache Keys
+  const MODELS_CACHE_KEY = 'strapi_bulk_updater_models_cache';
+  const LAST_ATTR_KEY = 'strapi_bulk_updater_last_attr';
+
   // Selected state
-  const [selectedAttribute, setSelectedAttribute] = useState<string>('metaDescription');
+  const getInitialAttribute = (): string => {
+    try {
+      const stored = localStorage.getItem(LAST_ATTR_KEY);
+      if (stored) return stored;
+    } catch {}
+    return 'metaDescription';
+  };
+  const [selectedAttribute, setSelectedAttribute] = useState<string>(getInitialAttribute);
   const [attributeValue, setAttributeValue] = useState<string>('');
   const [selectedEntries, setSelectedEntries] = useState<Record<string, boolean>>({});
 
@@ -533,51 +545,81 @@ const BulkUpdater: React.FC = () => {
 
   const latestActiveBatch = auditHistory.find((rec) => !rec.isRolledBack);
 
-  const fetchModels = async () => {
+  const applyModelsData = (data: any) => {
+    if (!data) return;
+    const attrs: string[] = data.attributes || [];
+    setAttributes(attrs);
+    const cols: CollectionModel[] = data.collections || [];
+    setCollections(cols);
+    setAuditEnabled(Boolean(data.auditEnabled));
+    if (data.executionWindow) {
+      setExecutionWindow(data.executionWindow);
+    }
+
+    const pages: Record<string, CollectionPageState> = {};
+    const initialVisibility: Record<string, boolean> = {};
+    const initialSorts: Record<string, { field: string; order: 'asc' | 'desc' }> = {};
+    cols.forEach((col: CollectionModel) => {
+      const total = col.totalEntries !== undefined ? col.totalEntries : (col.entries ? col.entries.length : 0);
+      const initialPageSize = col.isSingleType ? 1 : 10;
+      pages[col.uid] = {
+        page: 1,
+        pageSize: initialPageSize,
+        total,
+        pageCount: col.isSingleType ? 1 : (Math.ceil(total / initialPageSize) || 1),
+        entries: (col.entries || []).slice(0, initialPageSize),
+        loading: false,
+      };
+      initialVisibility[col.uid] = true;
+      initialSorts[col.uid] = { field: 'createdAt', order: 'desc' };
+    });
+    setCollectionPages(pages);
+    setVisibleTypeUids(initialVisibility);
+    setCollectionSorts(initialSorts);
+
+    if (data.relationsMeta) {
+      setRelationsMeta(data.relationsMeta);
+    }
+
+    let storedAttr: string | null = null;
     try {
-      setLoading(true);
+      storedAttr = localStorage.getItem(LAST_ATTR_KEY);
+    } catch {}
+
+    const resolvedAttr =
+      storedAttr && attrs.includes(storedAttr)
+        ? storedAttr
+        : (attrs.includes(selectedAttribute) ? selectedAttribute : attrs[0] || 'metaDescription');
+
+    setSelectedAttribute(resolvedAttr);
+    if (resolvedAttr && data.relationsMeta && data.relationsMeta[resolvedAttr]) {
+      fetchRelationOptions(data.relationsMeta[resolvedAttr].targetUid);
+    }
+  };
+
+  const fetchModels = async () => {
+    // 1. Instant hydration from session cache if available (0ms rendering)
+    try {
+      const cached = sessionStorage.getItem(MODELS_CACHE_KEY);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (parsed && parsed.data) {
+          applyModelsData(parsed.data);
+          setLoading(false);
+        }
+      }
+    } catch {}
+
+    try {
+      if (collections.length === 0) {
+        setLoading(true);
+      }
       const res = await get('/bulk-updater/models');
       if (res.data && res.data.success) {
-        setAttributes(res.data.attributes || []);
-        const cols: CollectionModel[] = res.data.collections || [];
-        setCollections(cols);
-        setAuditEnabled(Boolean(res.data.auditEnabled));
-        if (res.data.executionWindow) {
-          setExecutionWindow(res.data.executionWindow);
-        }
-
-        const pages: Record<string, CollectionPageState> = {};
-        const initialVisibility: Record<string, boolean> = {};
-        const initialSorts: Record<string, { field: string; order: 'asc' | 'desc' }> = {};
-        cols.forEach((col: CollectionModel) => {
-          const total = col.totalEntries !== undefined ? col.totalEntries : (col.entries ? col.entries.length : 0);
-          const initialPageSize = col.isSingleType ? 1 : 10;
-          pages[col.uid] = {
-            page: 1,
-            pageSize: initialPageSize,
-            total,
-            pageCount: col.isSingleType ? 1 : (Math.ceil(total / initialPageSize) || 1),
-            entries: (col.entries || []).slice(0, initialPageSize),
-            loading: false,
-          };
-          initialVisibility[col.uid] = true;
-          initialSorts[col.uid] = { field: 'createdAt', order: 'desc' };
-        });
-        setCollectionPages(pages);
-        setVisibleTypeUids(initialVisibility);
-        setCollectionSorts(initialSorts);
-
-        if (res.data.relationsMeta) {
-          setRelationsMeta(res.data.relationsMeta);
-        }
-
-        const activeAttr = selectedAttribute || (res.data.attributes && res.data.attributes[0]);
-        if (!selectedAttribute && activeAttr) {
-          setSelectedAttribute(activeAttr);
-        }
-        if (activeAttr && res.data.relationsMeta && res.data.relationsMeta[activeAttr]) {
-          fetchRelationOptions(res.data.relationsMeta[activeAttr].targetUid);
-        }
+        applyModelsData(res.data);
+        try {
+          sessionStorage.setItem(MODELS_CACHE_KEY, JSON.stringify({ timestamp: Date.now(), data: res.data }));
+        } catch {}
       }
     } catch (err: any) {
       toggleNotification({
@@ -776,6 +818,9 @@ const BulkUpdater: React.FC = () => {
   const handleAttributeChange = (newAttr: string) => {
     if (newAttr !== selectedAttribute) {
       setSelectedAttribute(newAttr);
+      try {
+        localStorage.setItem(LAST_ATTR_KEY, newAttr);
+      } catch {}
       setSelectedEntries({});
       setFilterOperator('none');
       setFilterQuery('');
@@ -1403,7 +1448,26 @@ const BulkUpdater: React.FC = () => {
       {/* ======================================================== */}
       {/* TAB 1: BULK UPDATER EDITOR                               */}
       {/* ======================================================== */}
-      {activeTab === 'editor' && (
+      {activeTab === 'editor' && loading && collections.length === 0 ? (
+        <Box
+          padding={8}
+          background="neutral0"
+          shadow="filterShadow"
+          hasRadius
+          marginBottom={6}
+          style={{ width: '100%', textAlign: 'center' }}
+        >
+          <Flex direction="column" alignItems="center" gap={3}>
+            <Loader>Discovering schema attributes and collections...</Loader>
+            <Typography variant="delta" fontWeight="semiBold" textColor="neutral800">
+              Discovering Schema Attributes &amp; Collections...
+            </Typography>
+            <Typography variant="pi" textColor="neutral600">
+              Scanning collection types, components, and relations across your Strapi schema.
+            </Typography>
+          </Flex>
+        </Box>
+      ) : activeTab === 'editor' ? (
         <>
           {/* Main Control Panel: Attribute Dropdown + Value Input + Action Button */}
           <Box
@@ -1427,6 +1491,9 @@ const BulkUpdater: React.FC = () => {
                     autocomplete={{ type: 'list', filter: 'contains' }}
                     placeholder="Search attribute by name or relation..."
                     value={selectedAttribute}
+                    textValue={selectedAttribute}
+                    loading={loading && attributes.length === 0}
+                    loadingMessage="Discovering schema attributes..."
                     onChange={(val: any) => {
                       if (val && typeof val === 'string') {
                         handleAttributeChange(val);
@@ -1435,10 +1502,8 @@ const BulkUpdater: React.FC = () => {
                   >
                     {attributes.map((attr) => {
                       const rel = relationsMeta[attr];
-                      const cleanParts = attr.includes('.') ? attr.split('.').join(' ') : '';
-                      const labelText = `${attr} ${cleanParts} ${rel ? `relation ${rel.targetDisplayName}` : ''}`.trim();
                       return (
-                        <ComboboxOption key={attr} value={attr} textValue={labelText}>
+                        <ComboboxOption key={attr} value={attr} textValue={attr}>
                           <Flex justifyContent="space-between" alignItems="center" width="100%" gap={2}>
                             <Typography variant="omega" fontWeight={attr === selectedAttribute ? 'bold' : 'regular'}>
                               {attr}
@@ -2341,7 +2406,7 @@ const BulkUpdater: React.FC = () => {
         </Box>
       )}
     </>
-  )}
+  ) : null}
 
       {/* ======================================================== */}
       {/* TAB 2: AUDIT TRAIL & ROLLBACK HISTORY                    */}

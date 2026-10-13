@@ -758,22 +758,25 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       const collections = [];
       const signatures: string[] = [];
 
-      // 2. High-watermark check per collection
-      for (const uid of staticSchemaCache.targetUids) {
-        const meta = staticSchemaCache.metaByUid[uid];
-        if (!meta) continue;
+      // 2. High-watermark check per collection in parallel
+      const collectionResults = await Promise.all(
+        staticSchemaCache.targetUids.map(async (uid) => {
+          const meta = staticSchemaCache!.metaByUid[uid];
+          if (!meta) return null;
 
-        const signature = await getCollectionSignature(strapi, uid);
-        signatures.push(`${uid}=${signature}`);
+          const signature = await getCollectionSignature(strapi, uid);
+          const cached = modelsCache.get(uid);
+          if (cached && cached.signature === signature) {
+            return {
+              collection: {
+                ...meta,
+                totalEntries: cached.totalCount,
+                entries: cached.entries,
+              },
+              signature: `${uid}=${signature}`,
+            };
+          }
 
-        const cached = modelsCache.get(uid);
-        if (cached && cached.signature === signature) {
-          collections.push({
-            ...meta,
-            totalEntries: cached.totalCount,
-            entries: cached.entries,
-          });
-        } else {
           let entries: any[] = [];
           let totalCount = 0;
           try {
@@ -819,11 +822,21 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
             entries: formattedEntries,
           });
 
-          collections.push({
-            ...meta,
-            totalEntries: totalCount,
-            entries: formattedEntries,
-          });
+          return {
+            collection: {
+              ...meta,
+              totalEntries: totalCount,
+              entries: formattedEntries,
+            },
+            signature: `${uid}=${signature}`,
+          };
+        })
+      );
+
+      for (const res of collectionResults) {
+        if (res) {
+          collections.push(res.collection);
+          signatures.push(res.signature);
         }
       }
 

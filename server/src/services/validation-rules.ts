@@ -158,63 +158,118 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     let totalScanned = 0;
 
     const allContentTypes = strapi.contentTypes || {};
+    const allComponents = strapi.components || {};
+
+    // Helper: Checks if a content-type schema or any of its components has the target field
+    function schemaHasField(ctSchema: any): { hasField: boolean; populateAttrs: Record<string, any> } {
+      if (!ctSchema || !ctSchema.attributes) return { hasField: false, populateAttrs: {} };
+      const rawAttrs = ctSchema.attributes;
+      const populateAttrs: Record<string, any> = {};
+      let hasField = Boolean(rawAttrs[targetField]);
+
+      for (const [attrKey, attrDef] of Object.entries(rawAttrs) as any[]) {
+        if (attrDef.type === 'component' && attrDef.component) {
+          const comp = allComponents[attrDef.component];
+          if (comp?.attributes?.[targetField]) {
+            hasField = true;
+            populateAttrs[attrKey] = true;
+          }
+        } else if (attrDef.type === 'dynamiczone' && Array.isArray(attrDef.components)) {
+          const matchingComp = attrDef.components.some(
+            (compUid: string) => allComponents[compUid]?.attributes?.[targetField]
+          );
+          if (matchingComp) {
+            hasField = true;
+            populateAttrs[attrKey] = true;
+          }
+        }
+      }
+
+      return { hasField, populateAttrs };
+    }
+
     const candidateUids = Object.keys(allContentTypes).filter(
       (uid) => uid.startsWith('api::') && !uid.includes('bulk-updater')
     );
 
+    // Filter candidate collections to ONLY those that actually possess targetField in their schema
+    const relevantCollections: Array<{ uid: string; displayName: string; populateOption?: Record<string, any> }> = [];
     for (const uid of candidateUids) {
       const ct = allContentTypes[uid];
       if (!ct) continue;
-      const displayName = ct.info?.displayName || uid;
-
-      try {
-        const entries = await strapi.documents(uid as any).findMany({
-          populate: '*',
+      const { hasField, populateAttrs } = schemaHasField(ct);
+      if (hasField) {
+        relevantCollections.push({
+          uid,
+          displayName: ct.info?.displayName || uid,
+          populateOption: Object.keys(populateAttrs).length > 0 ? populateAttrs : undefined,
         });
-
-        for (const entry of (entries || []) as any[]) {
-          totalScanned++;
-          const counts: Record<string, number> = {};
-
-          function traverse(obj: any) {
-            if (!obj || typeof obj !== 'object') return;
-            for (const key of Object.keys(obj)) {
-              const val = obj[key];
-              if (key === targetField && typeof val === 'string' && val) {
-                const lower = val.toLowerCase();
-                counts[lower] = (counts[lower] || 0) + 1;
-              }
-              if (typeof val === 'object' && val !== null) {
-                traverse(val);
-              }
-            }
-          }
-
-          traverse(entry);
-
-          for (const [optKey, max] of Object.entries(quotas)) {
-            const lowerOpt = optKey.toLowerCase();
-            const actualCount = counts[lowerOpt] || 0;
-            if (actualCount > max) {
-              const entryLabel =
-                entry.title || entry.name || entry.email || `Entry #${entry.documentId}`;
-              violations.push({
-                uid,
-                collectionDisplayName: displayName,
-                documentId: entry.documentId,
-                entryLabel,
-                violatingOption: optKey.toUpperCase(),
-                foundCount: actualCount,
-                maxAllowed: max,
-                editUrl: `/admin/content-manager/collection-types/${uid}/${entry.documentId}`,
-              });
-            }
-          }
-        }
-      } catch (err) {
-        strapi.log.warn(`[bulk-updater] Failed scanning ${uid} for rule ${ruleId}:`, err);
       }
     }
+
+    const BATCH_SIZE = 250;
+
+    await Promise.all(
+      relevantCollections.map(async ({ uid, displayName, populateOption }) => {
+        try {
+          let page = 1;
+          while (true) {
+            const entries: any[] = await strapi.documents(uid as any).findMany({
+              page,
+              pageSize: BATCH_SIZE,
+              populate: populateOption,
+            });
+
+            if (!entries || entries.length === 0) break;
+
+            for (const entry of entries) {
+              totalScanned++;
+              const counts: Record<string, number> = {};
+
+              function traverse(obj: any) {
+                if (!obj || typeof obj !== 'object') return;
+                for (const key of Object.keys(obj)) {
+                  const val = obj[key];
+                  if (key === targetField && typeof val === 'string' && val) {
+                    const lower = val.toLowerCase();
+                    counts[lower] = (counts[lower] || 0) + 1;
+                  }
+                  if (typeof val === 'object' && val !== null) {
+                    traverse(val);
+                  }
+                }
+              }
+
+              traverse(entry);
+
+              for (const [optKey, max] of Object.entries(quotas)) {
+                const lowerOpt = optKey.toLowerCase();
+                const actualCount = counts[lowerOpt] || 0;
+                if (actualCount > max) {
+                  const entryLabel =
+                    entry.title || entry.name || entry.email || `Entry #${entry.documentId}`;
+                  violations.push({
+                    uid,
+                    collectionDisplayName: displayName,
+                    documentId: entry.documentId,
+                    entryLabel,
+                    violatingOption: optKey.toUpperCase(),
+                    foundCount: actualCount,
+                    maxAllowed: max,
+                    editUrl: `/admin/content-manager/collection-types/${uid}/${entry.documentId}`,
+                  });
+                }
+              }
+            }
+
+            if (entries.length < BATCH_SIZE) break;
+            page++;
+          }
+        } catch (err) {
+          strapi.log.warn(`[bulk-updater] Failed scanning ${uid} for rule ${ruleId}:`, err);
+        }
+      })
+    );
 
     return {
       rule,
