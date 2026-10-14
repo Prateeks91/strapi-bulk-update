@@ -9,11 +9,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       if (data?.etag) {
         ctx.set('ETag', data.etag);
         ctx.set('Cache-Control', 'private, no-cache');
-
-        if (ctx.request.headers['if-none-match'] === data.etag) {
-          ctx.status = 304;
-          return;
-        }
       }
 
       ctx.body = data;
@@ -42,11 +37,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       if (data?.etag) {
         ctx.set('ETag', data.etag);
         ctx.set('Cache-Control', 'private, no-cache');
-
-        if (ctx.request.headers['if-none-match'] === data.etag) {
-          ctx.status = 304;
-          return;
-        }
       }
 
       ctx.body = { success: true, ...data };

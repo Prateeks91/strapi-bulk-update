@@ -1063,10 +1063,15 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         let condition: any = undefined;
         const q = (filterQuery || '').trim();
 
+        const targetAttrSchema = isNestedAttr
+          ? (strapi.components as any)[attrs[parentKey]?.component]?.attributes?.[childKey]
+          : attrs[attribute];
+        const isStringLike = ['string', 'text', 'email', 'richtext', 'uid'].includes(targetAttrSchema?.type);
+
         if (normOp === 'empty') {
-          condition = { $or: [{ $null: true }, { $eq: '' }] };
+          condition = isStringLike ? { $or: [{ $null: true }, { $eq: '' }] } : { $null: true };
         } else if (normOp === 'notempty') {
-          condition = { $and: [{ $notNull: true }, { $ne: '' }] };
+          condition = isStringLike ? { $and: [{ $notNull: true }, { $ne: '' }] } : { $notNull: true };
         } else if (q !== '') {
           switch (normOp) {
             case 'equals':
@@ -1096,12 +1101,12 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
               [childKey]: condition,
             };
           } else {
-            if (normOp === 'empty') {
+            if (normOp === 'empty' && isStringLike) {
               filters.$or = [
                 { [attribute]: { $null: true } },
                 { [attribute]: { $eq: '' } },
               ];
-            } else if (normOp === 'notempty') {
+            } else if (normOp === 'notempty' && isStringLike) {
               filters[attribute] = { $notNull: true, $ne: '' };
             } else {
               filters[attribute] = condition;

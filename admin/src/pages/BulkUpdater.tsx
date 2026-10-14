@@ -640,10 +640,19 @@ const BulkUpdater: React.FC = () => {
         } catch {}
       }
     } catch (err: any) {
-      toggleNotification({
-        type: 'danger',
-        message: err.message || 'Failed to load collections data',
-      });
+      const isAborted =
+        err?.name === 'AbortError' ||
+        err?.name === 'CanceledError' ||
+        err?.code === 'ERR_CANCELED' ||
+        err?.message?.includes('aborted') ||
+        err?.message?.includes('canceled');
+
+      if (!isAborted) {
+        toggleNotification({
+          type: 'danger',
+          message: err?.message || 'Failed to load collections data',
+        });
+      }
     } finally {
       setLoading(false);
     }
@@ -699,13 +708,18 @@ const BulkUpdater: React.FC = () => {
       const res = await get(`/bulk-updater/collections/${colUid}/entries?${params.toString()}`);
       if (res.data && (res.data.success || res.data.entries !== undefined)) {
         const fetchedEntries: Entry[] = res.data.entries || [];
+        const pageNum = res.data.pagination?.page ?? targetPage ?? 1;
+        const pageSizeNum = res.data.pagination?.pageSize ?? size ?? defaultPageSize;
+        const totalNum = res.data.pagination?.total !== undefined ? res.data.pagination.total : fetchedEntries.length;
+        const pageCountNum = res.data.pagination?.pageCount ?? Math.max(1, Math.ceil(totalNum / pageSizeNum));
+
         setCollectionPages((prev) => ({
           ...prev,
           [colUid]: {
-            page: res.data.pagination.page,
-            pageSize: res.data.pagination.pageSize,
-            total: res.data.pagination.total,
-            pageCount: res.data.pagination.pageCount,
+            page: pageNum,
+            pageSize: pageSizeNum,
+            total: totalNum,
+            pageCount: pageCountNum,
             entries: fetchedEntries,
             loading: false,
           },
@@ -726,10 +740,19 @@ const BulkUpdater: React.FC = () => {
         }
       }
     } catch (err: any) {
-      toggleNotification({
-        type: 'danger',
-        message: `Failed to load entries for ${colUid}: ${err.message}`,
-      });
+      const isAborted =
+        err?.name === 'AbortError' ||
+        err?.name === 'CanceledError' ||
+        err?.code === 'ERR_CANCELED' ||
+        err?.message?.includes('aborted') ||
+        err?.message?.includes('canceled');
+
+      if (!isAborted) {
+        toggleNotification({
+          type: 'danger',
+          message: `Failed to load entries for ${colUid}: ${err?.message || 'Network error'}`,
+        });
+      }
       setCollectionPages((prev) => ({
         ...prev,
         [colUid]: {
@@ -754,10 +777,19 @@ const BulkUpdater: React.FC = () => {
         }
       }
     } catch (err: any) {
-      toggleNotification({
-        type: 'danger',
-        message: err.message || 'Failed to fetch audit history.',
-      });
+      const isAborted =
+        err?.name === 'AbortError' ||
+        err?.name === 'CanceledError' ||
+        err?.code === 'ERR_CANCELED' ||
+        err?.message?.includes('aborted') ||
+        err?.message?.includes('canceled');
+
+      if (!isAborted) {
+        toggleNotification({
+          type: 'danger',
+          message: err?.message || 'Failed to fetch audit history.',
+        });
+      }
     } finally {
       setAuditLoading(false);
     }
