@@ -688,6 +688,216 @@ async function executeBatchInternal(
   };
 }
 
+/**
+ * Executes a bulk publish operation directly across selected entries and collections.
+ */
+async function executePublishBatchInternal(
+  strapi: Core.Strapi,
+  {
+    selectedEntries = [],
+    selectedCollections = [],
+  }: {
+    selectedEntries?: Array<{ uid: string; documentId: string }>;
+    selectedCollections?: string[];
+  },
+  currentUser?: any,
+  existingBatchId?: string
+) {
+  const targetsMap = new Map<string, { uid: string; documentId: string }>();
+
+  // 1. Add entire collections if selected
+  for (const colUid of selectedCollections) {
+    if (!strapi.contentTypes[colUid]) continue;
+    const entries = await (strapi.documents(colUid as any) as any).findMany();
+    for (const entry of (entries || []) as any[]) {
+      const key = `${colUid}@@@${entry.documentId}`;
+      targetsMap.set(key, { uid: colUid, documentId: entry.documentId });
+    }
+  }
+
+  // 2. Add individually selected entries
+  for (const item of selectedEntries) {
+    if (!item.uid || !item.documentId) continue;
+    const key = `${item.uid}@@@${item.documentId}`;
+    targetsMap.set(key, { uid: item.uid, documentId: item.documentId });
+  }
+
+  if (targetsMap.size === 0) {
+    throw new Error('No collections or entries were selected to publish.');
+  }
+
+  const batchId = existingBatchId || `batch_pub_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+  const results: any[] = [];
+  let publishedCount = 0;
+  let skippedCount = 0;
+
+  const jobState: BatchJobState = {
+    id: batchId,
+    createdAt: new Date().toISOString(),
+    startedAt: new Date().toISOString(),
+    createdBy: currentUser
+      ? {
+          id: currentUser.id,
+          email: currentUser.email,
+          firstname: currentUser.firstname,
+          lastname: currentUser.lastname,
+          username: currentUser.username,
+        }
+      : { email: 'admin@system.local' },
+    status: 'processing',
+    executionMode: 'immediate',
+    attribute: '(publish)',
+    value: 'published',
+    totalTargets: targetsMap.size,
+    processedCount: 0,
+    updatedCount: 0,
+    skippedCount: 0,
+    failedCount: 0,
+    isLive: false,
+    publishOnApproval: true,
+    results: [],
+  };
+  batchJobsMap.set(batchId, jobState);
+
+  const targets = Array.from(targetsMap.values());
+  const CHUNK_SIZE = 25;
+
+  for (let i = 0; i < targets.length; i += CHUNK_SIZE) {
+    const chunk = targets.slice(i, i + CHUNK_SIZE);
+
+    const chunkPromises = chunk.map(async (target) => {
+      try {
+        const contentType = strapi.contentTypes[target.uid];
+        const displayName = contentType?.info?.displayName || target.uid;
+        const isDraftAndPublish = Boolean(contentType?.options?.draftAndPublish);
+
+        let existingDoc: any = null;
+        try {
+          existingDoc = await (strapi.documents(target.uid as any) as any).findOne({
+            documentId: target.documentId,
+          });
+        } catch {
+          existingDoc = null;
+        }
+
+        const entryLabel =
+          existingDoc?.name ||
+          existingDoc?.title ||
+          existingDoc?.label ||
+          existingDoc?.documentId ||
+          `Entry #${target.documentId}`;
+
+        if (!isDraftAndPublish) {
+          return {
+            uid: target.uid,
+            collectionName: displayName,
+            documentId: target.documentId,
+            label: entryLabel,
+            attribute: '(publish)',
+            status: 'skipped' as const,
+            message: `Skipped: Draft & Publish is disabled for collection ${displayName}`,
+          };
+        }
+
+        const isAlreadyPublished = Boolean(existingDoc?.publishedAt);
+
+        await (strapi.documents(target.uid as any) as any).publish({
+          documentId: target.documentId,
+        });
+
+        invalidateCollectionCache(target.uid);
+
+        return {
+          uid: target.uid,
+          collectionName: displayName,
+          documentId: target.documentId,
+          label: entryLabel,
+          attribute: '(publish)',
+          oldValue: isAlreadyPublished ? 'published' : 'draft',
+          newValue: 'published',
+          status: 'updated' as const,
+          message: isAlreadyPublished
+            ? 'Re-published latest version live'
+            : 'Successfully published to live',
+        };
+      } catch (pubErr: any) {
+        return {
+          uid: target.uid,
+          collectionName: strapi.contentTypes[target.uid]?.info?.displayName || target.uid,
+          documentId: target.documentId,
+          label: `Entry #${target.documentId}`,
+          attribute: '(publish)',
+          status: 'error' as const,
+          message: pubErr.message || 'Failed to publish entry',
+        };
+      }
+    });
+
+    const chunkResults = await Promise.all(chunkPromises);
+    for (const res of chunkResults) {
+      if (res.status === 'updated') publishedCount++;
+      else if (res.status === 'skipped') skippedCount++;
+      results.push(res);
+    }
+    jobState.processedCount = results.length;
+    jobState.updatedCount = publishedCount;
+    jobState.skippedCount = skippedCount;
+    jobState.failedCount = results.filter((r) => r.status === 'error').length;
+  }
+
+  const affectedUids = new Set(targets.map((t) => t.uid));
+  affectedUids.forEach((uid) => {
+    invalidateCollectionCache(uid);
+  });
+
+  const failedCount = results.filter((r) => r.status === 'error').length;
+  jobState.failedCount = failedCount;
+  jobState.completedAt = new Date().toISOString();
+  jobState.isLive = publishedCount > 0;
+  jobState.status =
+    failedCount === 0 && publishedCount > 0
+      ? 'successful'
+      : failedCount > 0 && publishedCount > 0
+      ? 'partial_failure'
+      : failedCount > 0
+      ? 'failed'
+      : 'successful';
+  jobState.results = results.map((r) => ({
+    ...r,
+    isLive: r.status === 'updated',
+  }));
+
+  const batchSummary = {
+    batchId,
+    attribute: '(publish)',
+    value: 'published',
+    updatedCount: publishedCount,
+    skippedCount,
+    totalTargets: targetsMap.size,
+    publishOnApproval: true,
+  };
+
+  // Stateless audit recording
+  await strapi.plugin('bulk-updater').service('audit').recordBatch(
+    batchSummary,
+    results,
+    currentUser
+  );
+
+  return {
+    success: true,
+    batchId,
+    publishedCount,
+    updatedCount: publishedCount,
+    skippedCount,
+    failedCount,
+    totalTargets: targetsMap.size,
+    isLive: publishedCount > 0,
+    status: jobState.status,
+    results,
+  };
+}
+
 export default ({ strapi }: { strapi: Core.Strapi }) => {
   // Initialize periodic runner for off-peak queue execution
   if (!runnerInterval) {
@@ -701,7 +911,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         for (const [id, batch] of pendingBatches.entries()) {
           if (batch.status === 'queued_offpeak' && !isBusinessHours) {
             strapi.log.info(`[bulk-updater] Executing off-peak queued batch: ${id}`);
-            const result = await executeBatchInternal(strapi, batch.payload, batch.createdBy, id);
+            const result = batch.payload?.action === 'publish'
+              ? await executePublishBatchInternal(strapi, batch.payload, batch.createdBy, id)
+              : await executeBatchInternal(strapi, batch.payload, batch.createdBy, id);
             batch.status = 'executed';
             batch.executionResult = result;
           }
@@ -827,6 +1039,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
             uid,
             kind: contentType.kind,
             isSingleType,
+            draftAndPublish: Boolean(contentType.options?.draftAndPublish),
             singularName: contentType.info?.singularName || uid,
             pluralName: contentType.info?.pluralName || uid,
             displayName: contentType.info?.displayName || uid,
@@ -1048,6 +1261,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
             uid,
             displayName: contentType.info?.displayName || uid,
             isSingleType,
+            draftAndPublish: Boolean(contentType.options?.draftAndPublish),
             entries: [],
             pagination: {
               page: 1,
@@ -1149,6 +1363,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           uid,
           displayName: contentType.info?.displayName || uid,
           isSingleType: true,
+          draftAndPublish: Boolean(contentType.options?.draftAndPublish),
           entries: singleDoc ? [singleDoc] : [],
           pagination: {
             page: 1,
@@ -1199,6 +1414,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           uid,
           displayName: contentType.info?.displayName || uid,
           isSingleType: false,
+          draftAndPublish: Boolean(contentType.options?.draftAndPublish),
           entries: (entries || []).map((entry: any) => ({
             id: entry.id,
             documentId: entry.documentId,
@@ -1791,6 +2007,232 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
     },
 
     /**
+     * Bulk Publish selected entries or collections
+     */
+    async batchPublish(
+      {
+        selectedEntries = [],
+        selectedCollections = [],
+        executionMode = 'immediate',
+        makerNotes = '',
+        forceImmediate = false,
+      }: {
+        selectedEntries?: Array<{ uid: string; documentId: string }>;
+        selectedCollections?: string[];
+        executionMode?: 'immediate' | 'queue_offpeak' | 'maker_checker';
+        makerNotes?: string;
+        forceImmediate?: boolean;
+      },
+      currentUser?: any
+    ) {
+      const executionConfig = getExecutionWindowConfig(strapi);
+      const { isBusinessHours, policyMessage } = checkBusinessHours(executionConfig);
+
+      // 1. Enterprise Maker-Checker Flow:
+      if (executionMode === 'maker_checker') {
+        const summary = await computeTargetsSummary(strapi, { selectedCollections, selectedEntries });
+        if (summary.totalTargets === 0) {
+          throw new Error('No collections or entries were selected to publish.');
+        }
+
+        const batchId = `batch_pub_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+        const batch: PendingBatch = {
+          id: batchId,
+          createdAt: new Date().toISOString(),
+          createdBy: currentUser
+            ? {
+                id: currentUser.id,
+                email: currentUser.email,
+                firstname: currentUser.firstname,
+                lastname: currentUser.lastname,
+                username: currentUser.username,
+              }
+            : { email: 'admin@system.local' },
+          payload: { action: 'publish', attribute: '(publish)', value: 'published', selectedEntries, selectedCollections, publishOnApproval: true },
+          summary: {
+            attribute: '(publish)',
+            value: 'published',
+            totalTargets: summary.totalTargets,
+            collectionBreakdown: summary.collectionBreakdown,
+            publishOnApproval: true,
+          },
+          status: 'pending_approval',
+          executionMode: 'maker_checker',
+          makerNotes,
+        };
+
+        pendingBatches.set(batchId, batch);
+        batchJobsMap.set(batchId, {
+          id: batchId,
+          createdAt: batch.createdAt,
+          createdBy: batch.createdBy,
+          status: 'pending_approval',
+          executionMode: 'maker_checker',
+          attribute: '(publish)',
+          value: 'published',
+          totalTargets: summary.totalTargets,
+          processedCount: 0,
+          updatedCount: 0,
+          skippedCount: 0,
+          failedCount: 0,
+          isLive: false,
+          publishOnApproval: true,
+          makerNotes,
+          results: [],
+        });
+
+        return {
+          success: true,
+          pending: true,
+          batchId,
+          status: 'pending_approval',
+          message: 'Bulk publish batch submitted for Checker authorization (4-Eyes Maker-Checker Workflow).',
+          batch,
+        };
+      }
+
+      // 2. Off-Peak Queued Batch:
+      if (executionMode === 'queue_offpeak') {
+        const summary = await computeTargetsSummary(strapi, { selectedCollections, selectedEntries });
+        if (summary.totalTargets === 0) {
+          throw new Error('No collections or entries were selected to publish.');
+        }
+
+        const batchId = `batch_pub_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+        const batch: PendingBatch = {
+          id: batchId,
+          createdAt: new Date().toISOString(),
+          createdBy: currentUser
+            ? {
+                id: currentUser.id,
+                email: currentUser.email,
+                firstname: currentUser.firstname,
+                lastname: currentUser.lastname,
+                username: currentUser.username,
+              }
+            : { email: 'admin@system.local' },
+          payload: { action: 'publish', attribute: '(publish)', value: 'published', selectedEntries, selectedCollections, publishOnApproval: true },
+          summary: {
+            attribute: '(publish)',
+            value: 'published',
+            totalTargets: summary.totalTargets,
+            collectionBreakdown: summary.collectionBreakdown,
+            publishOnApproval: true,
+          },
+          status: 'queued_offpeak',
+          executionMode: 'queue_offpeak',
+          scheduledFor: executionConfig.offPeakStartTime,
+          makerNotes,
+        };
+
+        pendingBatches.set(batchId, batch);
+        batchJobsMap.set(batchId, {
+          id: batchId,
+          createdAt: batch.createdAt,
+          createdBy: batch.createdBy,
+          status: 'queued_offpeak',
+          executionMode: 'queue_offpeak',
+          scheduledFor: executionConfig.offPeakStartTime,
+          attribute: '(publish)',
+          value: 'published',
+          totalTargets: summary.totalTargets,
+          processedCount: 0,
+          updatedCount: 0,
+          skippedCount: 0,
+          failedCount: 0,
+          isLive: false,
+          publishOnApproval: true,
+          makerNotes,
+          results: [],
+        });
+
+        return {
+          success: true,
+          pending: true,
+          batchId,
+          status: 'queued_offpeak',
+          scheduledFor: executionConfig.offPeakStartTime,
+          message: `Bulk publish batch queued for server off-peak maintenance window (${executionConfig.offPeakStartTime}).`,
+          batch,
+        };
+      }
+
+      // 3. Peak hours auto-queue check
+      if (executionConfig.enabled && executionConfig.autoQueueDuringBusinessHours && isBusinessHours && !forceImmediate) {
+        const summary = await computeTargetsSummary(strapi, { selectedCollections, selectedEntries });
+        if (summary.totalTargets === 0) {
+          throw new Error('No collections or entries were selected to publish.');
+        }
+
+        const batchId = `batch_pub_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+        const batch: PendingBatch = {
+          id: batchId,
+          createdAt: new Date().toISOString(),
+          createdBy: currentUser
+            ? {
+                id: currentUser.id,
+                email: currentUser.email,
+                firstname: currentUser.firstname,
+                lastname: currentUser.lastname,
+                username: currentUser.username,
+              }
+            : { email: 'admin@system.local' },
+          payload: { action: 'publish', attribute: '(publish)', value: 'published', selectedEntries, selectedCollections, publishOnApproval: true },
+          summary: {
+            attribute: '(publish)',
+            value: 'published',
+            totalTargets: summary.totalTargets,
+            collectionBreakdown: summary.collectionBreakdown,
+            publishOnApproval: true,
+          },
+          status: 'queued_offpeak',
+          executionMode: 'queue_offpeak',
+          scheduledFor: executionConfig.offPeakStartTime,
+          makerNotes: 'Automatically queued due to peak business hours restriction.',
+        };
+
+        pendingBatches.set(batchId, batch);
+        batchJobsMap.set(batchId, {
+          id: batchId,
+          createdAt: batch.createdAt,
+          createdBy: batch.createdBy,
+          status: 'queued_offpeak',
+          executionMode: 'queue_offpeak',
+          scheduledFor: executionConfig.offPeakStartTime,
+          attribute: '(publish)',
+          value: 'published',
+          totalTargets: summary.totalTargets,
+          processedCount: 0,
+          updatedCount: 0,
+          skippedCount: 0,
+          failedCount: 0,
+          isLive: false,
+          publishOnApproval: true,
+          policyMessage,
+          makerNotes: 'Automatically queued due to peak business hours restriction.',
+          results: [],
+        });
+
+        return {
+          success: true,
+          pending: true,
+          batchId,
+          status: 'queued_offpeak',
+          scheduledFor: executionConfig.offPeakStartTime,
+          message: policyMessage,
+          batch,
+        };
+      }
+
+      // 4. Immediate execution
+      return await executePublishBatchInternal(
+        strapi,
+        { selectedEntries, selectedCollections },
+        currentUser
+      );
+    },
+
+    /**
      * Get Pending & Queued Batches
      */
     getPendingBatches() {
@@ -1840,7 +2282,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
       if (options.executeImmediately || !isBusinessHours) {
         batch.status = 'approved';
-        const result = await executeBatchInternal(strapi, batch.payload, checkerUser, batch.id);
+        const result = batch.payload?.action === 'publish'
+          ? await executePublishBatchInternal(strapi, batch.payload, checkerUser, batch.id)
+          : await executeBatchInternal(strapi, batch.payload, checkerUser, batch.id);
         batch.status = 'executed';
         batch.executionResult = result;
         return {
@@ -1907,7 +2351,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         throw new Error(`Batch ${batchId} has already been executed.`);
       }
 
-      const result = await executeBatchInternal(strapi, batch.payload, currentUser, batch.id);
+      const result = batch.payload?.action === 'publish'
+        ? await executePublishBatchInternal(strapi, batch.payload, currentUser, batch.id)
+        : await executeBatchInternal(strapi, batch.payload, currentUser, batch.id);
       batch.status = 'executed';
       batch.executionResult = result;
 

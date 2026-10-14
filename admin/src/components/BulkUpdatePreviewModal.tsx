@@ -49,6 +49,7 @@ interface BulkUpdatePreviewModalProps {
   } | null;
   attribute: string;
   targetValueDisplay: string;
+  publishOnApproval?: boolean;
 }
 
 const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
@@ -59,6 +60,7 @@ const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
   previewData,
   attribute,
   targetValueDisplay,
+  publishOnApproval = true,
 }) => {
   const [filterTab, setFilterTab] = useState<'all' | 'will_update' | 'unchanged' | 'will_skip'>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -144,12 +146,18 @@ const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
               </Typography>
             </Box>
 
-            <Flex gap={2} alignItems="center">
+            <Flex gap={2} alignItems="center" wrap="wrap">
               <Typography variant="pi" textColor="neutral600">
                 New Value:
               </Typography>
               <Badge backgroundColor="success100" textColor="success700">
                 {targetValueDisplay || '(empty)'}
+              </Badge>
+              <Badge
+                backgroundColor={publishOnApproval !== false ? 'success100' : 'warning100'}
+                textColor={publishOnApproval !== false ? 'success700' : 'warning700'}
+              >
+                {publishOnApproval !== false ? '✓ LIVE PUBLISH' : 'DRAFT ONLY'}
               </Badge>
             </Flex>
           </Flex>

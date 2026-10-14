@@ -46,6 +46,7 @@ interface CollectionModel {
   uid: string;
   kind?: string;
   isSingleType?: boolean;
+  draftAndPublish?: boolean;
   singularName: string;
   pluralName: string;
   displayName: string;
@@ -443,6 +444,11 @@ const BulkUpdater: React.FC = () => {
   const [showPreviewModal, setShowPreviewModal] = useState<boolean>(false);
   const [previewLoading, setPreviewLoading] = useState<boolean>(false);
   const [previewData, setPreviewData] = useState<any>(null);
+
+  // Bulk Publish Modal State
+  const [showPublishConfirmModal, setShowPublishConfirmModal] = useState<boolean>(false);
+  const [publishing, setPublishing] = useState<boolean>(false);
+  const [publishMakerNotesInput, setPublishMakerNotesInput] = useState<string>('');
 
   // Managed Cache Keys
   const MODELS_CACHE_KEY = 'strapi_bulk_updater_models_cache';
@@ -1426,6 +1432,167 @@ const BulkUpdater: React.FC = () => {
     }
   };
 
+  // Open Bulk Publish Modal
+  const handleOpenPublishModal = () => {
+    const totalSelected = Object.values(selectedEntries).filter(Boolean).length;
+    if (totalSelected === 0) {
+      toggleNotification({
+        type: 'warning',
+        message: 'Please select at least one collection type or entry to publish',
+      });
+      return;
+    }
+    setShowPublishConfirmModal(true);
+  };
+
+  // Perform bulk publish with chosen mode
+  const executeBatchPublish = async (
+    executionMode: 'immediate' | 'queue_offpeak' | 'maker_checker',
+    forceImmediate = false
+  ) => {
+    const targets: Array<{ uid: string; documentId: string }> = [];
+    Object.keys(selectedEntries).forEach((key) => {
+      if (selectedEntries[key]) {
+        const parts = key.split(KEY_SEP);
+        if (parts.length === 2) {
+          targets.push({ uid: parts[0], documentId: parts[1] });
+        }
+      }
+    });
+
+    try {
+      setPublishing(true);
+      setShowPublishConfirmModal(false);
+      setShowProcessingDashboard(true);
+      setIsSubmittingBatch(true);
+      setLastResults(null);
+
+      // Initialize live dashboard job tracker
+      const tempBatchId = `batch_pub_${Date.now()}`;
+      setDashboardBatchId(tempBatchId);
+      setDashboardJob({
+        id: tempBatchId,
+        createdAt: new Date().toISOString(),
+        status: 'processing',
+        executionMode,
+        attribute: '(publish)',
+        value: 'published',
+        totalTargets: targets.length,
+        processedCount: 0,
+        updatedCount: 0,
+        skippedCount: 0,
+        failedCount: 0,
+        isLive: true,
+        publishOnApproval: true,
+        results: [],
+      });
+
+      const payload = {
+        selectedEntries: targets,
+        executionMode,
+        makerNotes: publishMakerNotesInput,
+        forceImmediate,
+      };
+
+      const res = await post('/bulk-updater/batch-publish', payload);
+
+      setIsSubmittingBatch(false);
+
+      if (res.data && res.data.success) {
+        setSelectedEntries({});
+        const finalBatchId = res.data.batchId;
+        setDashboardBatchId(finalBatchId);
+
+        if (res.data.pending) {
+          setDashboardJob({
+            id: finalBatchId,
+            createdAt: new Date().toISOString(),
+            status: res.data.status || 'pending_approval',
+            executionMode,
+            scheduledFor: res.data.scheduledFor,
+            attribute: '(publish)',
+            value: 'published',
+            totalTargets: targets.length,
+            processedCount: 0,
+            updatedCount: 0,
+            skippedCount: 0,
+            failedCount: 0,
+            isLive: true,
+            publishOnApproval: true,
+            makerNotes: publishMakerNotesInput,
+            policyMessage: res.data.message,
+            results: [],
+          });
+
+          toggleNotification({
+            type: 'success',
+            message: res.data.message || 'Publish batch submitted successfully.',
+          });
+          await fetchPendingBatches();
+        } else {
+          setLastResults(res.data.results || []);
+          setUpdateSummary({
+            updatedCount: res.data.publishedCount || 0,
+            skippedCount: res.data.skippedCount || 0,
+            batchId: res.data.batchId,
+          });
+
+          setDashboardJob({
+            id: finalBatchId,
+            createdAt: new Date().toISOString(),
+            completedAt: new Date().toISOString(),
+            status: res.data.status || 'successful',
+            executionMode: 'immediate',
+            attribute: '(publish)',
+            value: 'published',
+            totalTargets: res.data.totalTargets || targets.length,
+            processedCount: res.data.results?.length || targets.length,
+            updatedCount: res.data.publishedCount || 0,
+            skippedCount: res.data.skippedCount || 0,
+            failedCount: res.data.failedCount || 0,
+            isLive: true,
+            publishOnApproval: true,
+            results: res.data.results || [],
+          });
+
+          toggleNotification({
+            type: 'success',
+            message: `Bulk publish complete! Batch ID: ${res.data.batchId}. Published: ${res.data.publishedCount}, Skipped: ${res.data.skippedCount}`,
+          });
+
+          await fetchModels();
+          await fetchAuditHistory();
+        }
+      } else {
+        setIsSubmittingBatch(false);
+        setDashboardJob((prev: any) => ({
+          ...prev,
+          status: 'failed',
+          error: res.data?.error || 'Batch publish encountered an error',
+        }));
+        toggleNotification({
+          type: 'danger',
+          message: res.data?.error || 'Batch publish encountered an error',
+        });
+      }
+    } catch (err: any) {
+      setIsSubmittingBatch(false);
+      const errMsg = err.response?.data?.error || err.message || 'Batch publish failed';
+      setDashboardJob((prev: any) => ({
+        ...prev,
+        status: 'failed',
+        error: errMsg,
+      }));
+      toggleNotification({
+        type: 'danger',
+        message: errMsg,
+      });
+    } finally {
+      setPublishing(false);
+      setPublishMakerNotesInput('');
+    }
+  };
+
   // Checker Approves Batch
   const handleApproveBatch = async (batchId: string) => {
     try {
@@ -1918,7 +2085,7 @@ const BulkUpdater: React.FC = () => {
                 )}
               </Box>
 
-              {/* Action Buttons: Preview & Update */}
+              {/* Action Buttons: Preview, Update & Publish */}
               <Flex gap={2} alignItems="center" wrap="wrap">
                 <Button
                   startIcon={<Eye />}
@@ -1940,8 +2107,44 @@ const BulkUpdater: React.FC = () => {
                 >
                   Update Selected ({totalSelectedCount})
                 </Button>
+                <Button
+                  startIcon={<Check />}
+                  variant="success-light"
+                  size="L"
+                  onClick={handleOpenPublishModal}
+                  loading={publishing}
+                  disabled={loading || totalSelectedCount === 0}
+                  title="Directly publish selected draft records across collections"
+                >
+                  Publish Selected ({totalSelectedCount})
+                </Button>
               </Flex>
             </Flex>
+
+            {/* Auto-Publish upon Update Setting */}
+            <Box marginTop={4} padding={4} background="neutral100" hasRadius style={{ border: '1px solid #eaeaef' }}>
+              <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={3}>
+                <Flex gap={2} alignItems="center">
+                  <Checkbox
+                    checked={publishOnApproval}
+                    onCheckedChange={(checked: boolean) => setPublishOnApproval(Boolean(checked))}
+                  >
+                    <Typography fontWeight="bold">Auto-Publish after Update</Typography>
+                  </Checkbox>
+                  <Badge
+                    backgroundColor={publishOnApproval ? 'success100' : 'warning100'}
+                    textColor={publishOnApproval ? 'success700' : 'warning700'}
+                  >
+                    {publishOnApproval ? '✓ LIVE PUBLISH' : 'DRAFT ONLY'}
+                  </Badge>
+                </Flex>
+                <Typography variant="pi" textColor="neutral600">
+                  {publishOnApproval
+                    ? 'When enabled, entries will be published live immediately upon batch execution for draft-enabled content types.'
+                    : 'When disabled, entries will be saved as draft versions without publishing to live visitors.'}
+                </Typography>
+              </Flex>
+            </Box>
 
             {/* Pro Feature: Regex Search & Replace */}
             <Box marginTop={4} padding={4} background="neutral100" hasRadius>
@@ -3495,6 +3698,214 @@ const BulkUpdater: React.FC = () => {
         </div>
       )}
 
+      {/* Confirmation Modal for Direct Bulk Publish */}
+      {showPublishConfirmModal && (
+        <div
+          style={{
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            backgroundColor: 'rgba(0, 0, 0, 0.5)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 100,
+          }}
+          onClick={() => setShowPublishConfirmModal(false)}
+        >
+          <Box
+            background="neutral0"
+            hasRadius
+            style={{
+              width: '90%',
+              maxWidth: 620,
+              maxHeight: '90vh',
+              display: 'flex',
+              flexDirection: 'column',
+              boxShadow: '0 10px 40px rgba(0, 0, 0, 0.25)',
+              overflow: 'hidden',
+            }}
+            onClick={(e: React.MouseEvent) => e.stopPropagation()}
+          >
+            {/* Modal Header */}
+            <Box
+              padding={5}
+              background="neutral100"
+              style={{
+                borderBottom: '1px solid rgba(120, 120, 150, 0.2)',
+                flexShrink: 0,
+              }}
+            >
+              <Flex justifyContent="space-between" alignItems="center">
+                <Box>
+                  <Typography variant="beta" fontWeight="bold">
+                    Confirm Bulk Publish
+                  </Typography>
+                  <Box marginTop={1}>
+                    <Typography variant="pi" textColor="neutral600">
+                      Publish selected draft records live to visitors across content types
+                    </Typography>
+                  </Box>
+                </Box>
+                <Badge backgroundColor="success100" textColor="success700">
+                  {totalSelectedCount} Selected
+                </Badge>
+              </Flex>
+            </Box>
+
+            {/* Modal Scrollable Body */}
+            <Box
+              padding={5}
+              style={{
+                overflowY: 'auto',
+                flexGrow: 1,
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 16,
+              }}
+            >
+              <Box padding={4} background="neutral100" hasRadius style={{ border: '1px solid #eaeaef' }}>
+                <Typography variant="omega" fontWeight="bold">
+                  Collection Breakdown:
+                </Typography>
+                <Box marginTop={2}>
+                  {collections
+                    .filter((col) =>
+                      col.entries.some((entry) => selectedEntries[`${col.uid}${KEY_SEP}${entry.documentId}`])
+                    )
+                    .map((col) => {
+                      const count = col.entries.filter(
+                        (entry) => selectedEntries[`${col.uid}${KEY_SEP}${entry.documentId}`]
+                      ).length;
+                      const hasDraftAndPublish = col.draftAndPublish !== false;
+
+                      return (
+                        <Flex
+                          key={col.uid}
+                          justifyContent="space-between"
+                          alignItems="center"
+                          paddingTop={2}
+                          paddingBottom={2}
+                          style={{ borderBottom: '1px dashed #eaeaef' }}
+                        >
+                          <Typography variant="pi">
+                            <strong>{col.displayName}</strong> ({col.uid})
+                          </Typography>
+                          <Flex gap={2} alignItems="center">
+                            <Badge backgroundColor="neutral150" textColor="neutral700">
+                              {count} {count === 1 ? 'entry' : 'entries'}
+                            </Badge>
+                            {hasDraftAndPublish ? (
+                              <Badge backgroundColor="success100" textColor="success700">
+                                ✓ Draft &amp; Publish Enabled
+                              </Badge>
+                            ) : (
+                              <Badge backgroundColor="warning100" textColor="warning700">
+                                ⚠️ Skipped (Drafts Disabled)
+                              </Badge>
+                            )}
+                          </Flex>
+                        </Flex>
+                      );
+                    })}
+                </Box>
+              </Box>
+
+              {/* Business Hours Warning Banner */}
+              {executionWindow?.isBusinessHours && (
+                <Box
+                  padding={4}
+                  background="warning100"
+                  hasRadius
+                  style={{ border: '1px solid #f5c0b8' }}
+                >
+                  <Typography variant="pi" fontWeight="bold" textColor="warning700">
+                    ⚠️ Business Hours Active:
+                  </Typography>
+                  <Typography variant="pi" textColor="warning700" style={{ display: 'block', marginTop: 4 }}>
+                    It is currently business peak hours ({executionWindow.currentTime}). To prevent API latency spikes, publish requests should be queued for off-peak hours ({executionWindow.offPeakStartTime}) or submitted for governance review.
+                  </Typography>
+                </Box>
+              )}
+
+              {/* Maker-Checker Notes Input */}
+              <Box>
+                <Typography variant="pi" fontWeight="bold">
+                  Governance Notes / Reason (Optional):
+                </Typography>
+                <Box marginTop={1}>
+                  <TextInput
+                    name="publishMakerNotes"
+                    placeholder="e.g. Publishing Q3 catalog release updates"
+                    value={publishMakerNotesInput}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setPublishMakerNotesInput(e.target.value)}
+                  />
+                </Box>
+              </Box>
+            </Box>
+
+            {/* Modal Footer */}
+            <Box
+              padding={4}
+              background="neutral100"
+              style={{
+                borderTop: '1px solid rgba(120, 120, 150, 0.2)',
+                flexShrink: 0,
+                boxShadow: '0 -4px 16px rgba(0, 0, 0, 0.08)',
+              }}
+            >
+              <Flex justifyContent="space-between" alignItems="center" gap={3} style={{ width: '100%' }}>
+                <Button variant="tertiary" size="M" onClick={() => setShowPublishConfirmModal(false)}>
+                  Cancel
+                </Button>
+                <Flex gap={2} wrap="wrap" justifyContent="flex-end" alignItems="center">
+                  <Button
+                    variant={executionWindow?.isBusinessHours ? 'default' : 'secondary'}
+                    size="M"
+                    onClick={() => executeBatchPublish('maker_checker')}
+                    loading={publishing}
+                  >
+                    Submit for Checker Approval
+                  </Button>
+
+                  {executionWindow?.isBusinessHours ? (
+                    <>
+                      <Button
+                        variant="secondary"
+                        size="M"
+                        onClick={() => executeBatchPublish('queue_offpeak')}
+                        loading={publishing}
+                      >
+                        Queue for Off-Peak ({executionWindow?.offPeakStartTime || '18:00'})
+                      </Button>
+                      <Button
+                        variant="danger-light"
+                        size="S"
+                        onClick={() => executeBatchPublish('immediate', true)}
+                        loading={publishing}
+                      >
+                        Force Publish Now
+                      </Button>
+                    </>
+                  ) : (
+                    <Button
+                      variant="default"
+                      size="M"
+                      onClick={() => executeBatchPublish('immediate')}
+                      loading={publishing}
+                    >
+                      Confirm &amp; Publish Now
+                    </Button>
+                  )}
+                </Flex>
+              </Flex>
+            </Box>
+          </Box>
+        </div>
+      )}
+
       {/* Pre-Update Change Preview Modal */}
       <BulkUpdatePreviewModal
         isOpen={showPreviewModal}
@@ -3506,6 +3917,7 @@ const BulkUpdater: React.FC = () => {
         loading={previewLoading}
         previewData={previewData}
         attribute={selectedAttribute}
+        publishOnApproval={publishOnApproval}
         targetValueDisplay={
           relationsMeta[selectedAttribute]
             ? (selectedRelationDocId === '__clear__'

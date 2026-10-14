@@ -36,6 +36,14 @@ export default {
       },
       {
         method: 'POST',
+        path: '/batch-publish',
+        handler: 'bulkUpdater.batchPublish',
+        config: {
+          policies: [],
+        },
+      },
+      {
+        method: 'POST',
         path: '/preview',
         handler: 'bulkUpdater.previewBatch',
         config: {
