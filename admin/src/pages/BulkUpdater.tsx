@@ -22,10 +22,11 @@ import {
   Field,
   Loader,
 } from '@strapi/design-system';
-import { Play, ArrowClockwise, Check, Download } from '@strapi/icons';
+import { Play, ArrowClockwise, Check, Download, Eye } from '@strapi/icons';
 import ValidationRulesTab from './ValidationRulesTab';
 import CsvManagerTab from './CsvManagerTab';
 import ProcessingDashboardModal from '../components/ProcessingDashboardModal';
+import BulkUpdatePreviewModal from '../components/BulkUpdatePreviewModal';
 
 interface Entry {
   id: number | string;
@@ -437,6 +438,11 @@ const BulkUpdater: React.FC = () => {
   const [dashboardBatchId, setDashboardBatchId] = useState<string>('');
   const [dashboardJob, setDashboardJob] = useState<any>(null);
   const [isSubmittingBatch, setIsSubmittingBatch] = useState<boolean>(false);
+
+  // Preview Modal State
+  const [showPreviewModal, setShowPreviewModal] = useState<boolean>(false);
+  const [previewLoading, setPreviewLoading] = useState<boolean>(false);
+  const [previewData, setPreviewData] = useState<any>(null);
 
   // Managed Cache Keys
   const MODELS_CACHE_KEY = 'strapi_bulk_updater_models_cache';
@@ -1178,6 +1184,63 @@ const BulkUpdater: React.FC = () => {
     setShowConfirmModal(true);
   };
 
+  // Open Preview Modal
+  const handleOpenPreviewModal = async () => {
+    if (!selectedAttribute) {
+      toggleNotification({
+        type: 'warning',
+        message: 'Please select an attribute from the dropdown',
+      });
+      return;
+    }
+
+    const targets: Array<{ uid: string; documentId: string }> = [];
+    Object.keys(selectedEntries).forEach((key) => {
+      if (selectedEntries[key]) {
+        const parts = key.split(KEY_SEP);
+        if (parts.length === 2) {
+          targets.push({ uid: parts[0], documentId: parts[1] });
+        }
+      }
+    });
+
+    if (targets.length === 0) {
+      toggleNotification({
+        type: 'warning',
+        message: 'Please select at least one collection type or entry to preview',
+      });
+      return;
+    }
+
+    setShowPreviewModal(true);
+    setPreviewLoading(true);
+
+    try {
+      const res = await post('/bulk-updater/preview', {
+        attribute: selectedAttribute,
+        value: attributeValue,
+        selectedEntries: targets,
+        isRegex: useRegex,
+        regexPattern,
+        publishOnApproval,
+      });
+
+      if (res.data && res.data.success) {
+        setPreviewData(res.data);
+      } else {
+        throw new Error(res.data?.error || 'Failed to generate preview');
+      }
+    } catch (err: any) {
+      toggleNotification({
+        type: 'danger',
+        message: err.message || 'Failed to fetch preview diffs',
+      });
+      setShowPreviewModal(false);
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
   // Perform bulk update with chosen mode
   const executeBatchWithMode = async (
     executionMode: 'immediate' | 'queue_offpeak' | 'maker_checker',
@@ -1823,19 +1886,29 @@ const BulkUpdater: React.FC = () => {
                 )}
               </Box>
 
-              {/* Update Action Button */}
-              <Box>
+              {/* Action Buttons: Preview & Update */}
+              <Flex gap={2} alignItems="center" wrap="wrap">
+                <Button
+                  startIcon={<Eye />}
+                  variant="secondary"
+                  size="L"
+                  onClick={handleOpenPreviewModal}
+                  loading={previewLoading}
+                  disabled={loading || totalSelectedCount === 0 || !selectedAttribute}
+                >
+                  Preview Changes ({totalSelectedCount})
+                </Button>
                 <Button
                   startIcon={<Play />}
                   variant="default"
                   size="L"
                   onClick={handleOpenConfirmModal}
                   loading={updating}
-                  disabled={loading || totalSelectedCount === 0}
+                  disabled={loading || totalSelectedCount === 0 || !selectedAttribute}
                 >
                   Update Selected ({totalSelectedCount})
                 </Button>
-              </Box>
+              </Flex>
             </Flex>
 
             {/* Pro Feature: Regex Search & Replace */}
@@ -3229,6 +3302,22 @@ const BulkUpdater: React.FC = () => {
                       {publishOnApproval ? 'Publish Immediately' : 'Keep as Draft'}
                     </Badge>
                   </Flex>
+                  <Flex justifyContent="space-between" alignItems="center" marginTop={2} paddingTop={2} style={{ borderTop: '1px solid #eaeaef' }}>
+                    <Typography variant="pi" textColor="neutral600">
+                      Need to inspect before &amp; after values?
+                    </Typography>
+                    <Button
+                      variant="secondary"
+                      size="S"
+                      startIcon={<Eye />}
+                      onClick={() => {
+                        setShowConfirmModal(false);
+                        handleOpenPreviewModal();
+                      }}
+                    >
+                      Open Change Preview
+                    </Button>
+                  </Flex>
                 </Flex>
               </Box>
 
@@ -3373,6 +3462,28 @@ const BulkUpdater: React.FC = () => {
           </Box>
         </div>
       )}
+
+      {/* Pre-Update Change Preview Modal */}
+      <BulkUpdatePreviewModal
+        isOpen={showPreviewModal}
+        onClose={() => setShowPreviewModal(false)}
+        onProceed={() => {
+          setShowPreviewModal(false);
+          handleOpenConfirmModal();
+        }}
+        loading={previewLoading}
+        previewData={previewData}
+        attribute={selectedAttribute}
+        targetValueDisplay={
+          relationsMeta[selectedAttribute]
+            ? (selectedRelationDocId === '__clear__'
+                ? 'Clear / Unlink Relation'
+                : relationOptions.find((o) => o.documentId === selectedRelationDocId)?.label || selectedRelationDocId || '(none)')
+            : useRegex
+            ? `Replace /${regexPattern}/g with "${attributeValue}"`
+            : attributeValue
+        }
+      />
 
       {/* Processing Dashboard & Status Tracker Modal */}
       <ProcessingDashboardModal

@@ -1257,6 +1257,295 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
     },
 
     /**
+     * Preview bulk update changes before execution:
+     * Reads current values and computes proposed new values without mutating data.
+     */
+    async previewBatch({
+      attribute,
+      value,
+      selectedEntries = [],
+      selectedCollections = [],
+      isRegex = false,
+      regexPattern = '',
+    }: {
+      attribute: string;
+      value: string;
+      selectedEntries?: Array<{ uid: string; documentId: string }>;
+      selectedCollections?: string[];
+      isRegex?: boolean;
+      regexPattern?: string;
+    }) {
+      if (!attribute) {
+        throw new Error('Attribute name is required.');
+      }
+
+      const targetsMap = new Map<string, { uid: string; documentId: string }>();
+
+      // 1. Add entire collections if selected
+      for (const colUid of selectedCollections) {
+        if (!strapi.contentTypes[colUid]) continue;
+        const entries = await strapi.documents(colUid as any).findMany();
+        for (const entry of (entries || []) as any[]) {
+          const key = `${colUid}@@@${entry.documentId}`;
+          targetsMap.set(key, { uid: colUid, documentId: entry.documentId });
+        }
+      }
+
+      // 2. Add individually selected entries
+      for (const item of selectedEntries) {
+        if (!item.uid || !item.documentId) continue;
+        const key = `${item.uid}@@@${item.documentId}`;
+        targetsMap.set(key, { uid: item.uid, documentId: item.documentId });
+      }
+
+      if (targetsMap.size === 0) {
+        throw new Error('No collections or entries were selected for preview.');
+      }
+
+      let regexObj: RegExp | null = null;
+      if (isRegex && regexPattern) {
+        try {
+          regexObj = new RegExp(regexPattern, 'g');
+        } catch (e: any) {
+          throw new Error(`Invalid regular expression: ${e.message}`);
+        }
+      }
+
+      const targets = Array.from(targetsMap.values());
+      const diffs: any[] = [];
+      let willUpdateCount = 0;
+      let unchangedCount = 0;
+      let skippedCount = 0;
+
+      for (const target of targets) {
+        const contentType = strapi.contentTypes[target.uid];
+        const displayName = contentType?.info?.displayName || target.uid;
+
+        try {
+          const isNested = attribute.includes('.');
+          let isComponentNested = false;
+          let parentKey = '';
+          let childKey = '';
+
+          if (isNested) {
+            const parts = attribute.split('.');
+            parentKey = parts[0];
+            childKey = parts[1];
+            const parentAttrDef = contentType?.attributes?.[parentKey];
+            if (parentAttrDef?.type === 'component' && !parentAttrDef.repeatable && parentAttrDef.component) {
+              const compSchema = strapi.components[parentAttrDef.component];
+              if (compSchema?.attributes?.[childKey]) {
+                isComponentNested = true;
+              }
+            }
+          }
+
+          const attrDef = contentType?.attributes?.[attribute];
+          const hasAttribute = Boolean(attrDef) || isComponentNested;
+
+          if (!hasAttribute) {
+            skippedCount++;
+            diffs.push({
+              uid: target.uid,
+              collectionName: displayName,
+              documentId: target.documentId,
+              label: `Entry #${target.documentId}`,
+              attribute,
+              oldValue: null,
+              newValue: null,
+              oldDisplay: '—',
+              newDisplay: '—',
+              hasChange: false,
+              status: 'will_skip',
+              message: `Attribute "${attribute}" does not exist in schema for ${displayName}`,
+            });
+            continue;
+          }
+
+          let currentEntry: any;
+          if (isComponentNested) {
+            currentEntry = await strapi.documents(target.uid as any).findOne({
+              documentId: target.documentId,
+              populate: [parentKey],
+            });
+          } else if (attrDef?.type === 'relation') {
+            currentEntry = await strapi.documents(target.uid as any).findOne({
+              documentId: target.documentId,
+              populate: [attribute],
+            });
+          } else {
+            currentEntry = await strapi.documents(target.uid as any).findOne({
+              documentId: target.documentId,
+            });
+          }
+
+          const entryLabel =
+            currentEntry?.name ||
+            currentEntry?.title ||
+            currentEntry?.email ||
+            `Entry #${target.documentId}`;
+
+          if (isComponentNested) {
+            const existingParent = currentEntry?.[parentKey] || {};
+            const currentVal = existingParent?.[childKey];
+
+            let newValue = value;
+            if (regexObj && typeof currentVal === 'string') {
+              newValue = currentVal.replace(regexObj, value);
+            }
+
+            const hasChange = String(currentVal ?? '') !== String(newValue ?? '');
+            if (hasChange) {
+              willUpdateCount++;
+            } else {
+              unchangedCount++;
+            }
+
+            diffs.push({
+              uid: target.uid,
+              collectionName: displayName,
+              documentId: target.documentId,
+              label: entryLabel,
+              attribute,
+              oldValue: currentVal ?? null,
+              newValue,
+              oldDisplay: currentVal !== undefined && currentVal !== null ? String(currentVal) : '(empty)',
+              newDisplay: String(newValue ?? ''),
+              hasChange,
+              status: hasChange ? 'will_update' : 'unchanged',
+              message: hasChange ? 'Value will be updated' : 'Already has target value',
+            });
+            continue;
+          }
+
+          if (attrDef?.type === 'relation') {
+            const isMulti = attrDef.relation === 'oneToMany' || attrDef.relation === 'manyToMany';
+            const currentRel = currentEntry?.[attribute];
+
+            let oldDocIds: string[] = [];
+            let oldDisplay = '';
+            if (isMulti && Array.isArray(currentRel)) {
+              oldDocIds = currentRel.map((r: any) => r.documentId).filter(Boolean);
+              oldDisplay = currentRel.map((r: any) => r.name || r.title || r.email || r.documentId).join(', ') || '(empty)';
+            } else if (currentRel) {
+              oldDocIds = currentRel.documentId ? [currentRel.documentId] : [];
+              oldDisplay = currentRel.name || currentRel.title || currentRel.email || currentRel.documentId || '(empty)';
+            } else {
+              oldDisplay = '(unlinked / none)';
+            }
+
+            let mode: 'set' | 'connect' | 'disconnect' | 'clear' = 'set';
+            let targetDocIds: string[] = [];
+            let newDisplay = '';
+
+            if (value === '__clear__' || value === '') {
+              mode = 'clear';
+              newDisplay = '(cleared / unlinked)';
+            } else {
+              try {
+                const parsed = JSON.parse(value);
+                if (parsed && typeof parsed === 'object' && parsed.mode) {
+                  mode = parsed.mode;
+                  targetDocIds = Array.isArray(parsed.documentIds) ? parsed.documentIds : (parsed.documentId ? [parsed.documentId] : []);
+                  newDisplay = parsed.label || targetDocIds.join(', ') || `[${mode}]`;
+                } else if (Array.isArray(parsed)) {
+                  targetDocIds = parsed;
+                  newDisplay = targetDocIds.join(', ');
+                } else {
+                  targetDocIds = [value];
+                  newDisplay = value;
+                }
+              } catch {
+                targetDocIds = [value];
+                newDisplay = value;
+              }
+            }
+
+            const hasChange = oldDisplay !== newDisplay;
+            if (hasChange) {
+              willUpdateCount++;
+            } else {
+              unchangedCount++;
+            }
+
+            diffs.push({
+              uid: target.uid,
+              collectionName: displayName,
+              documentId: target.documentId,
+              label: entryLabel,
+              attribute,
+              oldValue: { isRelation: true, documentIds: oldDocIds, display: oldDisplay },
+              newValue: { isRelation: true, mode, documentIds: targetDocIds, display: newDisplay },
+              oldDisplay,
+              newDisplay,
+              hasChange,
+              status: hasChange ? 'will_update' : 'unchanged',
+              message: hasChange ? `Relation will be modified (${mode})` : 'Relation already set to this target',
+            });
+            continue;
+          }
+
+          // Scalar attributes
+          let newValue = value;
+          const currentVal = currentEntry?.[attribute];
+
+          if (regexObj && typeof currentVal === 'string') {
+            newValue = currentVal.replace(regexObj, value);
+          }
+
+          const hasChange = String(currentVal ?? '') !== String(newValue ?? '');
+          if (hasChange) {
+            willUpdateCount++;
+          } else {
+            unchangedCount++;
+          }
+
+          diffs.push({
+            uid: target.uid,
+            collectionName: displayName,
+            documentId: target.documentId,
+            label: entryLabel,
+            attribute,
+            oldValue: currentVal ?? null,
+            newValue,
+            oldDisplay: currentVal !== undefined && currentVal !== null ? String(currentVal) : '(empty)',
+            newDisplay: String(newValue ?? ''),
+            hasChange,
+            status: hasChange ? 'will_update' : 'unchanged',
+            message: hasChange ? 'Value will be updated' : 'Already matches target value',
+          });
+        } catch (err: any) {
+          skippedCount++;
+          diffs.push({
+            uid: target.uid,
+            collectionName: displayName,
+            documentId: target.documentId,
+            label: `Entry #${target.documentId}`,
+            attribute,
+            oldValue: null,
+            newValue: null,
+            oldDisplay: '—',
+            newDisplay: '—',
+            hasChange: false,
+            status: 'will_skip',
+            message: `Error inspecting entry: ${err.message}`,
+          });
+        }
+      }
+
+      return {
+        success: true,
+        summary: {
+          total: targets.length,
+          willUpdate: willUpdateCount,
+          unchanged: unchangedCount,
+          skipped: skippedCount,
+        },
+        diffs,
+      };
+    },
+
+    /**
      * Batch Update API with Maker-Checker and Off-Peak Scheduling:
      */
     async batchUpdate(

@@ -35,6 +35,14 @@ export default {
         },
       },
       {
+        method: 'POST',
+        path: '/preview',
+        handler: 'bulkUpdater.previewBatch',
+        config: {
+          policies: [],
+        },
+      },
+      {
         method: 'GET',
         path: '/pending-batches',
         handler: 'bulkUpdater.getPendingBatches',

@@ -85,6 +85,17 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     }
   },
 
+  async previewBatch(ctx: any) {
+    try {
+      const service = strapi.plugin('bulk-updater').service('bulkUpdater');
+      const result = await service.previewBatch(ctx.request.body || {});
+      ctx.body = result;
+    } catch (err: any) {
+      ctx.status = 400;
+      ctx.body = { success: false, error: err.message };
+    }
+  },
+
   async getPendingBatches(ctx: any) {
     try {
       const service = strapi.plugin('bulk-updater').service('bulkUpdater');
