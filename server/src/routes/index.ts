@@ -179,6 +179,22 @@ export default {
         },
       },
       {
+        method: 'POST',
+        path: '/csv/export/:uid',
+        handler: 'csv.exportCollection',
+        config: {
+          policies: [],
+        },
+      },
+      {
+        method: 'POST',
+        path: '/csv/export-bulk',
+        handler: 'csv.exportBulk',
+        config: {
+          policies: [],
+        },
+      },
+      {
         method: 'GET',
         path: '/csv/export-violations/:ruleId',
         handler: 'csv.exportViolations',

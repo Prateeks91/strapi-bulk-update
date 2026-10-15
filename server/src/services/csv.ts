@@ -1,33 +1,57 @@
 import type { Core } from '@strapi/strapi';
 
+import type { Core } from '@strapi/strapi';
+
 /**
- * Robust CSV string escaping helper
+ * Robust, Excel-Safe CSV string escaping helper (RFC-4180 compliant)
  */
 function escapeCsvValue(val: any): string {
   if (val === null || val === undefined) return '';
   let str = '';
-  if (typeof val === 'object') {
+
+  if (val instanceof Date) {
+    str = val.toISOString();
+  } else if (typeof val === 'object') {
     str = JSON.stringify(val);
   } else {
     str = String(val);
   }
-  if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
+
+  // Normalize CRLF or lone CR inside cells to standard LF
+  str = str.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+  // Excel CSV Formula Injection Mitigation:
+  // If first character is =, +, -, or @, prefix with a single quote to prevent execution in Excel
+  if (/^[=+@-]$/.test(str.charAt(0))) {
+    str = `'${str}`;
+  }
+
+  // Quote cell if it contains delimiter, quotes, or newlines
+  if (str.includes(',') || str.includes('"') || str.includes('\n')) {
     return `"${str.replace(/"/g, '""')}"`;
   }
   return str;
 }
 
 /**
- * Basic CSV parser supporting quotes, commas, and newlines
+ * Basic CSV parser supporting quotes, commas, CRLF, and newlines
  */
 export function parseCsv(csvText: string): Array<Record<string, string>> {
+  if (!csvText) return [];
+
+  // Strip UTF-8 BOM if present
+  let cleanText = csvText;
+  if (cleanText.charCodeAt(0) === 0xfeff) {
+    cleanText = cleanText.slice(1);
+  }
+
   const lines: string[] = [];
   let current = '';
   let inQuotes = false;
 
-  for (let i = 0; i < csvText.length; i++) {
-    const char = csvText[i];
-    const nextChar = csvText[i + 1];
+  for (let i = 0; i < cleanText.length; i++) {
+    const char = cleanText[i];
+    const nextChar = cleanText[i + 1];
 
     if (char === '"') {
       if (inQuotes && nextChar === '"') {
@@ -94,6 +118,153 @@ export function parseCsv(csvText: string): Array<Record<string, string>> {
   return rows;
 }
 
+/**
+ * Field definition discovered for export
+ */
+interface ExportFieldDef {
+  key: string;
+  label: string;
+  type: string;
+}
+
+/**
+ * Recursively discovers all exportable fields, fully supporting nested components
+ */
+function discoverExportFields(
+  ct: any,
+  allComponents: Record<string, any>,
+  maxDepth = 4
+): ExportFieldDef[] {
+  const fields: ExportFieldDef[] = [{ key: 'documentId', label: 'documentId', type: 'string' }];
+  const excluded = ['createdBy', 'updatedBy', 'localizations'];
+
+  function walkComponent(compUid: string, pathPrefix: string, labelPrefix: string, depth: number) {
+    if (depth >= maxDepth) return;
+    const comp = allComponents[compUid];
+    if (!comp?.attributes) return;
+
+    for (const [subKey, subDef] of Object.entries(comp.attributes) as any[]) {
+      if (excluded.includes(subKey)) continue;
+      const keyPath = `${pathPrefix}.${subKey}`;
+      const displayLabel = `${labelPrefix} > ${subKey}`;
+
+      if (subDef.type === 'component' && subDef.component) {
+        if (!subDef.repeatable) {
+          walkComponent(subDef.component, keyPath, displayLabel, depth + 1);
+        } else {
+          fields.push({ key: keyPath, label: displayLabel, type: 'component' });
+        }
+      } else {
+        fields.push({ key: keyPath, label: displayLabel, type: subDef.type });
+      }
+    }
+  }
+
+  for (const [attrName, attrDef] of Object.entries(ct.attributes || {}) as any[]) {
+    if (excluded.includes(attrName)) continue;
+    if (attrDef.type === 'component' && attrDef.component) {
+      if (!attrDef.repeatable) {
+        walkComponent(attrDef.component, attrName, attrName, 0);
+      } else {
+        fields.push({ key: attrName, label: attrName, type: 'component' });
+      }
+    } else {
+      fields.push({ key: attrName, label: attrName, type: attrDef.type });
+    }
+  }
+
+  return fields;
+}
+
+/**
+ * Builds a deep populate object for Strapi 5 Document Service
+ */
+function buildDeepPopulate(attributes: Record<string, any>, allComponents: Record<string, any>, depth = 0): any {
+  if (depth > 4) return true;
+  const populate: Record<string, any> = {};
+
+  for (const [key, def] of Object.entries(attributes || {}) as any[]) {
+    if (def.type === 'component' && def.component) {
+      const comp = allComponents[def.component];
+      if (comp?.attributes) {
+        populate[key] = {
+          populate: buildDeepPopulate(comp.attributes, allComponents, depth + 1),
+        };
+      } else {
+        populate[key] = true;
+      }
+    } else if (def.type === 'dynamiczone') {
+      populate[key] = true;
+    } else if (def.type === 'relation' || def.type === 'media') {
+      populate[key] = true;
+    }
+  }
+
+  return Object.keys(populate).length > 0 ? populate : true;
+}
+
+/**
+ * Safely resolves deep nested dot-notation paths (e.g. "defaultSeo.metaDescription" or "author.name")
+ */
+function getNestedExportValue(entry: any, path: string): any {
+  if (!entry || !path) return '';
+  const parts = path.split('.');
+  let current: any = entry;
+
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (current === null || current === undefined) return '';
+
+    if (Array.isArray(current)) {
+      // Repeatable component or array: extract remainder for each element
+      const subPath = parts.slice(i).join('.');
+      return current
+        .map((item) => {
+          if (!item) return '';
+          if (typeof item === 'object') {
+            const val = getNestedExportValue(item, subPath);
+            return typeof val === 'object' ? JSON.stringify(val) : String(val ?? '');
+          }
+          return String(item);
+        })
+        .filter(Boolean)
+        .join('; ');
+    }
+
+    current = current[part];
+  }
+
+  if (current === null || current === undefined) return '';
+
+  // If Media object
+  if (typeof current === 'object' && current.url) {
+    return current.url;
+  }
+
+  // If Relation object
+  if (typeof current === 'object' && !Array.isArray(current)) {
+    if (current.documentId || current.name || current.title) {
+      return current.name || current.title || current.documentId;
+    }
+  }
+
+  // If array of objects (e.g. relations or components)
+  if (Array.isArray(current)) {
+    return current
+      .map((item) => {
+        if (!item) return '';
+        if (typeof item === 'object') {
+          return item.name || item.title || item.documentId || JSON.stringify(item);
+        }
+        return String(item);
+      })
+      .filter(Boolean)
+      .join('; ');
+  }
+
+  return current;
+}
+
 export default ({ strapi }: { strapi: Core.Strapi }) => ({
   /**
    * Generates a sample template CSV with schema attribute headers and sample values
@@ -106,7 +277,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
     const attrs = ct.attributes || {};
     const excluded = ['createdAt', 'updatedAt', 'publishedAt', 'createdBy', 'updatedBy', 'localizations'];
-    
+
     // Base columns: documentId (optional for create, required for update)
     const headers = ['documentId'];
     const sampleRow: string[] = ['(Leave empty to create new, or enter existing docId)'];
@@ -148,7 +319,13 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       sampleRow.push(sampleVal);
     }
 
-    const csvContent = `${headers.map(escapeCsvValue).join(',')}\n${sampleRow.map(escapeCsvValue).join(',')}\n`;
+    const csvContent =
+      '\uFEFF' +
+      headers.map(escapeCsvValue).join(',') +
+      '\r\n' +
+      sampleRow.map(escapeCsvValue).join(',') +
+      '\r\n';
+
     return {
       filename: `${ct.info?.singularName || 'template'}_template.csv`,
       csvContent,
@@ -157,7 +334,8 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
   },
 
   /**
-   * Exports entries of a collection to CSV, with optional filters
+   * Exports entries of a collection to CSV with deep nested component support,
+   * RFC-4180 CRLF line endings, and UTF-8 BOM for 100% Microsoft Excel compatibility.
    */
   async exportCollectionCsv(
     uid: string,
@@ -167,6 +345,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       filterOperator?: string;
       filterQuery?: string;
       limit?: number;
+      documentIds?: string[];
     } = {}
   ) {
     const ct = strapi.contentTypes[uid];
@@ -174,64 +353,62 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       throw new Error(`Content type ${uid} not found`);
     }
 
-    const attrs = ct.attributes || {};
-    const excluded = ['createdBy', 'updatedBy', 'localizations'];
+    const allComponents = strapi.components || {};
 
-    // Discover exportable scalar and component fields
-    const exportFields: string[] = ['documentId'];
-    const compFieldsToPopulate: string[] = [];
-    for (const [attrName, attrDef] of Object.entries(attrs) as any[]) {
-      if (excluded.includes(attrName)) continue;
-      if (['dynamiczone', 'media', 'relation'].includes(attrDef.type)) continue;
-      if (attrDef.type === 'component') {
-        if (!attrDef.repeatable && attrDef.component) {
-          const comp = strapi.components[attrDef.component];
-          if (comp?.attributes) {
-            compFieldsToPopulate.push(attrName);
-            for (const [subKey, subDef] of Object.entries(comp.attributes) as any[]) {
-              if (excluded.includes(subKey)) continue;
-              if (['component', 'dynamiczone', 'media', 'relation'].includes(subDef.type)) continue;
-              exportFields.push(`${attrName}.${subKey}`);
-            }
-          }
-        }
-        continue;
-      }
-      exportFields.push(attrName);
-    }
+    // 1. Discover all exportable fields, including nested components
+    const fields = discoverExportFields(ct, allComponents);
 
-    // Build database query filters
+    // 2. Build database query filters
     const filters: Record<string, any> = {};
-    const { attribute, filterOperator, filterQuery, search } = options;
+    const { attribute, filterOperator, filterQuery, search, documentIds } = options;
 
-    if (attribute && filterOperator && filterQuery !== undefined && filterQuery !== '') {
-      switch (filterOperator) {
-        case 'equals':
-          filters[attribute] = { $eq: filterQuery };
-          break;
-        case 'notEquals':
-          filters[attribute] = { $ne: filterQuery };
-          break;
-        case 'contains':
-          filters[attribute] = { $containsi: filterQuery };
-          break;
-        case 'notContains':
-          filters[attribute] = { $notContainsi: filterQuery };
-          break;
-        case 'startsWith':
-          filters[attribute] = { $startsWith: filterQuery };
-          break;
-        case 'endsWith':
-          filters[attribute] = { $endsWith: filterQuery };
-          break;
+    // Filter by specific selected document IDs if provided
+    if (documentIds && Array.isArray(documentIds) && documentIds.length > 0) {
+      filters.documentId = { $in: documentIds };
+    }
+
+    // Apply attribute condition filter with nested component support
+    if (attribute && filterOperator && filterOperator !== 'none') {
+      const isNested = attribute.includes('.');
+      if (filterOperator === 'empty') {
+        if (isNested) {
+          const [parent, child] = attribute.split('.');
+          filters[parent] = { [child]: { $null: true } };
+        } else {
+          filters[attribute] = { $null: true };
+        }
+      } else if (filterOperator === 'not_empty') {
+        if (isNested) {
+          const [parent, child] = attribute.split('.');
+          filters[parent] = { [child]: { $notNull: true } };
+        } else {
+          filters[attribute] = { $notNull: true };
+        }
+      } else if (filterQuery !== undefined && filterQuery !== '') {
+        const opMap: Record<string, string> = {
+          equals: '$eq',
+          notEquals: '$ne',
+          contains: '$containsi',
+          notContains: '$notContainsi',
+          startsWith: '$startsWith',
+          endsWith: '$endsWith',
+        };
+        const strapiOp = opMap[filterOperator] || '$eq';
+        if (isNested) {
+          const [parent, child] = attribute.split('.');
+          filters[parent] = { [child]: { [strapiOp]: filterQuery } };
+        } else {
+          filters[attribute] = { [strapiOp]: filterQuery };
+        }
       }
     }
 
+    // Text search filter
     if (search && search.trim() !== '') {
       const q = search.trim();
       const searchConditions: any[] = [];
       const searchFields = ['name', 'title', 'email', 'slug', 'description'].filter(
-        (f) => attrs[f] && ['string', 'text', 'email'].includes(attrs[f].type)
+        (f) => ct.attributes?.[f] && ['string', 'text', 'email'].includes(ct.attributes[f].type)
       );
 
       for (const field of searchFields) {
@@ -247,41 +424,47 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       }
     }
 
-    const populateOption = compFieldsToPopulate.length > 0
-      ? compFieldsToPopulate.reduce((acc, k) => ({ ...acc, [k]: true }), {})
-      : undefined;
+    // 3. Build deep populate tree so nested components and relations are retrieved
+    const deepPopulate = buildDeepPopulate(ct.attributes || {}, allComponents);
 
-    const entries = await strapi.documents(uid as any).findMany({
-      filters: Object.keys(filters).length > 0 ? filters : undefined,
-      limit: options.limit || 5000,
-      sort: { createdAt: 'desc' },
-      populate: populateOption,
-    });
+    // 4. Retrieve entries (handling singleType vs collectionType)
+    let entries: any[] = [];
+    if (ct.kind === 'singleType') {
+      const doc = await (strapi.documents(uid as any) as any).findFirst({
+        populate: deepPopulate,
+      });
+      entries = doc ? [doc] : [];
+    } else {
+      entries = await (strapi.documents(uid as any) as any).findMany({
+        filters: Object.keys(filters).length > 0 ? filters : undefined,
+        limit: options.limit || 5000,
+        sort: { createdAt: 'desc' },
+        populate: deepPopulate,
+      });
+    }
 
+    // 5. Generate RFC-4180 CRLF rows with UTF-8 BOM
     const lines: string[] = [];
-    lines.push(exportFields.map(escapeCsvValue).join(','));
+    // Header line using field keys
+    lines.push(fields.map((f) => escapeCsvValue(f.key)).join(','));
 
     for (const entry of (entries || []) as any[]) {
-      const rowValues = exportFields.map((field) => {
-        let val: any;
-        if (field.includes('.')) {
-          const [parent, child] = field.split('.');
-          val = entry[parent]?.[child];
-        } else {
-          val = entry[field];
-        }
+      const rowValues = fields.map((f) => {
+        const val = getNestedExportValue(entry, f.key);
         return escapeCsvValue(val);
       });
       lines.push(rowValues.join(','));
     }
 
-    const csvContent = lines.join('\n');
+    // Prepend UTF-8 BOM and terminate lines with CRLF for seamless Excel import
+    const csvContent = '\uFEFF' + lines.join('\r\n') + '\r\n';
     const filename = `${ct.info?.singularName || uid}_export_${new Date().toISOString().slice(0, 10)}.csv`;
 
     return {
       filename,
       csvContent,
       count: entries ? entries.length : 0,
+      fields: fields.map((f) => f.key),
     };
   },
 
@@ -327,9 +510,88 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
     return {
       filename,
-      csvContent: lines.join('\n'),
+      csvContent: '\uFEFF' + lines.join('\r\n') + '\r\n',
       count: scanReport.violations.length,
       ruleName: scanReport.rule.name,
+    };
+  },
+
+  /**
+   * Bulk Export: Exports selected entries across multiple collections or a multi-collection batch.
+   */
+  async exportBulkCsv(selectedEntries: Array<{ uid: string; documentId: string }>) {
+    if (!selectedEntries || selectedEntries.length === 0) {
+      throw new Error('No entries selected for bulk export');
+    }
+
+    // Group selected documentIds by collection uid
+    const byUid: Record<string, string[]> = {};
+    for (const item of selectedEntries) {
+      if (!byUid[item.uid]) byUid[item.uid] = [];
+      byUid[item.uid].push(item.documentId);
+    }
+
+    const uids = Object.keys(byUid);
+
+    // If all entries belong to a single collection, export full collection schema with deep fields
+    if (uids.length === 1) {
+      const uid = uids[0];
+      return await this.exportCollectionCsv(uid, { documentIds: byUid[uid] });
+    }
+
+    // Multi-collection unified export
+    const rows: string[] = [];
+    const headers = [
+      'Collection UID',
+      'Collection Name',
+      'Document ID',
+      'Record Title / Name',
+      'Primary Identifier',
+      'Created At',
+      'Updated At',
+      'Published Status',
+    ];
+    rows.push(headers.map(escapeCsvValue).join(','));
+
+    let totalExported = 0;
+
+    for (const uid of uids) {
+      const ct = strapi.contentTypes[uid];
+      if (!ct) continue;
+      const displayName = ct.info?.displayName || uid;
+      const docIds = byUid[uid];
+
+      const entries = await (strapi.documents(uid as any) as any).findMany({
+        filters: { documentId: { $in: docIds } },
+        limit: docIds.length,
+      });
+
+      for (const entry of (entries || []) as any[]) {
+        const titleOrName = entry.title || entry.name || entry.subject || entry.email || `Entry #${entry.documentId}`;
+        const identifier = entry.slug || entry.email || entry.username || entry.documentId;
+        const isPublished = Boolean(entry.publishedAt);
+
+        const row = [
+          uid,
+          displayName,
+          entry.documentId,
+          titleOrName,
+          identifier,
+          entry.createdAt || '',
+          entry.updatedAt || '',
+          isPublished ? 'Published' : 'Draft',
+        ];
+        rows.push(row.map(escapeCsvValue).join(','));
+        totalExported++;
+      }
+    }
+
+    const filename = `bulk_export_selected_${totalExported}_entries_${new Date().toISOString().slice(0, 10)}.csv`;
+    return {
+      filename,
+      csvContent: '\uFEFF' + rows.join('\r\n') + '\r\n',
+      count: totalExported,
+      isMultiCollection: true,
     };
   },
 

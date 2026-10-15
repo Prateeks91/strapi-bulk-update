@@ -2464,7 +2464,11 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       function escapeCsvVal(val: any): string {
         if (val === null || val === undefined) return '';
         let str = typeof val === 'object' ? JSON.stringify(val) : String(val);
-        if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
+        str = str.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        if (/^[=+@-]$/.test(str.charAt(0))) {
+          str = `'${str}`;
+        }
+        if (str.includes(',') || str.includes('"') || str.includes('\n')) {
           return `"${str.replace(/"/g, '""')}"`;
         }
         return str;
@@ -2513,7 +2517,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       return {
         success: true,
         filename,
-        csvContent: rows.join('\n'),
+        csvContent: '\uFEFF' + rows.join('\r\n') + '\r\n',
         summary: {
           batchId: batch.id,
           status: batch.status,

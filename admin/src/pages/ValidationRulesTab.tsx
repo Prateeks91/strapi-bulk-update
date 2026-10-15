@@ -641,7 +641,8 @@ export default function ValidationRulesTab() {
                         });
                         return;
                       }
-                      const blob = new Blob([csvStr], { type: 'text/csv;charset=utf-8;' });
+                      const safeContent = csvStr.startsWith('\uFEFF') ? csvStr : '\uFEFF' + csvStr;
+                      const blob = new Blob([safeContent], { type: 'text/csv;charset=utf-8;' });
                       const url = URL.createObjectURL(blob);
                       const link = document.createElement('a');
                       link.href = url;

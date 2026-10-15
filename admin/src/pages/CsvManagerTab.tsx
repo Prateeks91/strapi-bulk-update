@@ -151,7 +151,8 @@ export default function CsvManagerTab() {
       });
       return;
     }
-    const blob = new Blob([content], { type: 'text/csv;charset=utf-8;' });
+    const safeContent = content.startsWith('\uFEFF') ? content : '\uFEFF' + content;
+    const blob = new Blob([safeContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;

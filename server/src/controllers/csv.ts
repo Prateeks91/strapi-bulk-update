@@ -21,14 +21,29 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
   async exportCollection(ctx: any) {
     try {
       const { uid } = ctx.params;
-      const { search, attribute, filterOperator, filterQuery, limit } = ctx.query;
+      const { search, attribute, filterOperator, filterQuery, limit, documentIds } = {
+        ...ctx.query,
+        ...(ctx.request?.body || {}),
+      };
       const csvService = strapi.plugin('bulk-updater').service('csv');
+
+      let parsedDocIds: string[] | undefined;
+      if (documentIds) {
+        parsedDocIds = Array.isArray(documentIds)
+          ? documentIds
+          : String(documentIds)
+              .split(',')
+              .map((s) => s.trim())
+              .filter(Boolean);
+      }
+
       const result = await csvService.exportCollectionCsv(uid, {
         search: search ? String(search) : undefined,
         attribute: attribute ? String(attribute) : undefined,
         filterOperator: filterOperator ? String(filterOperator) : undefined,
         filterQuery: filterQuery !== undefined ? String(filterQuery) : undefined,
         limit: limit ? Number(limit) : undefined,
+        documentIds: parsedDocIds,
       });
 
       ctx.body = {
@@ -36,6 +51,26 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         filename: result.filename,
         csvContent: result.csvContent,
         count: result.count,
+        fields: result.fields,
+      };
+    } catch (err: any) {
+      ctx.status = 500;
+      ctx.body = { success: false, error: err.message };
+    }
+  },
+
+  async exportBulk(ctx: any) {
+    try {
+      const { selectedEntries } = ctx.request.body || {};
+      const csvService = strapi.plugin('bulk-updater').service('csv');
+      const result = await csvService.exportBulkCsv(selectedEntries);
+
+      ctx.body = {
+        success: true,
+        filename: result.filename,
+        csvContent: result.csvContent,
+        count: result.count,
+        isMultiCollection: result.isMultiCollection,
       };
     } catch (err: any) {
       ctx.status = 500;

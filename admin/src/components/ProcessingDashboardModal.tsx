@@ -74,7 +74,9 @@ function formatVal(v: any): string {
 }
 
 function downloadFile(content: string, filename: string, mimeType: string = 'text/csv;charset=utf-8;') {
-  const blob = new Blob([content], { type: mimeType });
+  const isCsv = mimeType.includes('csv') || filename.endsWith('.csv');
+  const safeContent = isCsv && !content.startsWith('\uFEFF') ? '\uFEFF' + content : content;
+  const blob = new Blob([safeContent], { type: mimeType });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -210,7 +212,7 @@ export default function ProcessingDashboardModal({
             ].join(',')
           ),
         ];
-        downloadFile(csvRows.join('\n'), `bulk_update_report_${targetId}.csv`);
+        downloadFile(csvRows.join('\r\n') + '\r\n', `bulk_update_report_${targetId}.csv`);
         toggleNotification({
           type: 'success',
           message: 'Execution report downloaded successfully',

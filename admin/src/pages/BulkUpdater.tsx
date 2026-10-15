@@ -449,6 +449,7 @@ const BulkUpdater: React.FC = () => {
   const [showPublishConfirmModal, setShowPublishConfirmModal] = useState<boolean>(false);
   const [publishing, setPublishing] = useState<boolean>(false);
   const [publishMakerNotesInput, setPublishMakerNotesInput] = useState<string>('');
+  const [bulkExporting, setBulkExporting] = useState<boolean>(false);
 
   // Managed Cache Keys
   const MODELS_CACHE_KEY = 'strapi_bulk_updater_models_cache';
@@ -1432,6 +1433,61 @@ const BulkUpdater: React.FC = () => {
     }
   };
 
+  // Bulk Export Selected Entries across collections (Excel-compatible RFC-4180 CSV with UTF-8 BOM)
+  const handleBulkExportSelected = async () => {
+    const targets: Array<{ uid: string; documentId: string }> = [];
+    Object.keys(selectedEntries).forEach((key) => {
+      if (selectedEntries[key]) {
+        const parts = key.split(KEY_SEP);
+        if (parts.length === 2) {
+          targets.push({ uid: parts[0], documentId: parts[1] });
+        }
+      }
+    });
+
+    if (targets.length === 0) {
+      toggleNotification({
+        type: 'warning',
+        message: 'Please select at least one entry to export',
+      });
+      return;
+    }
+
+    try {
+      setBulkExporting(true);
+      const res = await post('/bulk-updater/csv/export-bulk', { selectedEntries: targets });
+      const csvStr = res.data?.csvContent || (typeof res.data === 'string' ? res.data : '');
+      if (!csvStr) {
+        toggleNotification({
+          type: 'warning',
+          message: 'No CSV content returned for selected entries',
+        });
+        return;
+      }
+      const safeContent = csvStr.startsWith('\uFEFF') ? csvStr : '\uFEFF' + csvStr;
+      const blob = new Blob([safeContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', res.data?.filename || `bulk_export_selected_${targets.length}.csv`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      toggleNotification({
+        type: 'success',
+        message: `Successfully exported ${res.data?.count || targets.length} selected records to Excel CSV`,
+      });
+    } catch (e: any) {
+      toggleNotification({
+        type: 'danger',
+        message: e.message || 'Failed exporting selected records to CSV',
+      });
+    } finally {
+      setBulkExporting(false);
+    }
+  };
+
   // Open Bulk Publish Modal
   const handleOpenPublishModal = () => {
     const totalSelected = Object.values(selectedEntries).filter(Boolean).length;
@@ -2118,6 +2174,17 @@ const BulkUpdater: React.FC = () => {
                 >
                   Publish Selected ({totalSelectedCount})
                 </Button>
+                <Button
+                  startIcon={<Download />}
+                  variant="tertiary"
+                  size="L"
+                  onClick={handleBulkExportSelected}
+                  loading={bulkExporting}
+                  disabled={loading || totalSelectedCount === 0}
+                  title="Export selected entries to Excel-compatible CSV with full nested component support"
+                >
+                  Export Selected ({totalSelectedCount})
+                </Button>
               </Flex>
             </Flex>
 
@@ -2681,6 +2748,15 @@ const BulkUpdater: React.FC = () => {
                               if (entrySearch && entrySearch.trim()) {
                                 params.set('search', entrySearch.trim());
                               }
+
+                              // If entries are checked in this collection, export only checked entries
+                              const colSelectedDocIds = col.entries
+                                .filter((e) => selectedEntries[`${col.uid}${KEY_SEP}${e.documentId}`])
+                                .map((e) => e.documentId);
+                              if (colSelectedDocIds.length > 0) {
+                                params.set('documentIds', colSelectedDocIds.join(','));
+                              }
+
                               const res = await get(`/bulk-updater/csv/export/${col.uid}?${params.toString()}`);
                               const csvStr = res.data?.csvContent || (typeof res.data === 'string' ? res.data : '');
                               if (!csvStr) {
@@ -2690,7 +2766,8 @@ const BulkUpdater: React.FC = () => {
                                 });
                                 return;
                               }
-                              const blob = new Blob([csvStr], { type: 'text/csv;charset=utf-8;' });
+                              const safeContent = csvStr.startsWith('\uFEFF') ? csvStr : '\uFEFF' + csvStr;
+                              const blob = new Blob([safeContent], { type: 'text/csv;charset=utf-8;' });
                               const url = URL.createObjectURL(blob);
                               const link = document.createElement('a');
                               link.href = url;
@@ -2701,7 +2778,7 @@ const BulkUpdater: React.FC = () => {
                               URL.revokeObjectURL(url);
                               toggleNotification({
                                 type: 'success',
-                                message: `Exported ${col.displayName} entries to CSV`,
+                                message: `Exported ${res.data?.count ?? (colSelectedDocIds.length || col.entries.length)} ${col.displayName} entries to Excel CSV`,
                               });
                             } catch (e: any) {
                               toggleNotification({
