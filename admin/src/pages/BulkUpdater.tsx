@@ -22,7 +22,7 @@ import {
   Field,
   Loader,
 } from '@strapi/design-system';
-import { Play, ArrowClockwise, Check, Download, Eye } from '@strapi/icons';
+import { Play, ArrowClockwise, Check, Download, Eye, Cog } from '@strapi/icons';
 import ValidationRulesTab from './ValidationRulesTab';
 import CsvManagerTab from './CsvManagerTab';
 import ProcessingDashboardModal from '../components/ProcessingDashboardModal';
@@ -500,6 +500,16 @@ const BulkUpdater: React.FC = () => {
   // Managed Cache Keys
   const MODELS_CACHE_KEY = 'strapi_bulk_updater_models_cache';
   const LAST_ATTR_KEY = 'strapi_bulk_updater_last_attr';
+  const LAST_COLLECTION_KEY = 'strapi_bulk_updater_last_collection';
+
+  const getInitialCollectionUid = (): string => {
+    try {
+      const stored = localStorage.getItem(LAST_COLLECTION_KEY);
+      if (stored) return stored;
+    } catch {}
+    return '';
+  };
+  const [selectedCollectionUid, setSelectedCollectionUid] = useState<string>(getInitialCollectionUid);
 
   // Selected state
   const getInitialAttribute = (): string => {
@@ -605,6 +615,7 @@ const BulkUpdater: React.FC = () => {
   // Column Visibility per Collection Type (flat mapping: uid -> string[])
   const [collectionColumnVisibility, setCollectionColumnVisibility] = useState<Record<string, string[]>>({});
   const [openColumnPickerUid, setOpenColumnPickerUid] = useState<string | null>(null);
+  const [columnSearchTerm, setColumnSearchTerm] = useState<string>('');
 
   const toggleColumn = (colUid: string, colKey: string, availableCols: ColumnDef[]) => {
     setCollectionColumnVisibility((prev) => {
@@ -685,15 +696,33 @@ const BulkUpdater: React.FC = () => {
       setAttributesMeta(data.attributesMeta);
     }
 
+    let resolvedColUid = selectedCollectionUid;
+    let storedCol: string | null = null;
+    try {
+      storedCol = localStorage.getItem(LAST_COLLECTION_KEY);
+    } catch {}
+
+    if (!resolvedColUid || !cols.some((c) => c.uid === resolvedColUid)) {
+      resolvedColUid = (storedCol && cols.some((c) => c.uid === storedCol)) ? storedCol : (cols[0]?.uid || '');
+    }
+    setSelectedCollectionUid(resolvedColUid);
+    try {
+      if (resolvedColUid) localStorage.setItem(LAST_COLLECTION_KEY, resolvedColUid);
+    } catch {}
+
+    const activeCol = cols.find((c) => c.uid === resolvedColUid) || cols[0];
+    const activeAttrs = activeCol?.attributes || [];
+    setAttributes(activeAttrs);
+
     let storedAttr: string | null = null;
     try {
       storedAttr = localStorage.getItem(LAST_ATTR_KEY);
     } catch {}
 
     const resolvedAttr =
-      storedAttr && attrs.includes(storedAttr)
+      storedAttr && activeAttrs.includes(storedAttr)
         ? storedAttr
-        : (selectedAttribute && attrs.includes(selectedAttribute) ? selectedAttribute : '');
+        : (selectedAttribute && activeAttrs.includes(selectedAttribute) ? selectedAttribute : (activeAttrs[0] || ''));
 
     setSelectedAttribute(resolvedAttr);
     if (resolvedAttr && data.relationsMeta && data.relationsMeta[resolvedAttr]) {
@@ -925,7 +954,7 @@ const BulkUpdater: React.FC = () => {
     }
 
     const timer = setTimeout(() => {
-      if (collections.length > 0) {
+      if (selectedCollectionUid) {
         const isFilterActiveNow =
           Boolean(searchAttribute && searchAttribute !== selectedAttribute) ||
           (filterOperator !== 'none' &&
@@ -937,35 +966,61 @@ const BulkUpdater: React.FC = () => {
           setSelectedEntries({});
         }
 
-        const targetSearchAttr = searchAttribute || selectedAttribute;
-        // Targeted Collection Querying: Only query visible collections possessing the target search attribute
-        const targetCols = collections.filter((col) => {
-          if (visibleTypeUids[col.uid] === false) return false;
-          if (filterOperator !== 'none' && targetSearchAttr && !col.attributes.includes(targetSearchAttr)) return false;
-          return true;
-        });
-
-        targetCols.forEach((col) => {
-          loadCollectionPage(
-            col.uid,
-            1,
-            undefined,
-            undefined,
-            undefined,
-            filterOperator,
-            filterQuery,
-            entrySearch,
-            true,
-            searchAttribute
-          );
-        });
+        loadCollectionPage(
+          selectedCollectionUid,
+          1,
+          undefined,
+          undefined,
+          undefined,
+          filterOperator,
+          filterQuery,
+          entrySearch,
+          true,
+          searchAttribute
+        );
       }
     }, 350);
 
     return () => clearTimeout(timer);
-  }, [searchAttribute, filterOperator, filterQuery, entrySearch, useRegex, regexPattern]);
+  }, [selectedCollectionUid, searchAttribute, filterOperator, filterQuery, entrySearch, useRegex, regexPattern]);
 
   const KEY_SEP = '@@@';
+
+  const selectedCol = useMemo(() => {
+    if (!collections.length) return null;
+    return collections.find((c) => c.uid === selectedCollectionUid) || collections[0] || null;
+  }, [collections, selectedCollectionUid]);
+
+  const handleCollectionChange = (newUid: string) => {
+    if (newUid === selectedCollectionUid) return;
+    setSelectedCollectionUid(newUid);
+    try {
+      localStorage.setItem(LAST_COLLECTION_KEY, newUid);
+    } catch {}
+
+    setSelectedEntries({});
+    setSearchAttribute('');
+    setSearchAttributeSearch('');
+
+    const targetCol = collections.find((c) => c.uid === newUid);
+    const colAttrs = targetCol?.attributes || [];
+    setAttributes(colAttrs);
+
+    if (!colAttrs.includes(selectedAttribute)) {
+      const newAttr = colAttrs[0] || '';
+      setSelectedAttribute(newAttr);
+      try {
+        localStorage.setItem(LAST_ATTR_KEY, newAttr);
+      } catch {}
+      if (newAttr && relationsMeta[newAttr]) {
+        fetchRelationOptions(relationsMeta[newAttr].targetUid);
+      } else {
+        setSelectedRelationDocId('');
+      }
+    }
+
+    loadCollectionPage(newUid, 1, undefined, undefined, undefined, filterOperator, filterQuery, entrySearch, true, '');
+  };
 
   // Handle attribute selection change: unchecks all existing selections if attribute changes
   const handleAttributeChange = (newAttr: string) => {
@@ -991,66 +1046,15 @@ const BulkUpdater: React.FC = () => {
         setRelationOptions([]);
       }
 
-      if (newAttr) {
-        const collectionsToLoad = collections.filter(
-          (col) =>
-            visibleTypeUids[col.uid] !== false &&
-            col.attributes.includes(newAttr) &&
-            (!collectionPages[col.uid]?.entries || collectionPages[col.uid].entries.length === 0)
-        );
-
-        collectionsToLoad.forEach((col) => {
-          loadCollectionPage(col.uid, 1);
-        });
+      if (newAttr && selectedCollectionUid) {
+        loadCollectionPage(selectedCollectionUid, 1);
       }
     }
   };
 
-  const filteredCollections = collections.filter(
-    (c) =>
-      visibleTypeUids[c.uid] !== false &&
-      (!collectionSearch.trim() ||
-        c.displayName.toLowerCase().includes(collectionSearch.toLowerCase().trim()) ||
-        c.uid.toLowerCase().includes(collectionSearch.toLowerCase().trim()))
-  );
-
-  // Memoized collections classification for 100+ collection enterprise UX
-  const supportedCollections = useMemo(() => {
-    return collections.filter((c) => c.attributes.includes(selectedAttribute));
-  }, [collections, selectedAttribute]);
-
-  const unsupportedCollections = useMemo(() => {
-    return collections.filter((c) => !c.attributes.includes(selectedAttribute));
-  }, [collections, selectedAttribute]);
-
-  // One-click helper: focus workspace visibility strictly on collections supporting the attribute
-  const handleFocusOnlySupported = () => {
-    const newVis: Record<string, boolean> = {};
-    collections.forEach((c) => {
-      newVis[c.uid] = c.attributes.includes(selectedAttribute);
-    });
-    setVisibleTypeUids(newVis);
-    toggleNotification({
-      type: 'info',
-      message: `Workspace focused: Showing ${supportedCollections.length} of ${collections.length} collections supporting "${selectedAttribute}".`,
-    });
-  };
-
-  const handleShowAllTypes = () => {
-    const newVis: Record<string, boolean> = {};
-    collections.forEach((c) => {
-      newVis[c.uid] = true;
-    });
-    setVisibleTypeUids(newVis);
-  };
-
-  const handleHideAllTypes = () => {
-    const newVis: Record<string, boolean> = {};
-    collections.forEach((c) => {
-      newVis[c.uid] = false;
-    });
-    setVisibleTypeUids(newVis);
-  };
+  const filteredCollections = useMemo(() => {
+    return selectedCol ? [selectedCol] : [];
+  }, [selectedCol]);
 
   const [attributeSearch, setAttributeSearch] = useState('');
   const [searchAttributeSearch, setSearchAttributeSearch] = useState('');
@@ -1058,10 +1062,14 @@ const BulkUpdater: React.FC = () => {
   const getAttrDepth = (attr: string): number =>
     attributesMeta[attr]?.depth ?? (attr.includes('.') ? attr.split('.').length - 1 : 0);
 
+  const availableColAttributes = useMemo(() => {
+    return selectedCol?.attributes || attributes || [];
+  }, [selectedCol, attributes]);
+
   // Depth-filtered attributes based on user-configured componentDepth (1 to 5)
   const depthFilteredAttributes = useMemo(() => {
-    return attributes.filter((attr) => getAttrDepth(attr) <= componentDepth);
-  }, [attributes, componentDepth, attributesMeta]);
+    return availableColAttributes.filter((attr) => getAttrDepth(attr) <= componentDepth);
+  }, [availableColAttributes, componentDepth, attributesMeta]);
 
   // Filtered attributes for Update Attribute combobox (handles camelCase, dot-notation, relations)
   const filteredAttributes = useMemo(() => {
@@ -2242,12 +2250,52 @@ const BulkUpdater: React.FC = () => {
               </Flex>
             </Flex>
 
-            <Flex gap={4} alignItems="flex-end" wrap="wrap">
+            <Flex gap={3} alignItems="flex-end" wrap="wrap">
+              {/* Collection Type Selector */}
+              <Box style={{ width: 280, minWidth: 230 }}>
+                <Field.Root>
+                  <Field.Label>Collection Type</Field.Label>
+                  <Combobox
+                    key={`update-col-${selectedCollectionUid}`}
+                    autocomplete="none"
+                    placeholder="Select Collection Type..."
+                    value={selectedCollectionUid || undefined}
+                    onChange={(val: any) => {
+                      if (val && typeof val === 'string') {
+                        handleCollectionChange(val);
+                      }
+                    }}
+                  >
+                    {collections.map((col) => (
+                      <ComboboxOption key={col.uid} value={col.uid} textValue={`${col.displayName} (${col.uid})`}>
+                        <Flex justifyContent="space-between" alignItems="center" style={{ width: '100%' }}>
+                          <Typography variant="pi" fontWeight="bold">
+                            {col.displayName}
+                          </Typography>
+                          <Flex gap={1} alignItems="center">
+                            {col.isSingleType ? (
+                              <Badge backgroundColor="secondary100" textColor="secondary700" size="S">
+                                Single
+                              </Badge>
+                            ) : (
+                              <Badge backgroundColor="neutral150" textColor="neutral700" size="S">
+                                {col.totalEntries !== undefined ? `${col.totalEntries}` : ''}
+                              </Badge>
+                            )}
+                          </Flex>
+                        </Flex>
+                      </ComboboxOption>
+                    ))}
+                  </Combobox>
+                </Field.Root>
+              </Box>
+
               {/* Attribute Dropdown (Searchable Combobox) */}
-              <Box style={{ minWidth: 280, flex: 1, maxWidth: 440 }}>
+              <Box style={{ width: 280, minWidth: 230 }}>
                 <Field.Root>
                   <Field.Label>Attribute to Update</Field.Label>
                   <Combobox
+                    key={`update-attr-${selectedCollectionUid}-${selectedAttribute}`}
                     autocomplete="none"
                     placeholder="Search attribute by name or relation..."
                     value={selectedAttribute || undefined}
@@ -2437,86 +2485,36 @@ const BulkUpdater: React.FC = () => {
               </Flex>
             </Box>
 
-            {/* Selected Attribute Context & Schema Intelligence Dashboard */}
-            {selectedAttribute && (
-              <Box marginTop={4} padding={4} background="neutral100" hasRadius style={{ border: '1px solid #eaeaef' }}>
+            {/* Selected Attribute & Collection Context */}
+            {selectedCol && selectedAttribute && (
+              <Box marginTop={4} padding={3} background="neutral100" hasRadius style={{ border: '1px solid #eaeaef' }}>
                 <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={3}>
                   <Flex gap={2} alignItems="center" wrap="wrap">
                     <Typography variant="pi" fontWeight="bold">
-                      Attribute Info:
+                      Target Selection:
                     </Typography>
-                    <Typography variant="pi">
-                      Targeting attribute <strong><code>{selectedAttribute}</code></strong>
-                    </Typography>
-                    <Badge backgroundColor="success100" textColor="success700">
-                      ✓ Supported in {supportedCollections.length} of {collections.length} Collections
+                    <Badge backgroundColor="primary100" textColor="primary700">
+                      Collection: {selectedCol.displayName}
                     </Badge>
-                    {unsupportedCollections.length > 0 && (
+                    <Badge backgroundColor="secondary100" textColor="secondary700">
+                      Attribute: {selectedAttribute} {attributesMeta[selectedAttribute]?.type ? `(${attributesMeta[selectedAttribute].type})` : ''}
+                    </Badge>
+                    {attributesMeta[selectedAttribute]?.depth ? (
                       <Badge backgroundColor="neutral200" textColor="neutral700">
-                        — Not in schema: {unsupportedCollections.length}
+                        Nesting Level: L{attributesMeta[selectedAttribute].depth}
+                      </Badge>
+                    ) : null}
+                    {selectedCol.draftAndPublish ? (
+                      <Badge backgroundColor="success100" textColor="success700">
+                        Draft &amp; Publish Enabled
+                      </Badge>
+                    ) : (
+                      <Badge backgroundColor="warning100" textColor="warning700">
+                        Direct Publish Only
                       </Badge>
                     )}
                   </Flex>
-
-                  <Flex gap={2} alignItems="center">
-                    <Button
-                      variant="secondary"
-                      size="S"
-                      onClick={handleFocusOnlySupported}
-                    >
-                      Focus Workspace: Show Supported Only ({supportedCollections.length})
-                    </Button>
-                    <Button
-                      variant="tertiary"
-                      size="S"
-                      onClick={() => setAttributeInfoExpanded((prev) => !prev)}
-                    >
-                      {attributeInfoExpanded ? 'Hide Schema Breakdown ▲' : 'Inspect Breakdown ▼'}
-                    </Button>
-                  </Flex>
                 </Flex>
-
-                {attributeInfoExpanded && (
-                  <Box marginTop={3} paddingTop={3} style={{ borderTop: '1px solid #dcdce4' }}>
-                    <Flex justifyContent="space-between" alignItems="center" marginBottom={3} wrap="wrap" gap={2}>
-                      <Typography variant="pi" textColor="neutral600">
-                        Showing collection types schema compatibility. Type to filter:
-                      </Typography>
-                      <Box style={{ width: 220 }}>
-                        <TextInput
-                          placeholder="Filter collection name..."
-                          size="S"
-                          value={attributeInfoSearch}
-                          onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                            setAttributeInfoSearch(e.target.value)
-                          }
-                        />
-                      </Box>
-                    </Flex>
-                    <Flex wrap="wrap" gap={2} alignItems="center" style={{ maxHeight: 180, overflowY: 'auto' }}>
-                      {collections
-                        .filter(
-                          (c) =>
-                            !attributeInfoSearch.trim() ||
-                            c.displayName.toLowerCase().includes(attributeInfoSearch.toLowerCase().trim()) ||
-                            c.uid.toLowerCase().includes(attributeInfoSearch.toLowerCase().trim())
-                        )
-                        .map((c) => {
-                          const hasAttr = c.attributes.includes(selectedAttribute);
-                          return (
-                            <Badge
-                              key={c.uid}
-                              backgroundColor={hasAttr ? 'success100' : 'neutral200'}
-                              textColor={hasAttr ? 'success700' : 'neutral600'}
-                              size="S"
-                            >
-                              {c.displayName}: {hasAttr ? '✓ Supported' : '— Not in schema'}
-                            </Badge>
-                          );
-                        })}
-                    </Flex>
-                  </Box>
-                )}
               </Box>
             )}
           </Box>
@@ -2599,11 +2597,45 @@ const BulkUpdater: React.FC = () => {
                 </Flex>
 
                 <Flex gap={3} alignItems="flex-end" wrap="wrap">
+                  {/* Collection Type Selector */}
+                  <Box style={{ width: 260, minWidth: 200 }}>
+                    <Field.Root>
+                      <Field.Label>Collection Type</Field.Label>
+                      <Combobox
+                        key={`search-col-${selectedCollectionUid}`}
+                        autocomplete="none"
+                        placeholder="Select Collection Type..."
+                        value={selectedCollectionUid || undefined}
+                        onChange={(val: any) => {
+                          if (val && typeof val === 'string') {
+                            handleCollectionChange(val);
+                          }
+                        }}
+                      >
+                        {collections.map((col) => (
+                          <ComboboxOption key={col.uid} value={col.uid} textValue={`${col.displayName} (${col.uid})`}>
+                            <Flex justifyContent="space-between" alignItems="center" style={{ width: '100%' }}>
+                              <Typography variant="pi" fontWeight="bold">
+                                {col.displayName}
+                              </Typography>
+                              {col.isSingleType ? (
+                                <Badge backgroundColor="secondary100" textColor="secondary700" size="S">
+                                  Single
+                                </Badge>
+                              ) : null}
+                            </Flex>
+                          </ComboboxOption>
+                        ))}
+                      </Combobox>
+                    </Field.Root>
+                  </Box>
+
                   {/* Search Attribute Combobox */}
                   <Box style={{ width: 280, minWidth: 230 }}>
                     <Field.Root>
                       <Field.Label>Search Attribute</Field.Label>
                       <Combobox
+                        key={`search-attr-${selectedCollectionUid}-${searchAttribute}`}
                         autocomplete="none"
                         placeholder={searchAttribute || `Same as Update (${selectedAttribute || 'None'})`}
                         value={searchAttribute || '__default__'}
@@ -2740,200 +2772,34 @@ const BulkUpdater: React.FC = () => {
               </Flex>
             </Box>
 
-            {/* Advanced Content Type Visibility Filter - Enterprise High-Density UX */}
-            {collections.length > 0 && (
-              <Box
-                padding={4}
-                background="neutral100"
-                hasRadius
-                marginBottom={4}
-                style={{ width: '100%', maxWidth: '100%', boxSizing: 'border-box', border: '1px solid #eaeaef' }}
-              >
-                <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={3} marginBottom={3}>
-                  <Flex gap={2} alignItems="center" wrap="wrap">
-                    <Typography variant="omega" fontWeight="bold">
-                      Filter Visible Content Types:
-                    </Typography>
-                    <Badge backgroundColor="primary100" textColor="primary700">
-                      {filteredCollections.length} of {collections.length} visible
-                    </Badge>
-                    <Badge backgroundColor="success100" textColor="success700">
-                      {supportedCollections.filter((c) => visibleTypeUids[c.uid] !== false).length} of {supportedCollections.length} supported visible
-                    </Badge>
-                  </Flex>
-
-                  {/* Inline Quick Search & Action Buttons */}
-                  <Flex gap={2} alignItems="center" wrap="wrap">
-                    <Box style={{ width: 220 }}>
-                      <TextInput
-                        placeholder="Search types..."
-                        size="S"
-                        value={typeVisibilitySearch}
-                        onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                          setTypeVisibilitySearch(e.target.value)
-                        }
-                      />
-                    </Box>
-                    <Button
-                      variant="secondary"
-                      size="S"
-                      onClick={handleFocusOnlySupported}
-                    >
-                      Show Supported Only ({supportedCollections.length})
-                    </Button>
-                    <Button
-                      variant="tertiary"
-                      size="S"
-                      onClick={handleShowAllTypes}
-                    >
-                      Show All
-                    </Button>
-                    <Button
-                      variant="tertiary"
-                      size="S"
-                      onClick={handleHideAllTypes}
-                    >
-                      Hide All
-                    </Button>
-                  </Flex>
-                </Flex>
-
-                {/* High-Density Scrollable Responsive Grid */}
-                <Box
-                  style={{
-                    maxHeight: 220,
-                    overflowY: 'auto',
-                    padding: 8,
-                    background: '#ffffff',
-                    borderRadius: 4,
-                    border: '1px solid #dcdce4',
-                    display: 'grid',
-                    gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))',
-                    gap: 8,
-                  }}
-                >
-                  {collections
-                    .filter(
-                      (col) =>
-                        !typeVisibilitySearch.trim() ||
-                        col.displayName.toLowerCase().includes(typeVisibilitySearch.toLowerCase().trim()) ||
-                        col.uid.toLowerCase().includes(typeVisibilitySearch.toLowerCase().trim())
-                    )
-                    .map((col) => {
-                      const isVisible = visibleTypeUids[col.uid] !== false;
-                      const hasAttr = selectedAttribute ? col.attributes.includes(selectedAttribute) : false;
-                      return (
-                        <Box
-                          key={col.uid}
-                          padding={2}
-                          paddingLeft={3}
-                          paddingRight={3}
-                          background={isVisible ? '#f0f0ff' : '#f6f6f9'}
-                          hasRadius
-                          style={{
-                            border: isVisible ? '1px solid #4945ff' : '1px solid #eaeaef',
-                            transition: 'all 0.15s ease',
-                          }}
-                        >
-                          <Flex justifyContent="space-between" alignItems="center" gap={2}>
-                            <Checkbox
-                              checked={isVisible}
-                              onCheckedChange={(checked: boolean) =>
-                                setVisibleTypeUids((prev) => ({ ...prev, [col.uid]: Boolean(checked) }))
-                              }
-                            >
-                              <Typography variant="pi" fontWeight={isVisible ? 'bold' : 'regular'}>
-                                {col.displayName}
-                              </Typography>
-                            </Checkbox>
-                            <Flex gap={1} alignItems="center">
-                              {col.isSingleType ? (
-                                <Badge backgroundColor="secondary100" textColor="secondary700" size="S">
-                                  Single
-                                </Badge>
-                              ) : null}
-                              {hasAttr ? (
-                                <Badge backgroundColor="success100" textColor="success700" size="S">
-                                  ✓ Supports
-                                </Badge>
-                              ) : (
-                                <Badge backgroundColor="neutral150" textColor="neutral600" size="S">
-                                  —
-                                </Badge>
-                              )}
-                            </Flex>
-                          </Flex>
-                        </Box>
-                      );
-                    })}
-                </Box>
-              </Box>
-            )}
-
-            {/* Filter Search & Global Page Size Controls */}
-            <Flex justifyContent="space-between" alignItems="center" marginBottom={4} wrap="wrap" gap={3}>
-              {collections.length > 1 && (
-                <Box style={{ flex: 1, maxWidth: 360, minWidth: 220 }}>
-                  <TextInput
-                    label="Search Content Types"
-                    placeholder="Search by name or UID..."
-                    value={collectionSearch}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                      setCollectionSearch(e.target.value)
-                    }
-                  />
-                </Box>
-              )}
-              <Flex gap={2} alignItems="center" style={{ marginLeft: 'auto' }}>
-                <Typography variant="pi" textColor="neutral600">
-                  Default page size (max 500):
-                </Typography>
-                <Box style={{ width: 130 }}>
-                  <SingleSelect
-                    size="S"
-                    value={String(defaultPageSize)}
-                    onChange={(val) => handleGlobalPageSizeChange(Number(val))}
-                  >
-                    <SingleSelectOption value="5">5 / page</SingleSelectOption>
-                    <SingleSelectOption value="10">10 / page</SingleSelectOption>
-                    <SingleSelectOption value="25">25 / page</SingleSelectOption>
-                    <SingleSelectOption value="50">50 / page</SingleSelectOption>
-                    <SingleSelectOption value="100">100 / page</SingleSelectOption>
-                    <SingleSelectOption value="250">250 / page</SingleSelectOption>
-                    <SingleSelectOption value="500">500 / page</SingleSelectOption>
-                  </SingleSelect>
-                </Box>
-              </Flex>
-            </Flex>
-
-            {filteredCollections.length === 0 ? (
+            {!selectedCol ? (
               <Box padding={6} background="neutral100" hasRadius style={{ textAlign: 'center' }}>
                 <Typography variant="pi" textColor="neutral600">
-                  No content types match the visibility or search filters.
+                  Please select a collection type above to display entries.
                 </Typography>
               </Box>
-            ) : (
-              filteredCollections.map((col) => {
-                const pageState = collectionPages[col.uid];
-                const entries = pageState ? pageState.entries : (col.entries || []);
-                const totalEntries = pageState ? pageState.total : (col.totalEntries !== undefined ? col.totalEntries : entries.length);
-                const page = pageState ? pageState.page : 1;
-                const pageCount = pageState ? pageState.pageCount : 1;
-                const pageSize = pageState ? pageState.pageSize : defaultPageSize;
-                const hasAttr = selectedAttribute ? col.attributes.includes(selectedAttribute) : false;
-                const visibleEntries = getVisibleEntries(col);
-                const matchingColCount = selectedAttribute ? entries.filter((e) => entryMatchesFilter(e, effectiveSearchAttribute)).length : 0;
-                const isFullySelected = isCollectionFullySelected(col);
-                const isPartiallySelected = isCollectionPartiallySelected(col);
-                const currentSort = collectionSorts[col.uid] || { field: 'createdAt', order: 'desc' };
-                const availableColumns = getAvailableColumnsForCollection(col, selectedAttribute, searchAttribute);
-                const savedColKeys = collectionColumnVisibility[col.uid];
-                const activeColumns = savedColKeys
-                  ? availableColumns.filter((c) => c.isPermanent || savedColKeys.includes(c.key))
-                  : availableColumns.filter((c) => c.defaultVisible);
+            ) : (() => {
+              const col = selectedCol;
+              const pageState = collectionPages[col.uid];
+              const entries = pageState ? pageState.entries : (col.entries || []);
+              const totalEntries = pageState ? pageState.total : (col.totalEntries !== undefined ? col.totalEntries : entries.length);
+              const page = pageState ? pageState.page : 1;
+              const pageCount = pageState ? pageState.pageCount : 1;
+              const pageSize = pageState ? pageState.pageSize : defaultPageSize;
+              const hasAttr = selectedAttribute ? col.attributes.includes(selectedAttribute) : false;
+              const visibleEntries = getVisibleEntries(col);
+              const matchingColCount = selectedAttribute ? entries.filter((e) => entryMatchesFilter(e, effectiveSearchAttribute)).length : 0;
+              const isFullySelected = isCollectionFullySelected(col);
+              const isPartiallySelected = isCollectionPartiallySelected(col);
+              const currentSort = collectionSorts[col.uid] || { field: 'createdAt', order: 'desc' };
+              const availableColumns = getAvailableColumnsForCollection(col, selectedAttribute, searchAttribute);
+              const savedColKeys = collectionColumnVisibility[col.uid];
+              const activeColumns = savedColKeys
+                ? availableColumns.filter((c) => c.isPermanent || savedColKeys.includes(c.key))
+                : availableColumns.filter((c) => c.defaultVisible);
 
-                return (
-                  <Box
+              return (
+                <Box
                     key={col.uid}
                     marginBottom={5}
                     padding={4}
@@ -3016,13 +2882,161 @@ const BulkUpdater: React.FC = () => {
                           </Flex>
                         )}
 
-                        <Button
-                          variant={openColumnPickerUid === col.uid ? 'secondary' : 'tertiary'}
-                          size="S"
-                          onClick={() => setOpenColumnPickerUid(openColumnPickerUid === col.uid ? null : col.uid)}
-                        >
-                          Columns ({activeColumns.filter((c) => !c.isPermanent).length}/{availableColumns.filter((c) => !c.isPermanent).length})
-                        </Button>
+                        {/* Searchable Columns Dropdown Popover */}
+                        <Box style={{ position: 'relative', display: 'inline-block' }}>
+                          <Button
+                            variant={openColumnPickerUid === col.uid ? 'secondary' : 'tertiary'}
+                            size="S"
+                            startIcon={<Cog />}
+                            onClick={() => {
+                              setOpenColumnPickerUid(openColumnPickerUid === col.uid ? null : col.uid);
+                              setColumnSearchTerm('');
+                            }}
+                          >
+                            Columns ({activeColumns.filter((c) => !c.isPermanent).length}/{availableColumns.filter((c) => !c.isPermanent).length})
+                          </Button>
+
+                          {openColumnPickerUid === col.uid && (
+                            <Box
+                              style={{
+                                position: 'absolute',
+                                top: 'calc(100% + 6px)',
+                                right: 0,
+                                zIndex: 200,
+                                width: 320,
+                                maxHeight: 420,
+                                background: '#ffffff',
+                                borderRadius: 8,
+                                boxShadow: '0 10px 25px rgba(33, 33, 52, 0.18)',
+                                border: '1px solid #dcdce4',
+                                padding: 12,
+                                display: 'flex',
+                                flexDirection: 'column',
+                                gap: 8,
+                              }}
+                            >
+                              <Flex justifyContent="space-between" alignItems="center">
+                                <Typography variant="pi" fontWeight="bold">
+                                  Configure Columns
+                                </Typography>
+                                <Button
+                                  variant="ghost"
+                                  size="S"
+                                  onClick={() => setOpenColumnPickerUid(null)}
+                                  style={{ padding: '2px 6px', height: 'auto', minWidth: 'unset' }}
+                                >
+                                  ✕
+                                </Button>
+                              </Flex>
+
+                              <TextInput
+                                size="S"
+                                placeholder="Search columns..."
+                                value={columnSearchTerm}
+                                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setColumnSearchTerm(e.target.value)}
+                              />
+
+                              <Flex justifyContent="space-between" alignItems="center" style={{ borderBottom: '1px solid #f0f0f5', paddingBottom: 6 }}>
+                                <Button
+                                  variant="ghost"
+                                  size="S"
+                                  onClick={() => showAllColumns(col.uid, availableColumns)}
+                                  style={{ fontSize: 11, padding: 0 }}
+                                >
+                                  Show All
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="S"
+                                  onClick={() => {
+                                    setCollectionColumnVisibility((prev) => ({
+                                      ...prev,
+                                      [col.uid]: [],
+                                    }));
+                                  }}
+                                  style={{ fontSize: 11, padding: 0 }}
+                                >
+                                  Hide All
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="S"
+                                  onClick={() => resetDefaultColumns(col.uid, availableColumns)}
+                                  style={{ fontSize: 11, padding: 0 }}
+                                >
+                                  Reset
+                                </Button>
+                              </Flex>
+
+                              <Box
+                                style={{
+                                  maxHeight: 250,
+                                  overflowY: 'auto',
+                                  display: 'flex',
+                                  flexDirection: 'column',
+                                  gap: 4,
+                                }}
+                              >
+                                {availableColumns
+                                  .filter((c) => {
+                                    if (!columnSearchTerm.trim()) return true;
+                                    const term = columnSearchTerm.toLowerCase().trim();
+                                    return c.label.toLowerCase().includes(term) || c.key.toLowerCase().includes(term);
+                                  })
+                                  .map((c) => {
+                                    const isChecked = activeColumns.some((ac) => ac.key === c.key);
+                                    const isNested = c.key.includes('.');
+                                    const depth = isNested ? c.key.split('.').length - 1 : 0;
+                                    return (
+                                      <Flex
+                                        key={c.key}
+                                        justifyContent="space-between"
+                                        alignItems="center"
+                                        style={{
+                                          padding: '4px 6px',
+                                          borderRadius: 4,
+                                          background: isChecked ? '#f0f0ff' : 'transparent',
+                                        }}
+                                      >
+                                        <Box style={{ minWidth: 0, flex: 1, overflow: 'hidden' }}>
+                                          <Checkbox
+                                            checked={isChecked}
+                                            disabled={c.isPermanent}
+                                            onCheckedChange={() => {
+                                              if (!c.isPermanent) {
+                                                toggleColumn(col.uid, c.key, availableColumns);
+                                              }
+                                            }}
+                                          >
+                                            <Typography
+                                              variant="pi"
+                                              ellipsis
+                                              style={{
+                                                color: c.isPermanent ? '#8e8ea9' : '#272833',
+                                                fontWeight: isChecked ? 600 : 400,
+                                              }}
+                                              title={c.key}
+                                            >
+                                              {c.label}
+                                            </Typography>
+                                          </Checkbox>
+                                        </Box>
+                                        {c.isPermanent ? (
+                                          <Badge size="S" backgroundColor="neutral150" textColor="neutral700">
+                                            Fixed
+                                          </Badge>
+                                        ) : depth > 0 ? (
+                                          <Badge size="S" backgroundColor="secondary100" textColor="secondary700">
+                                            L{depth}
+                                          </Badge>
+                                        ) : null}
+                                      </Flex>
+                                    );
+                                  })}
+                              </Box>
+                            </Box>
+                          )}
+                        </Box>
 
                         <Button
                           variant="tertiary"
@@ -3091,64 +3105,6 @@ const BulkUpdater: React.FC = () => {
                         </Typography>
                       </Flex>
                     </Flex>
-
-                    {/* Column Visibility Selector Panel */}
-                    {openColumnPickerUid === col.uid && (
-                      <Box
-                        padding={3}
-                        marginBottom={3}
-                        background="neutral100"
-                        hasRadius
-                        borderColor="neutral200"
-                        style={{ border: '1px solid #dcdce4' }}
-                      >
-                        <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={3}>
-                          <Flex gap={3} alignItems="center" wrap="wrap">
-                            <Typography variant="pi" fontWeight="bold" textColor="neutral700">
-                              Columns for {col.displayName}:
-                            </Typography>
-                            {availableColumns
-                              .filter((c) => !c.isPermanent)
-                              .map((c) => {
-                                const isChecked = activeColumns.some((ac) => ac.key === c.key);
-                                return (
-                                  <Box key={c.key}>
-                                    <Checkbox
-                                      checked={isChecked}
-                                      onCheckedChange={() => toggleColumn(col.uid, c.key, availableColumns)}
-                                    >
-                                      <Typography variant="pi">{c.label}</Typography>
-                                    </Checkbox>
-                                  </Box>
-                                );
-                              })}
-                          </Flex>
-                          <Flex gap={2}>
-                            <Button
-                              variant="tertiary"
-                              size="S"
-                              onClick={() => showAllColumns(col.uid, availableColumns)}
-                            >
-                              Show All
-                            </Button>
-                            <Button
-                              variant="tertiary"
-                              size="S"
-                              onClick={() => resetDefaultColumns(col.uid, availableColumns)}
-                            >
-                              Reset
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="S"
-                              onClick={() => setOpenColumnPickerUid(null)}
-                            >
-                              Close
-                            </Button>
-                          </Flex>
-                        </Flex>
-                      </Box>
-                    )}
 
                     {/* Entries Table */}
                     <Box className="bulk-updater-table-container" style={{ width: '100%', maxWidth: '100%', minWidth: 0, overflowX: 'auto' }}>
@@ -3280,8 +3236,7 @@ const BulkUpdater: React.FC = () => {
                     )}
                   </Box>
                 );
-              })
-            )}
+              })()}
           </Box>
 
           {/* Execution Results Feedback */}
