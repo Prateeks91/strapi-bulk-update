@@ -576,7 +576,8 @@ const BulkUpdater: React.FC = () => {
     Boolean(searchAttribute && searchAttribute !== selectedAttribute) ||
     (filterOperator !== 'none' &&
       (['empty', 'not_empty'].includes(filterOperator) || Boolean(filterQuery.trim()))) ||
-    Boolean(entrySearch.trim());
+    Boolean(entrySearch.trim()) ||
+    Boolean(useRegex && regexPattern.trim());
 
   // Result state
   const [lastResults, setLastResults] = useState<UpdateResult[] | null>(null);
@@ -929,7 +930,8 @@ const BulkUpdater: React.FC = () => {
           Boolean(searchAttribute && searchAttribute !== selectedAttribute) ||
           (filterOperator !== 'none' &&
             (['empty', 'not_empty'].includes(filterOperator) || Boolean(filterQuery.trim()))) ||
-          Boolean(entrySearch.trim());
+          Boolean(entrySearch.trim()) ||
+          Boolean(useRegex && regexPattern.trim());
 
         if (isFilterActiveNow) {
           setSelectedEntries({});
@@ -961,7 +963,7 @@ const BulkUpdater: React.FC = () => {
     }, 350);
 
     return () => clearTimeout(timer);
-  }, [searchAttribute, filterOperator, filterQuery, entrySearch]);
+  }, [searchAttribute, filterOperator, filterQuery, entrySearch, useRegex, regexPattern]);
 
   const KEY_SEP = '@@@';
 
@@ -1245,6 +1247,19 @@ const BulkUpdater: React.FC = () => {
 
   // Value filter evaluation
   const entryMatchesFilter = (entry: Entry, attr: string): boolean => {
+    // If regex search pattern is provided, verify against the search attribute value
+    if (useRegex && regexPattern.trim()) {
+      try {
+        const regex = new RegExp(regexPattern, 'i');
+        const targetSearchVal = formatDisplayValue(getNestedValue(entry, attr));
+        if (!regex.test(targetSearchVal)) {
+          return false;
+        }
+      } catch {
+        // Keep unhindered while typing regex
+      }
+    }
+
     if (filterOperator === 'none') return true;
     const val = getNestedValue(entry, attr);
     const displayStr = formatDisplayValue(val);
@@ -1319,6 +1334,7 @@ const BulkUpdater: React.FC = () => {
     setFilterOperator('none');
     setFilterQuery('');
     setEntrySearch('');
+    setRegexPattern('');
     setSelectedEntries({});
     collections.forEach((col) => {
       loadCollectionPage(col.uid, 1, undefined, undefined, undefined, 'none', '', '', false, '');
@@ -2421,31 +2437,6 @@ const BulkUpdater: React.FC = () => {
               </Flex>
             </Box>
 
-            {/* Pro Feature: Regex Search & Replace */}
-            <Box marginTop={4} padding={4} background="neutral100" hasRadius>
-              <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={3}>
-                <Flex gap={2} alignItems="center">
-                  <Checkbox
-                    checked={useRegex}
-                    onCheckedChange={(checked: boolean) => setUseRegex(Boolean(checked))}
-                  >
-                    <Typography fontWeight="bold">Enable Regex Find &amp; Replace</Typography>
-                  </Checkbox>
-                </Flex>
-                {useRegex && (
-                  <Box style={{ flex: 1, minWidth: 240 }}>
-                    <TextInput
-                      placeholder="Regex pattern (e.g. \b(OldName)\b)..."
-                      value={regexPattern}
-                      onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                        setRegexPattern(e.target.value)
-                      }
-                    />
-                  </Box>
-                )}
-              </Flex>
-            </Box>
-
             {/* Selected Attribute Context & Schema Intelligence Dashboard */}
             {selectedAttribute && (
               <Box marginTop={4} padding={4} background="neutral100" hasRadius style={{ border: '1px solid #eaeaef' }}>
@@ -2701,6 +2692,43 @@ const BulkUpdater: React.FC = () => {
                     </Flex>
                   )}
                 </Flex>
+
+                {/* Pro Feature: Regex Search & Pattern Subsection */}
+                <Box marginTop={3} paddingTop={3} style={{ borderTop: '1px solid #dcdce4' }}>
+                  <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={3}>
+                    <Flex gap={2} alignItems="center">
+                      <Checkbox
+                        checked={useRegex}
+                        onCheckedChange={(checked: boolean) => setUseRegex(Boolean(checked))}
+                      >
+                        <Typography fontWeight="bold">Enable Regex Search &amp; Replace</Typography>
+                      </Checkbox>
+                      <Badge
+                        backgroundColor={useRegex ? 'secondary100' : 'neutral200'}
+                        textColor={useRegex ? 'secondary700' : 'neutral600'}
+                        size="S"
+                      >
+                        {useRegex ? 'REGEX SEARCH ACTIVE' : 'REGEX OFF'}
+                      </Badge>
+                    </Flex>
+                    {useRegex && (
+                      <Box style={{ flex: 1, minWidth: 260 }}>
+                        <TextInput
+                          placeholder={`Regex pattern to search in "${effectiveSearchAttribute || 'target'}" (e.g. \\b(OldName)\\b)...`}
+                          value={regexPattern}
+                          onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                            setRegexPattern(e.target.value)
+                          }
+                        />
+                      </Box>
+                    )}
+                  </Flex>
+                  {useRegex && (
+                    <Typography variant="pi" textColor="neutral600" marginTop={1}>
+                      Searches {effectiveSearchAttribute ? <strong>{effectiveSearchAttribute}</strong> : 'target entries'} for text matching this regular expression pattern. Matches will be substituted with the Replacement Value configured in Section 1.
+                    </Typography>
+                  )}
+                </Box>
 
                 {isFilterActive && (
                   <Flex gap={2} alignItems="center" marginTop={1}>
