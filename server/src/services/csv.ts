@@ -179,17 +179,26 @@ function discoverExportFields(
 /**
  * Builds a deep populate object for Strapi 5 Document Service
  */
-function buildDeepPopulate(attributes: Record<string, any>, allComponents: Record<string, any>, depth = 0): any {
-  if (depth > 4) return true;
+function buildDeepPopulate(
+  attributes: Record<string, any>,
+  allComponents: Record<string, any>,
+  depth = 0
+): Record<string, any> | undefined {
+  if (depth > 5) return undefined;
   const populate: Record<string, any> = {};
 
   for (const [key, def] of Object.entries(attributes || {}) as any[]) {
     if (def.type === 'component' && def.component) {
       const comp = allComponents[def.component];
       if (comp?.attributes) {
-        populate[key] = {
-          populate: buildDeepPopulate(comp.attributes, allComponents, depth + 1),
-        };
+        const subPopulate = buildDeepPopulate(comp.attributes, allComponents, depth + 1);
+        if (subPopulate && Object.keys(subPopulate).length > 0) {
+          populate[key] = {
+            populate: subPopulate,
+          };
+        } else {
+          populate[key] = true;
+        }
       } else {
         populate[key] = true;
       }
@@ -200,7 +209,7 @@ function buildDeepPopulate(attributes: Record<string, any>, allComponents: Recor
     }
   }
 
-  return Object.keys(populate).length > 0 ? populate : true;
+  return Object.keys(populate).length > 0 ? populate : undefined;
 }
 
 /**
@@ -430,17 +439,22 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     // 4. Retrieve entries (handling singleType vs collectionType)
     let entries: any[] = [];
     if (ct.kind === 'singleType') {
-      const doc = await (strapi.documents(uid as any) as any).findFirst({
-        populate: deepPopulate,
-      });
+      const findFirstArgs: any = {};
+      if (deepPopulate) {
+        findFirstArgs.populate = deepPopulate;
+      }
+      const doc = await (strapi.documents(uid as any) as any).findFirst(findFirstArgs);
       entries = doc ? [doc] : [];
     } else {
-      entries = await (strapi.documents(uid as any) as any).findMany({
+      const findManyArgs: any = {
         filters: Object.keys(filters).length > 0 ? filters : undefined,
         limit: options.limit || 5000,
         sort: { createdAt: 'desc' },
-        populate: deepPopulate,
-      });
+      };
+      if (deepPopulate) {
+        findManyArgs.populate = deepPopulate;
+      }
+      entries = await (strapi.documents(uid as any) as any).findMany(findManyArgs);
     }
 
     // 5. Generate RFC-4180 CRLF rows with UTF-8 BOM

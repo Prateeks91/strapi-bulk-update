@@ -52,17 +52,26 @@ let staticSchemaCache: {
 /**
  * Builds a recursive Strapi 5 populate tree for deep nested components, relations, and media
  */
-export function buildDeepPopulate(attributes: Record<string, any>, allComponents: Record<string, any>, depth = 0): any {
-  if (depth > 5) return true;
+export function buildDeepPopulate(
+  attributes: Record<string, any>,
+  allComponents: Record<string, any>,
+  depth = 0
+): Record<string, any> | undefined {
+  if (depth > 5) return undefined;
   const populate: Record<string, any> = {};
 
   for (const [key, def] of Object.entries(attributes || {}) as any[]) {
     if (def.type === 'component' && def.component) {
       const comp = allComponents[def.component];
       if (comp?.attributes) {
-        populate[key] = {
-          populate: buildDeepPopulate(comp.attributes, allComponents, depth + 1),
-        };
+        const subPopulate = buildDeepPopulate(comp.attributes, allComponents, depth + 1);
+        if (subPopulate && Object.keys(subPopulate).length > 0) {
+          populate[key] = {
+            populate: subPopulate,
+          };
+        } else {
+          populate[key] = true;
+        }
       } else {
         populate[key] = true;
       }
@@ -73,7 +82,7 @@ export function buildDeepPopulate(attributes: Record<string, any>, allComponents
     }
   }
 
-  return Object.keys(populate).length > 0 ? populate : true;
+  return Object.keys(populate).length > 0 ? populate : undefined;
 }
 
 /**
@@ -572,10 +581,12 @@ async function executeBatchInternal(
         if (hasAttribute) {
           if (isComponentNested) {
             // Retrieve current component state with deep populate for safe recursive merge
-            const currentEntryWithPopulate: any = await strapi.documents(target.uid as any).findOne({
-              documentId: target.documentId,
-              populate: buildDeepPopulate(contentType.attributes, strapi.components),
-            });
+            const populateOption = buildDeepPopulate(contentType.attributes, strapi.components);
+            const findOneArgs: any = { documentId: target.documentId };
+            if (populateOption) {
+              findOneArgs.populate = populateOption;
+            }
+            const currentEntryWithPopulate: any = await strapi.documents(target.uid as any).findOne(findOneArgs);
             const existingRoot = currentEntryWithPopulate?.[rootKey] || {};
             const currentVal = getDeepProperty(existingRoot, parts.slice(1).join('.'));
 
@@ -1264,20 +1275,25 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
               const populateOption = buildDeepPopulate(allContentTypes[uid]?.attributes || {}, strapi.components);
 
               if (meta.isSingleType) {
-                const singleDoc: any = await (strapi.documents(uid as any) as any).findFirst({
-                  populate: populateOption,
-                });
+                const singleArgs: any = {};
+                if (populateOption) {
+                  singleArgs.populate = populateOption;
+                }
+                const singleDoc: any = await (strapi.documents(uid as any) as any).findFirst(singleArgs);
                 if (singleDoc) {
                   entries = [singleDoc];
                   totalCount = 1;
                 }
               } else {
                 totalCount = await strapi.documents(uid as any).count();
-                entries = await strapi.documents(uid as any).findMany({
+                const findArgs: any = {
                   limit: 10,
                   sort: { createdAt: 'desc' },
-                  populate: populateOption,
-                });
+                };
+                if (populateOption) {
+                  findArgs.populate = populateOption;
+                }
+                entries = await strapi.documents(uid as any).findMany(findArgs);
               }
             } catch (err) {
               strapi.log.error(`[bulk-updater] Failed to fetch entries for ${uid}:`, err);
@@ -1523,10 +1539,13 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       if (isSingleType) {
         let singleDoc: any = null;
         try {
-          singleDoc = await (strapi.documents(uid as any) as any).findFirst({
+          const singleArgs: any = {
             filters: Object.keys(filters).length > 0 ? filters : undefined,
-            populate: populateOption,
-          });
+          };
+          if (populateOption) {
+            singleArgs.populate = populateOption;
+          }
+          singleDoc = await (strapi.documents(uid as any) as any).findFirst(singleArgs);
         } catch {
           singleDoc = null;
         }
@@ -1559,14 +1578,18 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           sortClause['createdAt'] = 'desc';
         }
 
+        const findManyArgs: any = {
+          start,
+          limit,
+          filters: Object.keys(filters).length > 0 ? filters : undefined,
+          sort: sortClause,
+        };
+        if (populateOption) {
+          findManyArgs.populate = populateOption;
+        }
+
         const [entries, totalEntries] = await Promise.all([
-          strapi.documents(uid as any).findMany({
-            start,
-            limit,
-            filters: Object.keys(filters).length > 0 ? filters : undefined,
-            sort: sortClause,
-            populate: populateOption,
-          }),
+          strapi.documents(uid as any).findMany(findManyArgs),
           strapi.documents(uid as any).count({
             filters: Object.keys(filters).length > 0 ? filters : undefined,
           }),
@@ -1734,10 +1757,12 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
           let currentEntry: any;
           if (isComponentNested) {
-            currentEntry = await strapi.documents(target.uid as any).findOne({
-              documentId: target.documentId,
-              populate: buildDeepPopulate(contentType.attributes, strapi.components),
-            });
+            const findOneArgs: any = { documentId: target.documentId };
+            const populateOption = buildDeepPopulate(contentType.attributes, strapi.components);
+            if (populateOption) {
+              findOneArgs.populate = populateOption;
+            }
+            currentEntry = await strapi.documents(target.uid as any).findOne(findOneArgs);
           } else if (attrDef?.type === 'relation') {
             currentEntry = await strapi.documents(target.uid as any).findOne({
               documentId: target.documentId,
