@@ -21,8 +21,16 @@ export interface RelationMeta {
   isMulti: boolean;
 }
 
+export interface AttributeMeta {
+  depth: number;
+  type: string;
+  component?: string;
+  isRelation?: boolean;
+}
+
 let staticSchemaCache: {
   attributes: string[];
+  attributesMeta: Record<string, AttributeMeta>;
   targetUids: string[];
   metaByUid: Record<
     string,
@@ -34,11 +42,178 @@ let staticSchemaCache: {
       pluralName: string;
       displayName: string;
       attributes: string[];
+      attributesMeta: Record<string, AttributeMeta>;
       relations: Record<string, RelationMeta>;
     }
   >;
   relationsMeta: Record<string, RelationMeta>;
 } | null = null;
+
+/**
+ * Builds a recursive Strapi 5 populate tree for deep nested components, relations, and media
+ */
+export function buildDeepPopulate(attributes: Record<string, any>, allComponents: Record<string, any>, depth = 0): any {
+  if (depth > 5) return true;
+  const populate: Record<string, any> = {};
+
+  for (const [key, def] of Object.entries(attributes || {}) as any[]) {
+    if (def.type === 'component' && def.component) {
+      const comp = allComponents[def.component];
+      if (comp?.attributes) {
+        populate[key] = {
+          populate: buildDeepPopulate(comp.attributes, allComponents, depth + 1),
+        };
+      } else {
+        populate[key] = true;
+      }
+    } else if (def.type === 'dynamiczone') {
+      populate[key] = true;
+    } else if (def.type === 'relation' || def.type === 'media') {
+      populate[key] = true;
+    }
+  }
+
+  return Object.keys(populate).length > 0 ? populate : true;
+}
+
+/**
+ * Recursively discovers component fields down to a specified maxDepth (up to 5 levels)
+ */
+export function discoverComponentAttributes(
+  strapi: any,
+  compUid: string,
+  prefix: string,
+  currentDepth: number,
+  maxDepth: number,
+  systemFields: string[],
+  allContentTypes: Record<string, any>,
+  relationsByAttr: Record<string, RelationMeta>,
+  allRelationsMeta: Record<string, RelationMeta>,
+  attributesMeta: Record<string, AttributeMeta>
+): string[] {
+  if (currentDepth > maxDepth || !compUid) return [];
+  const compSchema = strapi.components[compUid];
+  if (!compSchema?.attributes) return [];
+
+  const discoveredAttrs: string[] = [];
+
+  for (const [subKey, subAttr] of Object.entries(compSchema.attributes) as any[]) {
+    if (systemFields.includes(subKey)) continue;
+    if (subAttr.type === 'dynamiczone') continue;
+    const fullPath = prefix ? `${prefix}.${subKey}` : subKey;
+
+    if (subAttr.type === 'component') {
+      if (!subAttr.repeatable && subAttr.component) {
+        const deeper = discoverComponentAttributes(
+          strapi,
+          subAttr.component,
+          fullPath,
+          currentDepth + 1,
+          maxDepth,
+          systemFields,
+          allContentTypes,
+          relationsByAttr,
+          allRelationsMeta,
+          attributesMeta
+        );
+        discoveredAttrs.push(...deeper);
+      }
+    } else if (subAttr.type === 'relation') {
+      const targetUid = subAttr.target;
+      if (targetUid && allContentTypes[targetUid]) {
+        const targetInfo = allContentTypes[targetUid]?.info;
+        const isMulti = subAttr.relation === 'oneToMany' || subAttr.relation === 'manyToMany';
+        const relMeta: RelationMeta = {
+          isRelation: true,
+          relationType: subAttr.relation,
+          targetUid,
+          targetDisplayName: targetInfo?.displayName || targetUid,
+          isMulti,
+        };
+        relationsByAttr[fullPath] = relMeta;
+        allRelationsMeta[fullPath] = relMeta;
+        attributesMeta[fullPath] = { depth: currentDepth, type: 'relation', component: compUid, isRelation: true };
+        discoveredAttrs.push(fullPath);
+      }
+    } else {
+      attributesMeta[fullPath] = { depth: currentDepth, type: subAttr.type, component: compUid };
+      discoveredAttrs.push(fullPath);
+    }
+  }
+
+  return discoveredAttrs;
+}
+
+/**
+ * Validates whether a dot-notation attribute corresponds to a valid deep component hierarchy
+ */
+export function isDeepComponentField(contentType: any, allComponents: Record<string, any>, attribute: string): boolean {
+  if (!attribute || !attribute.includes('.')) return false;
+  const parts = attribute.split('.');
+  let currentSchema = contentType;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const part = parts[i];
+    const attrDef = currentSchema?.attributes?.[part];
+    if (!attrDef || attrDef.type !== 'component' || !attrDef.component) return false;
+    currentSchema = allComponents[attrDef.component];
+    if (!currentSchema) return false;
+  }
+  const leafField = parts[parts.length - 1];
+  return Boolean(currentSchema?.attributes?.[leafField]);
+}
+
+/**
+ * Retrieves the schema definition of a leaf attribute from a deep dot-notation path
+ */
+export function getLeafAttributeSchema(contentType: any, allComponents: Record<string, any>, attribute: string): any {
+  if (!attribute) return null;
+  if (!attribute.includes('.')) return contentType?.attributes?.[attribute] || null;
+  const parts = attribute.split('.');
+  let currentSchema = contentType;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const part = parts[i];
+    const attrDef = currentSchema?.attributes?.[part];
+    if (!attrDef || attrDef.type !== 'component' || !attrDef.component) return null;
+    currentSchema = allComponents[attrDef.component];
+    if (!currentSchema) return null;
+  }
+  return currentSchema?.attributes?.[parts[parts.length - 1]] || null;
+}
+
+/**
+ * Immutably sets a nested property at an arbitrary depth while preserving all sibling properties
+ */
+export function setDeepProperty(obj: any, pathParts: string[], value: any): any {
+  if (pathParts.length === 0) return value;
+  const current = { ...(obj || {}) };
+  const [head, ...tail] = pathParts;
+  if (tail.length === 0) {
+    current[head] = value;
+  } else {
+    current[head] = setDeepProperty(current[head] || {}, tail, value);
+  }
+  return current;
+}
+
+/**
+ * Safely resolves a nested dot-notation property (e.g. "a.b.c.d")
+ */
+export function getDeepProperty(obj: any, path: string): any {
+  if (!obj || !path) return undefined;
+  if (!path.includes('.')) return obj[path];
+  return path.split('.').reduce((acc, part) => (acc && typeof acc === 'object' ? acc[part] : undefined), obj);
+}
+
+/**
+ * Constructs a nested filter object for Strapi 5 Document queries (e.g. { a: { b: { c: condition } } })
+ */
+export function buildDeepFilter(pathParts: string[], condition: any): any {
+  if (pathParts.length === 0) return condition;
+  const [head, ...tail] = pathParts;
+  return {
+    [head]: buildDeepFilter(tail, condition),
+  };
+}
 
 export interface ExecutionWindowConfig {
   enabled: boolean;
@@ -387,50 +562,34 @@ async function executeBatchInternal(
           `Entry #${target.documentId}`;
 
         const isNested = attribute.includes('.');
-        let isComponentNested = false;
-        let parentKey = '';
-        let childKey = '';
-
-        if (isNested) {
-          const parts = attribute.split('.');
-          parentKey = parts[0];
-          childKey = parts[1];
-          const parentAttrDef = contentType?.attributes?.[parentKey];
-          if (parentAttrDef?.type === 'component' && !parentAttrDef.repeatable && parentAttrDef.component) {
-            const compSchema = strapi.components[parentAttrDef.component];
-            if (compSchema?.attributes?.[childKey]) {
-              isComponentNested = true;
-            }
-          }
-        }
+        const isComponentNested = isNested && isDeepComponentField(contentType, strapi.components, attribute);
+        const parts = isNested ? attribute.split('.') : [];
+        const rootKey = isNested ? parts[0] : '';
 
         const attrDef = contentType?.attributes?.[attribute];
         const hasAttribute = Boolean(attrDef) || isComponentNested;
 
         if (hasAttribute) {
           if (isComponentNested) {
-            // Retrieve current component state with populate for safe deep merge
+            // Retrieve current component state with deep populate for safe recursive merge
             const currentEntryWithPopulate: any = await strapi.documents(target.uid as any).findOne({
               documentId: target.documentId,
-              populate: [parentKey],
+              populate: buildDeepPopulate(contentType.attributes, strapi.components),
             });
-            const existingParent = currentEntryWithPopulate?.[parentKey] || {};
-            const currentVal = existingParent?.[childKey];
+            const existingRoot = currentEntryWithPopulate?.[rootKey] || {};
+            const currentVal = getDeepProperty(existingRoot, parts.slice(1).join('.'));
 
             let newValue = value;
             if (regexObj && typeof currentVal === 'string') {
               newValue = currentVal.replace(regexObj, value);
             }
 
-            const updatedParent = {
-              ...existingParent,
-              [childKey]: newValue,
-            };
+            const updatedRoot = setDeepProperty(existingRoot, parts.slice(1), newValue);
 
             await strapi.documents(target.uid as any).update({
               documentId: target.documentId,
               data: {
-                [parentKey]: updatedParent,
+                [rootKey]: updatedRoot,
               },
             });
 
@@ -980,6 +1139,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
         const metaByUid: Record<string, any> = {};
         const allRelationsMeta: Record<string, RelationMeta> = {};
+        const allAttributesMeta: Record<string, AttributeMeta> = {};
 
         for (const uid of targetUids) {
           const contentType = allContentTypes[uid];
@@ -988,7 +1148,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           const isSingleType = contentType.kind === 'singleType';
           const rawAttrs = contentType.attributes || {};
           const relationsByAttr: Record<string, RelationMeta> = {};
-
+          const colAttributesMeta: Record<string, AttributeMeta> = {};
           const nestedComponentAttrs: string[] = [];
 
           const validAttrs = Object.keys(rawAttrs).filter((attrKey) => {
@@ -997,16 +1157,21 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
             if (rawAttrs[attrKey].type === 'component') {
               const compDef = rawAttrs[attrKey];
-              // Support non-repeatable components
+              // Support non-repeatable components recursively up to depth 5
               if (!compDef.repeatable && compDef.component) {
-                const componentSchema = strapi.components[compDef.component];
-                if (componentSchema && componentSchema.attributes) {
-                  for (const [subKey, subAttr] of Object.entries(componentSchema.attributes) as any[]) {
-                    if (systemFields.includes(subKey)) continue;
-                    if (['component', 'dynamiczone', 'relation'].includes(subAttr.type)) continue;
-                    nestedComponentAttrs.push(`${attrKey}.${subKey}`);
-                  }
-                }
+                const compAttrs = discoverComponentAttributes(
+                  strapi,
+                  compDef.component,
+                  attrKey,
+                  1,
+                  5,
+                  systemFields,
+                  allContentTypes,
+                  relationsByAttr,
+                  allRelationsMeta,
+                  colAttributesMeta
+                );
+                nestedComponentAttrs.push(...compAttrs);
               }
               return false;
             }
@@ -1026,14 +1191,21 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
               };
               relationsByAttr[attrKey] = relMeta;
               allRelationsMeta[attrKey] = relMeta;
+              colAttributesMeta[attrKey] = { depth: 0, type: 'relation', isRelation: true };
               return true;
             }
 
+            colAttributesMeta[attrKey] = { depth: 0, type: rawAttrs[attrKey].type };
             return true;
           });
 
           const allColAttrs = [...validAttrs, ...nestedComponentAttrs];
-          allColAttrs.forEach((attr) => allAttributesSet.add(attr));
+          allColAttrs.forEach((attr) => {
+            allAttributesSet.add(attr);
+            if (colAttributesMeta[attr]) {
+              allAttributesMeta[attr] = colAttributesMeta[attr];
+            }
+          });
 
           metaByUid[uid] = {
             uid,
@@ -1044,12 +1216,14 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
             pluralName: contentType.info?.pluralName || uid,
             displayName: contentType.info?.displayName || uid,
             attributes: allColAttrs,
+            attributesMeta: colAttributesMeta,
             relations: relationsByAttr,
           };
         }
 
         staticSchemaCache = {
           attributes: Array.from(allAttributesSet),
+          attributesMeta: allAttributesMeta,
           targetUids: Object.keys(metaByUid),
           metaByUid,
           relationsMeta: allRelationsMeta,
@@ -1087,13 +1261,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
             let entries: any[] = [];
             let totalCount = 0;
             try {
-              const ctAttrs = allContentTypes[uid]?.attributes || {};
-              const relKeys = Object.keys(meta.relations || {});
-              const compKeys = Object.keys(ctAttrs).filter((k) => ctAttrs[k].type === 'component');
-              const populateOptionObj: Record<string, any> = {};
-              relKeys.forEach((k) => { populateOptionObj[k] = true; });
-              compKeys.forEach((k) => { populateOptionObj[k] = true; });
-              const populateOption = Object.keys(populateOptionObj).length > 0 ? populateOptionObj : undefined;
+              const populateOption = buildDeepPopulate(allContentTypes[uid]?.attributes || {}, strapi.components);
 
               if (meta.isSingleType) {
                 const singleDoc: any = await (strapi.documents(uid as any) as any).findFirst({
@@ -1160,8 +1328,10 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       return {
         success: true,
         attributes: staticSchemaCache.attributes,
+        attributesMeta: staticSchemaCache.attributesMeta,
         collections,
         relationsMeta: staticSchemaCache.relationsMeta,
+        maxDiscoveredDepth: 5,
         executionWindow: {
           ...executionConfig,
           ...windowStatus,
@@ -1183,6 +1353,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         page = 1,
         pageSize = 10,
         attribute,
+        searchAttribute,
         filterOperator,
         filterQuery,
         search,
@@ -1192,6 +1363,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         page?: number;
         pageSize?: number;
         attribute?: string;
+        searchAttribute?: string;
         filterOperator?: string;
         filterQuery?: string;
         search?: string;
@@ -1209,10 +1381,11 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       const start = (currentPage - 1) * limit;
 
       const isSingleType = contentType.kind === 'singleType';
+      const targetFilterAttr = searchAttribute || attribute;
 
       // 1. Signature-based caching verification
       const signature = await getCollectionSignature(strapi, uid);
-      const cacheKey = `${uid}:${limit}:${start}:${attribute || ''}:${filterOperator || ''}:${filterQuery || ''}:${search || ''}:${sortField || ''}:${sortOrder}`;
+      const cacheKey = `${uid}:${limit}:${start}:${attribute || ''}:${searchAttribute || ''}:${filterOperator || ''}:${filterQuery || ''}:${search || ''}:${sortField || ''}:${sortOrder}`;
       const cached = queryCache.get(cacheKey);
 
       const etag = `W/"entry-${crypto.createHash('md5').update(`${cacheKey}:${signature}`).digest('hex')}"`;
@@ -1233,20 +1406,16 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       const attrs = contentType.attributes || {};
       let colHasAttribute = false;
       let isNestedAttr = false;
-      let parentKey = '';
-      let childKey = '';
+      let parts: string[] = [];
 
-      if (attribute) {
-        if (attribute.includes('.')) {
-          [parentKey, childKey] = attribute.split('.');
-          if (attrs[parentKey]?.type === 'component' && !attrs[parentKey].repeatable && attrs[parentKey].component) {
-            const compSchema = strapi.components[attrs[parentKey].component];
-            if (compSchema?.attributes?.[childKey]) {
-              colHasAttribute = true;
-              isNestedAttr = true;
-            }
+      if (targetFilterAttr) {
+        if (targetFilterAttr.includes('.')) {
+          isNestedAttr = isDeepComponentField(contentType, strapi.components, targetFilterAttr);
+          if (isNestedAttr) {
+            colHasAttribute = true;
+            parts = targetFilterAttr.split('.');
           }
-        } else if (attrs[attribute]) {
+        } else if (attrs[targetFilterAttr]) {
           colHasAttribute = true;
         }
       }
@@ -1278,8 +1447,8 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         const q = (filterQuery || '').trim();
 
         const targetAttrSchema = isNestedAttr
-          ? (strapi.components as any)[attrs[parentKey]?.component]?.attributes?.[childKey]
-          : attrs[attribute];
+          ? getLeafAttributeSchema(contentType, strapi.components, targetFilterAttr)
+          : attrs[targetFilterAttr];
         const isStringLike = ['string', 'text', 'email', 'richtext', 'uid'].includes(targetAttrSchema?.type);
 
         if (normOp === 'empty') {
@@ -1311,19 +1480,18 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
         if (condition !== undefined) {
           if (isNestedAttr) {
-            filters[parentKey] = {
-              [childKey]: condition,
-            };
+            const deepFilter = buildDeepFilter(parts, condition);
+            Object.assign(filters, deepFilter);
           } else {
             if (normOp === 'empty' && isStringLike) {
               filters.$or = [
-                { [attribute]: { $null: true } },
-                { [attribute]: { $eq: '' } },
+                { [targetFilterAttr]: { $null: true } },
+                { [targetFilterAttr]: { $eq: '' } },
               ];
             } else if (normOp === 'notempty' && isStringLike) {
-              filters[attribute] = { $notNull: true, $ne: '' };
+              filters[targetFilterAttr] = { $notNull: true, $ne: '' };
             } else {
-              filters[attribute] = condition;
+              filters[targetFilterAttr] = condition;
             }
           }
         }
@@ -1350,11 +1518,14 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         }
       }
 
+      const populateOption = buildDeepPopulate(contentType.attributes, strapi.components);
+
       if (isSingleType) {
         let singleDoc: any = null;
         try {
           singleDoc = await (strapi.documents(uid as any) as any).findFirst({
             filters: Object.keys(filters).length > 0 ? filters : undefined,
+            populate: populateOption,
           });
         } catch {
           singleDoc = null;
@@ -1374,11 +1545,11 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         };
       } else {
 
-        const sortClause: any = {};
+        let sortClause: any = {};
         if (sortField && sortField.includes('.')) {
-          const [parent, child] = sortField.split('.');
-          if (contentType.attributes?.[parent]?.type === 'component') {
-            sortClause[parent] = { [child]: sortOrder };
+          const sortParts = sortField.split('.');
+          if (isDeepComponentField(contentType, strapi.components, sortField)) {
+            sortClause = buildDeepFilter(sortParts, sortOrder);
           } else {
             sortClause['createdAt'] = 'desc';
           }
@@ -1387,13 +1558,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         } else {
           sortClause['createdAt'] = 'desc';
         }
-
-        const populateAttrs = Object.keys(contentType.attributes || {}).filter(
-          (k) => contentType.attributes[k].type === 'relation' || contentType.attributes[k].type === 'component'
-        );
-        const populateOption = populateAttrs.length > 0
-          ? populateAttrs.reduce((acc, k) => ({ ...acc, [k]: true }), {})
-          : undefined;
 
         const [entries, totalEntries] = await Promise.all([
           strapi.documents(uid as any).findMany({
@@ -1544,22 +1708,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
         try {
           const isNested = attribute.includes('.');
-          let isComponentNested = false;
-          let parentKey = '';
-          let childKey = '';
-
-          if (isNested) {
-            const parts = attribute.split('.');
-            parentKey = parts[0];
-            childKey = parts[1];
-            const parentAttrDef = contentType?.attributes?.[parentKey];
-            if (parentAttrDef?.type === 'component' && !parentAttrDef.repeatable && parentAttrDef.component) {
-              const compSchema = strapi.components[parentAttrDef.component];
-              if (compSchema?.attributes?.[childKey]) {
-                isComponentNested = true;
-              }
-            }
-          }
+          const isComponentNested = isNested && isDeepComponentField(contentType, strapi.components, attribute);
 
           const attrDef = contentType?.attributes?.[attribute];
           const hasAttribute = Boolean(attrDef) || isComponentNested;
@@ -1587,7 +1736,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           if (isComponentNested) {
             currentEntry = await strapi.documents(target.uid as any).findOne({
               documentId: target.documentId,
-              populate: [parentKey],
+              populate: buildDeepPopulate(contentType.attributes, strapi.components),
             });
           } else if (attrDef?.type === 'relation') {
             currentEntry = await strapi.documents(target.uid as any).findOne({
@@ -1607,8 +1756,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
             `Entry #${target.documentId}`;
 
           if (isComponentNested) {
-            const existingParent = currentEntry?.[parentKey] || {};
-            const currentVal = existingParent?.[childKey];
+            const currentVal = getDeepProperty(currentEntry, attribute);
 
             let newValue = value;
             if (regexObj && typeof currentVal === 'string') {

@@ -1,11 +1,11 @@
 {
   "name": "strapi-plugin-bulk-updater",
-  "version": "1.2.13",
-  "description": "Bulk update attributes and relationships across multiple collection types in Strapi v5 with schema validation, CSV export/import & override, legacy violation scanning, maker-checker governance, off-peak scheduling, and 3-tier audit rollback.",
+  "version": "1.3.0",
+  "description": "Enterprise bulk updater for Strapi v5: separate search and update attributes, configurable component nesting depth (L1-L5), bulk publish, Excel-safe CSV export/import, maker-checker governance, off-peak scheduling, and 3-tier audit rollback.",
   "strapi": {
     "displayName": "Bulk Attribute & Relation Updater",
     "name": "bulk-updater",
-    "description": "Mass update attributes and relationships across collection types with schema validation, CSV export/import & override, legacy violation scanning, maker-checker approval, off-peak scheduling, and 3-tier audit rollback.",
+    "description": "Enterprise bulk updater for Strapi v5: separate search and update attributes, configurable component nesting depth (L1-L5), bulk publish, Excel-safe CSV export/import, maker-checker governance, off-peak scheduling, and 3-tier audit rollback.",
     "kind": "plugin"
   },
   "license": "MIT",

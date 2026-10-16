@@ -31,9 +31,14 @@ Strapi allows editing entries individually or applying bulk actions within a sin
 ## ✨ Features at a Glance
 
 - 🔍 **Dynamic Cross-Collection Discovery**: Introspects all registered content types and attributes in your Strapi v5 instance.
+- 🎯 **Separate Search vs Update Attributes**: Search and filter by one attribute, relation, or nested component in Section 2, while targeting a distinct attribute to update in Section 1. Side-by-side table columns display both searched and target values simultaneously.
+- 🌲 **Configurable Component Nesting Depth (Levels 1–5)**: User-controlled depth exploration in the UI (`L1` to `L5`), persistent across sessions. Fully supports recursive component schema introspection, deep population, query filtering, and safe leaf mutation preserving sibling component properties.
+- 🚀 **Direct Bulk Publishing & Auto-Publish Toggle**: Directly publish draft records in bulk across multiple collections without editing values, plus an auto-publish toggle that instantly publishes updated documents for draft-enabled content types.
+- 📑 **Excel-Safe Bulk CSV Export**: RFC-4180 compliant CSV export with UTF-8 BOM and CRLF line breaks for seamless opening in Microsoft Excel and Numbers, with full recursive nested component support.
+- 🔍 **Interactive Pre-Update Change Preview**: Inspect real-time before-and-after diffs with impact classification (`Will Update`, `Unchanged`, `Will Skip`) prior to executing batch updates.
 - 🔎 **Searchable Combobox Attribute & Entity Picker**:
   - Instant fuzzy and substring search across all scalar fields, relations, and nested component paths.
-  - Interactive visual badges for relation targets (`relation ➔ Target`) and components.
+  - Interactive visual badges for relation targets (`relation ➔ Target`) and component nesting levels (`L1 component`, `L2 component`).
 - 🔗 **Full Relational Field Support**:
   - Supports `manyToOne`, `oneToOne`, `oneToMany`, and `manyToMany` relations.
   - Interactive searchable target entity dropdown populated directly from target collection records.
@@ -57,9 +62,6 @@ Strapi allows editing entries individually or applying bulk actions within a sin
   - **Convention Auto-Discovery**: Seamlessly detects and mirrors custom app collections (`api::audit-log.audit-log`).
   - **Strapi Enterprise Bridge**: Bridges events directly to native Strapi Enterprise Audit Logs (`admin::audit-logs`).
   - **Deterministic Rollback**: Restores exact prior values and relationship links using Strapi v5 Document Service.
-- 🧩 **Deep Nested Component Support**:
-  - Full dot-notation introspection (e.g. `metaFields.metaDescription`, `defaultSeo.metaTitle`) in attribute dropdown and table views.
-  - Non-destructive deep merging preserves sibling component properties during bulk updates and rollbacks.
 - ⚡ **Server-Side Filter & Full-Text Search Pushdown**:
   - Pushes text searches and attribute filters (`equals`, `contains`, `empty`, `starts_with`) directly to the database.
   - Automatically hides non-matching records and pre-selects matching rows with real-time match counters.
@@ -246,6 +248,10 @@ All routes are mounted under `/bulk-updater` and protected by Strapi Admin authe
 | `DELETE` | `/bulk-updater/validation-rules/:id` | Deletes a validation rule. |
 | `POST` | `/bulk-updater/validation-rules/:id/toggle` | Toggles rule active status. |
 | `POST` | `/bulk-updater/validation-rules/:id/scan` | Scans all existing records in target content types for violations. |
+| `POST` | `/bulk-updater/preview` | Generates a dry-run diff preview across target entries before update. |
+| `POST` | `/bulk-updater/publish` | Bulk publishes selected draft entries across multiple collections. |
+| `POST` | `/bulk-updater/export-selected` | Exports selected entries across collections to Excel-compatible CSV. |
+| `GET` | `/bulk-updater/collections/:uid/entries` | Paginated and filtered collection entries with search attribute pushdown. |
 | `GET` | `/bulk-updater/csv/template/:uid` | Generates a blank CSV template with content type headers. |
 | `GET` | `/bulk-updater/csv/export/:uid` | Exports all records for a collection type as CSV. |
 | `GET` | `/bulk-updater/csv/export-violations/:ruleId` | Exports only records violating the specified rule as CSV. |

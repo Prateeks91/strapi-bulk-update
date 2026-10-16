@@ -51,6 +51,7 @@ interface CollectionModel {
   pluralName: string;
   displayName: string;
   attributes: string[];
+  attributesMeta?: Record<string, { depth: number; type: string; component?: string; isRelation?: boolean }>;
   relations?: Record<string, RelationMeta>;
   totalEntries?: number;
   entries: Entry[];
@@ -164,7 +165,8 @@ export function getNestedValue(obj: any, path: string): any {
  */
 export function getAvailableColumnsForCollection(
   col: CollectionModel,
-  selectedAttribute: string
+  selectedAttribute: string,
+  searchAttribute?: string
 ): ColumnDef[] {
   const cols: ColumnDef[] = [
     {
@@ -184,7 +186,7 @@ export function getAvailableColumnsForCollection(
   // Schema-specific attributes
   const candidateAttrs = col.attributes || [];
   candidateAttrs.forEach((attr) => {
-    if (attr === 'name' || attr === 'title' || attr === selectedAttribute) {
+    if (attr === 'name' || attr === 'title' || attr === selectedAttribute || (searchAttribute && attr === searchAttribute)) {
       return;
     }
     const formattedLabel = attr.includes('.')
@@ -198,10 +200,27 @@ export function getAvailableColumnsForCollection(
     });
   });
 
+  // Dedicated search attribute column if searchAttribute differs from selectedAttribute
+  if (searchAttribute && searchAttribute !== selectedAttribute) {
+    const formattedSearchLabel = searchAttribute.includes('.')
+      ? searchAttribute.split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ')
+      : searchAttribute;
+    cols.push({
+      key: 'search_attr',
+      label: `Search: "${formattedSearchLabel}"`,
+      sortable: !col.isSingleType && col.attributes.includes(searchAttribute),
+      defaultVisible: true,
+    });
+  }
+
   // Target attribute column
+  const targetLabel = searchAttribute && searchAttribute !== selectedAttribute
+    ? `Update Target: "${selectedAttribute}"`
+    : `Current "${selectedAttribute}"`;
+
   cols.push({
     key: 'target_attr',
-    label: `Current "${selectedAttribute}"`,
+    label: targetLabel,
     sortable: !col.isSingleType && col.attributes.includes(selectedAttribute),
     defaultVisible: true,
   });
@@ -225,6 +244,7 @@ function renderHeaderCell(
   col: CollectionModel,
   currentSort: { field: string; order: 'asc' | 'desc' },
   selectedAttribute: string,
+  searchAttribute: string,
   onSort: (colUid: string, field: string) => void
 ) {
   if (colDef.key === 'select') {
@@ -237,6 +257,7 @@ function renderHeaderCell(
 
   const isCurrentSorted =
     (colDef.key === 'identifier' && (currentSort.field === 'name' || currentSort.field === 'title')) ||
+    (colDef.key === 'search_attr' && currentSort.field === searchAttribute) ||
     (colDef.key === 'target_attr' && currentSort.field === selectedAttribute) ||
     (colDef.key.startsWith('attr_') && currentSort.field === colDef.key.replace('attr_', ''));
 
@@ -247,6 +268,8 @@ function renderHeaderCell(
     if (colDef.key === 'identifier') {
       const field = col.attributes.includes('name') ? 'name' : col.attributes.includes('title') ? 'title' : 'createdAt';
       onSort(col.uid, field);
+    } else if (colDef.key === 'search_attr') {
+      onSort(col.uid, searchAttribute);
     } else if (colDef.key === 'target_attr') {
       onSort(col.uid, selectedAttribute);
     } else if (colDef.key.startsWith('attr_')) {
@@ -305,6 +328,7 @@ function renderCellContent(
   entry: Entry,
   col: CollectionModel,
   selectedAttribute: string,
+  searchAttribute: string,
   isMatch: boolean,
   hasAttr: boolean,
   isSelected: boolean,
@@ -330,6 +354,28 @@ function renderCellContent(
             </Typography>
           )}
         </Box>
+      );
+    }
+
+    case 'search_attr': {
+      const val = getNestedValue(entry, searchAttribute);
+      const displayStr = formatDisplayValue(val);
+      const isUnset = displayStr === '(empty / not set)' || displayStr === '(empty / unlinked)';
+      return (
+        <Typography
+          textColor={isUnset ? 'neutral500' : 'primary700'}
+          fontWeight="semiBold"
+          style={{
+            fontStyle: isUnset ? 'italic' : 'normal',
+            display: 'inline-block',
+            maxWidth: 260,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {displayStr}
+        </Typography>
       );
     }
 
@@ -492,6 +538,34 @@ const BulkUpdater: React.FC = () => {
   const [useRegex, setUseRegex] = useState<boolean>(false);
   const [regexPattern, setRegexPattern] = useState<string>('');
 
+  // Component Nesting Depth Config (User Configurable, 1 to 5)
+  const DEPTH_STORAGE_KEY = 'strapi_bulk_updater_component_depth';
+  const [componentDepth, setComponentDepth] = useState<number>(() => {
+    try {
+      const stored = localStorage.getItem(DEPTH_STORAGE_KEY);
+      if (stored) {
+        const val = Number(stored);
+        if (val >= 1 && val <= 5) return val;
+      }
+    } catch {}
+    return 3;
+  });
+
+  const handleComponentDepthChange = (depth: number) => {
+    const capped = Math.min(5, Math.max(1, depth));
+    setComponentDepth(capped);
+    try {
+      localStorage.setItem(DEPTH_STORAGE_KEY, String(capped));
+    } catch {}
+  };
+
+  // Search Attribute (separate from update attribute)
+  const [searchAttribute, setSearchAttribute] = useState<string>('');
+  const [searchAttributeInput, setSearchAttributeInput] = useState<string>('');
+  const [attributesMeta, setAttributesMeta] = useState<Record<string, { depth: number; type: string; component?: string; isRelation?: boolean }>>({});
+
+  const effectiveSearchAttribute = searchAttribute || selectedAttribute;
+
   // Target Value Filter state ("Find items with a certain value first")
   type FilterOperator = 'none' | 'empty' | 'not_empty' | 'equals' | 'contains' | 'starts_with';
   const [filterOperator, setFilterOperator] = useState<FilterOperator>('none');
@@ -499,6 +573,7 @@ const BulkUpdater: React.FC = () => {
   const [entrySearch, setEntrySearch] = useState<string>('');
 
   const isFilterActive =
+    Boolean(searchAttribute && searchAttribute !== selectedAttribute) ||
     (filterOperator !== 'none' &&
       (['empty', 'not_empty'].includes(filterOperator) || Boolean(filterQuery.trim()))) ||
     Boolean(entrySearch.trim());
@@ -605,6 +680,9 @@ const BulkUpdater: React.FC = () => {
     if (data.relationsMeta) {
       setRelationsMeta(data.relationsMeta);
     }
+    if (data.attributesMeta) {
+      setAttributesMeta(data.attributesMeta);
+    }
 
     let storedAttr: string | null = null;
     try {
@@ -674,7 +752,8 @@ const BulkUpdater: React.FC = () => {
     overrideFilterOp?: FilterOperator,
     overrideFilterQuery?: string,
     overrideEntrySearch?: string,
-    autoSelectReturned = true
+    autoSelectReturned = true,
+    overrideSearchAttr?: string
   ) => {
     const currentPageState = collectionPages[colUid];
     const size = customPageSize || currentPageState?.pageSize || defaultPageSize;
@@ -685,6 +764,7 @@ const BulkUpdater: React.FC = () => {
     const op = overrideFilterOp !== undefined ? overrideFilterOp : filterOperator;
     const q = overrideFilterQuery !== undefined ? overrideFilterQuery : filterQuery;
     const s = overrideEntrySearch !== undefined ? overrideEntrySearch : entrySearch;
+    const searchAttr = overrideSearchAttr !== undefined ? overrideSearchAttr : searchAttribute;
 
     setCollectionPages((prev) => ({
       ...prev,
@@ -700,6 +780,9 @@ const BulkUpdater: React.FC = () => {
         pageSize: String(size),
       });
       if (selectedAttribute) params.set('attribute', selectedAttribute);
+      if (searchAttr && searchAttr !== selectedAttribute) {
+        params.set('searchAttribute', searchAttr);
+      }
       if (op && op !== 'none') {
         params.set('filterOperator', op);
         if (q) params.set('filterQuery', q);
@@ -734,6 +817,7 @@ const BulkUpdater: React.FC = () => {
 
         // If a filter or search is active, pre-select all returned matching entries!
         const isFilterActiveNow =
+          Boolean(searchAttr && searchAttr !== selectedAttribute) ||
           (op !== 'none' && (['empty', 'not_empty'].includes(op) || Boolean(q.trim()))) ||
           Boolean(s.trim());
         if (isFilterActiveNow && autoSelectReturned) {
@@ -842,6 +926,7 @@ const BulkUpdater: React.FC = () => {
     const timer = setTimeout(() => {
       if (collections.length > 0) {
         const isFilterActiveNow =
+          Boolean(searchAttribute && searchAttribute !== selectedAttribute) ||
           (filterOperator !== 'none' &&
             (['empty', 'not_empty'].includes(filterOperator) || Boolean(filterQuery.trim()))) ||
           Boolean(entrySearch.trim());
@@ -850,10 +935,11 @@ const BulkUpdater: React.FC = () => {
           setSelectedEntries({});
         }
 
-        // Targeted Collection Querying: Only query visible collections possessing the attribute
+        const targetSearchAttr = searchAttribute || selectedAttribute;
+        // Targeted Collection Querying: Only query visible collections possessing the target search attribute
         const targetCols = collections.filter((col) => {
           if (visibleTypeUids[col.uid] === false) return false;
-          if (filterOperator !== 'none' && !col.attributes.includes(selectedAttribute)) return false;
+          if (filterOperator !== 'none' && targetSearchAttr && !col.attributes.includes(targetSearchAttr)) return false;
           return true;
         });
 
@@ -867,14 +953,15 @@ const BulkUpdater: React.FC = () => {
             filterOperator,
             filterQuery,
             entrySearch,
-            true
+            true,
+            searchAttribute
           );
         });
       }
     }, 350);
 
     return () => clearTimeout(timer);
-  }, [filterOperator, filterQuery, entrySearch]);
+  }, [searchAttribute, filterOperator, filterQuery, entrySearch]);
 
   const KEY_SEP = '@@@';
 
@@ -964,16 +1051,25 @@ const BulkUpdater: React.FC = () => {
   };
 
   const [attributeSearch, setAttributeSearch] = useState('');
+  const [searchAttributeSearch, setSearchAttributeSearch] = useState('');
 
-  // Filtered attributes based on user search query (handles camelCase, dot-notation, relations)
+  const getAttrDepth = (attr: string): number =>
+    attributesMeta[attr]?.depth ?? (attr.includes('.') ? attr.split('.').length - 1 : 0);
+
+  // Depth-filtered attributes based on user-configured componentDepth (1 to 5)
+  const depthFilteredAttributes = useMemo(() => {
+    return attributes.filter((attr) => getAttrDepth(attr) <= componentDepth);
+  }, [attributes, componentDepth, attributesMeta]);
+
+  // Filtered attributes for Update Attribute combobox (handles camelCase, dot-notation, relations)
   const filteredAttributes = useMemo(() => {
     if (!attributeSearch.trim()) {
-      return attributes;
+      return depthFilteredAttributes;
     }
     const q = attributeSearch.toLowerCase().trim();
     const cleanQ = q.replace(/[^a-z0-9]/g, '');
 
-    return attributes.filter((attr) => {
+    return depthFilteredAttributes.filter((attr) => {
       const lower = attr.toLowerCase();
       const cleanLower = lower.replace(/[^a-z0-9]/g, '');
       const rel = relationsMeta[attr];
@@ -985,15 +1081,37 @@ const BulkUpdater: React.FC = () => {
         relTarget.includes(q)
       );
     });
-  }, [attributes, attributeSearch, relationsMeta]);
+  }, [depthFilteredAttributes, attributeSearch, relationsMeta]);
 
-  // Memoized Combobox options to guarantee 60fps typing even with 1000+ attributes
+  // Filtered attributes for Search Attribute combobox
+  const filteredSearchAttributes = useMemo(() => {
+    if (!searchAttributeSearch.trim()) {
+      return depthFilteredAttributes;
+    }
+    const q = searchAttributeSearch.toLowerCase().trim();
+    const cleanQ = q.replace(/[^a-z0-9]/g, '');
+
+    return depthFilteredAttributes.filter((attr) => {
+      const lower = attr.toLowerCase();
+      const cleanLower = lower.replace(/[^a-z0-9]/g, '');
+      const rel = relationsMeta[attr];
+      const relTarget = (rel?.targetDisplayName || '').toLowerCase();
+
+      return (
+        lower.includes(q) ||
+        cleanLower.includes(cleanQ) ||
+        relTarget.includes(q)
+      );
+    });
+  }, [depthFilteredAttributes, searchAttributeSearch, relationsMeta]);
+
+  // Memoized Combobox options for Update Attribute
   const memoizedComboboxOptions = useMemo(() => {
     if (filteredAttributes.length === 0) {
       return (
         <ComboboxOption value="__none__" disabled textValue="No matching attributes found">
           <Typography variant="pi" textColor="neutral600">
-            No matching attributes found for "{attributeSearch}"
+            No matching attributes found for "{attributeSearch}" (Depth L{componentDepth})
           </Typography>
         </ComboboxOption>
       );
@@ -1001,6 +1119,7 @@ const BulkUpdater: React.FC = () => {
 
     return filteredAttributes.map((attr) => {
       const rel = relationsMeta[attr];
+      const depth = getAttrDepth(attr);
       return (
         <ComboboxOption key={attr} value={attr} textValue={attr}>
           <Flex justifyContent="space-between" alignItems="center" width="100%" gap={2}>
@@ -1011,16 +1130,80 @@ const BulkUpdater: React.FC = () => {
               <Badge backgroundColor="secondary100" textColor="secondary700" size="S">
                 relation ➔ {rel.targetDisplayName}
               </Badge>
-            ) : attr.includes('.') ? (
-              <Badge backgroundColor="neutral150" textColor="neutral700" size="S">
-                component
+            ) : depth > 0 ? (
+              <Badge backgroundColor={depth === 1 ? 'neutral150' : depth === 2 ? 'primary100' : 'secondary100'} textColor={depth === 1 ? 'neutral700' : depth === 2 ? 'primary700' : 'secondary700'} size="S">
+                L{depth} component
               </Badge>
             ) : null}
           </Flex>
         </ComboboxOption>
       );
     });
-  }, [filteredAttributes, relationsMeta, selectedAttribute, attributeSearch]);
+  }, [filteredAttributes, relationsMeta, selectedAttribute, attributeSearch, componentDepth, attributesMeta]);
+
+  // Memoized Combobox options for Search Attribute (in Section 2)
+  const memoizedSearchComboboxOptions = useMemo(() => {
+    return (
+      <>
+        <ComboboxOption
+          value="__default__"
+          textValue={`Same as Update Attribute (${selectedAttribute || 'None'})`}
+        >
+          <Flex justifyContent="space-between" alignItems="center" width="100%" gap={2}>
+            <Typography variant="omega" fontStyle="italic" textColor="neutral600">
+              -- Same as Update Attribute ({selectedAttribute || 'None'}) --
+            </Typography>
+            <Badge backgroundColor="neutral150" textColor="neutral600" size="S">
+              Default
+            </Badge>
+          </Flex>
+        </ComboboxOption>
+        {filteredSearchAttributes.map((attr) => {
+          const rel = relationsMeta[attr];
+          const depth = getAttrDepth(attr);
+          return (
+            <ComboboxOption key={`search_${attr}`} value={attr} textValue={attr}>
+              <Flex justifyContent="space-between" alignItems="center" width="100%" gap={2}>
+                <Typography variant="omega" fontWeight={attr === searchAttribute ? 'bold' : 'regular'}>
+                  {attr}
+                </Typography>
+                {rel ? (
+                  <Badge backgroundColor="secondary100" textColor="secondary700" size="S">
+                    relation ➔ {rel.targetDisplayName}
+                  </Badge>
+                ) : depth > 0 ? (
+                  <Badge backgroundColor={depth === 1 ? 'neutral150' : depth === 2 ? 'primary100' : 'secondary100'} textColor={depth === 1 ? 'neutral700' : depth === 2 ? 'primary700' : 'secondary700'} size="S">
+                    L{depth} component
+                  </Badge>
+                ) : null}
+              </Flex>
+            </ComboboxOption>
+          );
+        })}
+      </>
+    );
+  }, [filteredSearchAttributes, relationsMeta, searchAttribute, selectedAttribute, componentDepth, attributesMeta]);
+
+  const handleSearchAttributeChange = (newAttr: string) => {
+    const finalAttr = newAttr === '__default__' ? '' : newAttr;
+    setSearchAttribute(finalAttr);
+    if (collections.length > 0) {
+      collections.forEach((col) => {
+        loadCollectionPage(
+          col.uid,
+          1,
+          undefined,
+          undefined,
+          undefined,
+          filterOperator,
+          filterQuery,
+          entrySearch,
+          true,
+          finalAttr
+        );
+      });
+    }
+  };
 
   const handleGlobalPageSizeChange = (newSize: number) => {
     const capped = Math.min(500, Math.max(1, newSize));
@@ -1131,12 +1314,14 @@ const BulkUpdater: React.FC = () => {
   };
 
   const clearFilter = () => {
+    setSearchAttribute('');
+    setSearchAttributeSearch('');
     setFilterOperator('none');
     setFilterQuery('');
     setEntrySearch('');
     setSelectedEntries({});
     collections.forEach((col) => {
-      loadCollectionPage(col.uid, 1, undefined, undefined, undefined, 'none', '', '', false);
+      loadCollectionPage(col.uid, 1, undefined, undefined, undefined, 'none', '', '', false, '');
     });
   };
 
@@ -2014,9 +2199,32 @@ const BulkUpdater: React.FC = () => {
             marginBottom={6}
             style={{ width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box' }}
           >
-            <Typography variant="delta" tag="h2" marginBottom={4} fontWeight="semiBold">
-              1. Configure Attribute Update
-            </Typography>
+            <Flex justifyContent="space-between" alignItems="center" marginBottom={4} wrap="wrap" gap={3}>
+              <Box>
+                <Typography variant="delta" tag="h2" fontWeight="semiBold">
+                  1. Configure Attribute Update
+                </Typography>
+                <Typography variant="pi" textColor="neutral600">
+                  Select the target attribute to update across collections.
+                </Typography>
+              </Box>
+              <Flex gap={2} alignItems="center" wrap="wrap">
+                <Typography variant="pi" textColor="neutral700" fontWeight="bold">
+                  Component Nesting Depth:
+                </Typography>
+                {[1, 2, 3, 4, 5].map((lvl) => (
+                  <Button
+                    key={`depth_cfg_${lvl}`}
+                    variant={componentDepth === lvl ? 'default' : 'tertiary'}
+                    size="S"
+                    onClick={() => handleComponentDepthChange(lvl)}
+                    title={`Discover nested component attributes up to Level ${lvl}`}
+                  >
+                    Level {lvl}
+                  </Button>
+                ))}
+              </Flex>
+            </Flex>
 
             <Flex gap={4} alignItems="flex-end" wrap="wrap">
               {/* Attribute Dropdown (Searchable Combobox) */}
@@ -2360,7 +2568,7 @@ const BulkUpdater: React.FC = () => {
             >
               <Flex direction="column" gap={3}>
                 <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={2}>
-                  <Flex gap={2} alignItems="center">
+                  <Flex gap={2} alignItems="center" wrap="wrap">
                     <Typography variant="omega" fontWeight="bold">
                       Search &amp; Filter Targets:
                     </Typography>
@@ -2369,23 +2577,78 @@ const BulkUpdater: React.FC = () => {
                         {matchingEntriesCount} matching {matchingEntriesCount === 1 ? 'entry' : 'entries'} found in database
                       </Badge>
                     )}
+                    {searchAttribute && searchAttribute !== selectedAttribute && (
+                      <Badge backgroundColor="secondary100" textColor="secondary700">
+                        Searching by: {searchAttribute} &rarr; Target to update: {selectedAttribute}
+                      </Badge>
+                    )}
                   </Flex>
-                  {isFilterActive && (
-                    <Button variant="ghost" size="S" onClick={clearFilter}>
-                      Clear Search &amp; Filter
-                    </Button>
-                  )}
+                  <Flex gap={2} alignItems="center" wrap="wrap">
+                    <Flex gap={1} alignItems="center">
+                      <Typography variant="pi" textColor="neutral600">Depth:</Typography>
+                      {[1, 2, 3, 4, 5].map((lvl) => (
+                        <Button
+                          key={`s2_depth_${lvl}`}
+                          variant={componentDepth === lvl ? 'default' : 'tertiary'}
+                          size="S"
+                          onClick={() => handleComponentDepthChange(lvl)}
+                          title={`Show component attributes up to Level ${lvl}`}
+                          style={{ minWidth: 26, padding: '2px 6px' }}
+                        >
+                          L{lvl}
+                        </Button>
+                      ))}
+                    </Flex>
+                    {isFilterActive && (
+                      <Button variant="ghost" size="S" onClick={clearFilter}>
+                        Clear Search &amp; Filter
+                      </Button>
+                    )}
+                  </Flex>
                 </Flex>
 
                 <Flex gap={3} alignItems="flex-end" wrap="wrap">
+                  {/* Search Attribute Combobox */}
+                  <Box style={{ width: 280, minWidth: 230 }}>
+                    <Field.Root>
+                      <Field.Label>Search Attribute</Field.Label>
+                      <Combobox
+                        autocomplete="none"
+                        placeholder={searchAttribute || `Same as Update (${selectedAttribute || 'None'})`}
+                        value={searchAttribute || '__default__'}
+                        clearLabel="Reset search attribute"
+                        onClear={() => {
+                          handleSearchAttributeChange('');
+                          setSearchAttributeSearch('');
+                        }}
+                        onInputChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+                          setSearchAttributeSearch(e.target.value);
+                        }}
+                        onOpenChange={(isOpen: boolean) => {
+                          if (!isOpen) {
+                            setSearchAttributeSearch('');
+                          }
+                        }}
+                        onChange={(val: any) => {
+                          if (val && typeof val === 'string' && val !== '__none__') {
+                            handleSearchAttributeChange(val);
+                            setSearchAttributeSearch('');
+                          }
+                        }}
+                      >
+                        {memoizedSearchComboboxOptions}
+                      </Combobox>
+                    </Field.Root>
+                  </Box>
+
                   {/* Operator Select */}
-                  <Box style={{ width: 220, minWidth: 180 }}>
+                  <Box style={{ width: 200, minWidth: 170 }}>
                     <SingleSelect
-                      label={selectedAttribute ? `Filter condition for "${selectedAttribute}"` : 'Filter condition'}
+                      label={effectiveSearchAttribute ? `Condition for "${effectiveSearchAttribute}"` : 'Filter condition'}
                       value={filterOperator}
                       onChange={(val) => setFilterOperator(String(val) as FilterOperator)}
                     >
-                      <SingleSelectOption value="none">Show All (No Attribute Filter)</SingleSelectOption>
+                      <SingleSelectOption value="none">Show All (No Value Filter)</SingleSelectOption>
                       <SingleSelectOption value="empty">Is Empty or Null</SingleSelectOption>
                       <SingleSelectOption value="not_empty">Is Not Empty</SingleSelectOption>
                       <SingleSelectOption value="equals">Equals Exact Text</SingleSelectOption>
@@ -2396,9 +2659,9 @@ const BulkUpdater: React.FC = () => {
 
                   {/* Value query input if needed */}
                   {(filterOperator === 'equals' || filterOperator === 'contains' || filterOperator === 'starts_with') && (
-                    <Box style={{ flex: 1, minWidth: 200 }}>
+                    <Box style={{ flex: 1, minWidth: 180 }}>
                       <TextInput
-                        label={selectedAttribute ? `Value for "${selectedAttribute}"` : 'Value to match'}
+                        label={effectiveSearchAttribute ? `Value for "${effectiveSearchAttribute}"` : 'Value to match'}
                         placeholder="Type value to match..."
                         value={filterQuery}
                         onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFilterQuery(e.target.value)}
@@ -2407,7 +2670,7 @@ const BulkUpdater: React.FC = () => {
                   )}
 
                   {/* Full-text search across entries */}
-                  <Box style={{ flex: 1, minWidth: 200 }}>
+                  <Box style={{ flex: 1, minWidth: 180 }}>
                     <TextInput
                       label="Full-text Entry Search"
                       placeholder="Search title, name, or text across records..."
@@ -2631,11 +2894,11 @@ const BulkUpdater: React.FC = () => {
                 const pageSize = pageState ? pageState.pageSize : defaultPageSize;
                 const hasAttr = selectedAttribute ? col.attributes.includes(selectedAttribute) : false;
                 const visibleEntries = getVisibleEntries(col);
-                const matchingColCount = selectedAttribute ? entries.filter((e) => entryMatchesFilter(e, selectedAttribute)).length : 0;
+                const matchingColCount = selectedAttribute ? entries.filter((e) => entryMatchesFilter(e, effectiveSearchAttribute)).length : 0;
                 const isFullySelected = isCollectionFullySelected(col);
                 const isPartiallySelected = isCollectionPartiallySelected(col);
                 const currentSort = collectionSorts[col.uid] || { field: 'createdAt', order: 'desc' };
-                const availableColumns = getAvailableColumnsForCollection(col, selectedAttribute);
+                const availableColumns = getAvailableColumnsForCollection(col, selectedAttribute, searchAttribute);
                 const savedColKeys = collectionColumnVisibility[col.uid];
                 const activeColumns = savedColKeys
                   ? availableColumns.filter((c) => c.isPermanent || savedColKeys.includes(c.key))
@@ -2865,7 +3128,7 @@ const BulkUpdater: React.FC = () => {
                         <Thead>
                           <Tr>
                             {activeColumns.map((colDef) =>
-                              renderHeaderCell(colDef, col, currentSort, selectedAttribute, handleHeaderSortClick)
+                              renderHeaderCell(colDef, col, currentSort, selectedAttribute, searchAttribute, handleHeaderSortClick)
                             )}
                           </Tr>
                         </Thead>
@@ -2909,6 +3172,7 @@ const BulkUpdater: React.FC = () => {
                                         entry,
                                         col,
                                         selectedAttribute,
+                                        searchAttribute,
                                         isMatch,
                                         hasAttr,
                                         isSelected,

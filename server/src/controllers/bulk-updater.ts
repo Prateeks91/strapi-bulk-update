@@ -21,12 +21,13 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
   async getCollectionEntries(ctx: any) {
     try {
       const { uid } = ctx.params;
-      const { page, pageSize, attribute, filterOperator, filterQuery, search, sortField, sortOrder } = ctx.query;
+      const { page, pageSize, attribute, searchAttribute, filterOperator, filterQuery, search, sortField, sortOrder } = ctx.query;
       const service = strapi.plugin('bulk-updater').service('bulkUpdater');
       const data = await service.getCollectionEntries(uid, {
         page: page ? Number(page) : 1,
         pageSize: pageSize ? Number(pageSize) : 10,
         attribute: attribute ? String(attribute) : undefined,
+        searchAttribute: searchAttribute ? String(searchAttribute) : undefined,
         filterOperator: filterOperator ? String(filterOperator) : undefined,
         filterQuery: filterQuery !== undefined ? String(filterQuery) : undefined,
         search: search ? String(search) : undefined,
