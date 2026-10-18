@@ -1,7 +1,7 @@
 {
   "name": "strapi-plugin-bulk-updater",
-  "version": "1.3.3",
-  "description": "Enterprise bulk updater for Strapi v5: single collection focus with synchronized searchable dropdowns, searchable column picker popover, separate search & update attributes, configurable nesting depth (L1-L5), bulk publish, Excel-safe CSV export/import, maker-checker governance, off-peak scheduling, and 3-tier audit rollback.",
+  "version": "1.3.4",
+  "description": "Enterprise bulk updater for Strapi v5: unified single top-level collection dropdown, searchable column picker popover, separate search & update attributes, configurable nesting depth (L1-L5), bulk publish, Excel-safe CSV export/import, maker-checker governance, off-peak scheduling, and 3-tier audit rollback.",
   "strapi": {
     "displayName": "Bulk Attribute & Relation Updater",
     "name": "bulk-updater",

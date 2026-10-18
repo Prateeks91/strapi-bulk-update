@@ -2214,24 +2214,70 @@ const BulkUpdater: React.FC = () => {
         </Box>
       ) : activeTab === 'editor' ? (
         <>
-          {/* Main Control Panel: Attribute Dropdown + Value Input + Action Button */}
+          {/* Top Collection Type Selector & Component Depth Bar */}
           <Box
-            padding={6}
+            padding={4}
             background="neutral0"
             shadow="filterShadow"
             hasRadius
-            marginBottom={6}
+            marginBottom={5}
             style={{ width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box' }}
           >
-            <Flex justifyContent="space-between" alignItems="center" marginBottom={4} wrap="wrap" gap={3}>
-              <Box>
-                <Typography variant="delta" tag="h2" fontWeight="semiBold">
-                  1. Configure Attribute Update
-                </Typography>
-                <Typography variant="pi" textColor="neutral600">
-                  Select the target attribute to update across collections.
-                </Typography>
-              </Box>
+            <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={3}>
+              <Flex gap={3} alignItems="center" wrap="wrap" style={{ flex: 1, minWidth: 280 }}>
+                <Box style={{ width: 340, minWidth: 260 }}>
+                  <Field.Root>
+                    <Field.Label>Target Collection Type</Field.Label>
+                    <Combobox
+                      key={`top-col-${selectedCollectionUid}`}
+                      autocomplete="none"
+                      placeholder="Select Collection Type..."
+                      value={selectedCollectionUid || undefined}
+                      onChange={(val: any) => {
+                        if (val && typeof val === 'string') {
+                          handleCollectionChange(val);
+                        }
+                      }}
+                    >
+                      {collections.map((col) => (
+                        <ComboboxOption key={col.uid} value={col.uid} textValue={`${col.displayName} (${col.uid})`}>
+                          <Flex justifyContent="space-between" alignItems="center" style={{ width: '100%' }}>
+                            <Typography variant="pi" fontWeight="bold">
+                              {col.displayName}
+                            </Typography>
+                            <Flex gap={1} alignItems="center">
+                              {col.isSingleType ? (
+                                <Badge backgroundColor="secondary100" textColor="secondary700" size="S">
+                                  Single
+                                </Badge>
+                              ) : (
+                                <Badge backgroundColor="neutral150" textColor="neutral700" size="S">
+                                  {col.totalEntries !== undefined ? `${col.totalEntries} entries` : ''}
+                                </Badge>
+                              )}
+                            </Flex>
+                          </Flex>
+                        </ComboboxOption>
+                      ))}
+                    </Combobox>
+                  </Field.Root>
+                </Box>
+
+                {selectedCol && (
+                  <Flex gap={2} alignItems="center" wrap="wrap" style={{ paddingTop: 20 }}>
+                    <Badge backgroundColor="primary100" textColor="primary700">
+                      {selectedCol.isSingleType ? 'SINGLE TYPE' : 'COLLECTION'}
+                    </Badge>
+                    <Badge backgroundColor="neutral150" textColor="neutral700">
+                      {selectedCol.isSingleType
+                        ? '1 single entry'
+                        : `${collectionPages[selectedCol.uid]?.total ?? selectedCol.totalEntries ?? selectedCol.entries?.length ?? 0} records`}
+                    </Badge>
+                  </Flex>
+                )}
+              </Flex>
+
+              {/* Component Nesting Depth Config */}
               <Flex gap={2} alignItems="center" wrap="wrap">
                 <Typography variant="pi" textColor="neutral700" fontWeight="bold">
                   Component Nesting Depth:
@@ -2249,47 +2295,29 @@ const BulkUpdater: React.FC = () => {
                 ))}
               </Flex>
             </Flex>
+          </Box>
+
+          {/* Main Control Panel: Attribute Dropdown + Value Input + Action Button */}
+          <Box
+            padding={6}
+            background="neutral0"
+            shadow="filterShadow"
+            hasRadius
+            marginBottom={6}
+            style={{ width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box' }}
+          >
+            <Flex justifyContent="space-between" alignItems="center" marginBottom={4} wrap="wrap" gap={3}>
+              <Box>
+                <Typography variant="delta" tag="h2" fontWeight="semiBold">
+                  1. Configure Attribute Update
+                </Typography>
+                <Typography variant="pi" textColor="neutral600">
+                  Select the target attribute to update and configure the replacement value.
+                </Typography>
+              </Box>
+            </Flex>
 
             <Flex gap={3} alignItems="flex-end" wrap="wrap">
-              {/* Collection Type Selector */}
-              <Box style={{ width: 280, minWidth: 230 }}>
-                <Field.Root>
-                  <Field.Label>Collection Type</Field.Label>
-                  <Combobox
-                    key={`update-col-${selectedCollectionUid}`}
-                    autocomplete="none"
-                    placeholder="Select Collection Type..."
-                    value={selectedCollectionUid || undefined}
-                    onChange={(val: any) => {
-                      if (val && typeof val === 'string') {
-                        handleCollectionChange(val);
-                      }
-                    }}
-                  >
-                    {collections.map((col) => (
-                      <ComboboxOption key={col.uid} value={col.uid} textValue={`${col.displayName} (${col.uid})`}>
-                        <Flex justifyContent="space-between" alignItems="center" style={{ width: '100%' }}>
-                          <Typography variant="pi" fontWeight="bold">
-                            {col.displayName}
-                          </Typography>
-                          <Flex gap={1} alignItems="center">
-                            {col.isSingleType ? (
-                              <Badge backgroundColor="secondary100" textColor="secondary700" size="S">
-                                Single
-                              </Badge>
-                            ) : (
-                              <Badge backgroundColor="neutral150" textColor="neutral700" size="S">
-                                {col.totalEntries !== undefined ? `${col.totalEntries}` : ''}
-                              </Badge>
-                            )}
-                          </Flex>
-                        </Flex>
-                      </ComboboxOption>
-                    ))}
-                  </Combobox>
-                </Field.Root>
-              </Box>
-
               {/* Attribute Dropdown (Searchable Combobox) */}
               <Box style={{ width: 280, minWidth: 230 }}>
                 <Field.Root>
@@ -2534,7 +2562,7 @@ const BulkUpdater: React.FC = () => {
                   2. Select Targets
                 </Typography>
                 <Typography variant="pi" textColor="neutral600">
-                  Pick entire collection types or individual entries to apply the update to.
+                  Search and select entries to apply the update to within {selectedCol ? selectedCol.displayName : 'the selected collection'}.
                 </Typography>
               </Box>
               <Flex gap={2}>
@@ -2572,64 +2600,14 @@ const BulkUpdater: React.FC = () => {
                       </Badge>
                     )}
                   </Flex>
-                  <Flex gap={2} alignItems="center" wrap="wrap">
-                    <Flex gap={1} alignItems="center">
-                      <Typography variant="pi" textColor="neutral600">Depth:</Typography>
-                      {[1, 2, 3, 4, 5].map((lvl) => (
-                        <Button
-                          key={`s2_depth_${lvl}`}
-                          variant={componentDepth === lvl ? 'default' : 'tertiary'}
-                          size="S"
-                          onClick={() => handleComponentDepthChange(lvl)}
-                          title={`Show component attributes up to Level ${lvl}`}
-                          style={{ minWidth: 26, padding: '2px 6px' }}
-                        >
-                          L{lvl}
-                        </Button>
-                      ))}
-                    </Flex>
-                    {isFilterActive && (
-                      <Button variant="ghost" size="S" onClick={clearFilter}>
-                        Clear Search &amp; Filter
-                      </Button>
-                    )}
-                  </Flex>
+                  {isFilterActive && (
+                    <Button variant="ghost" size="S" onClick={clearFilter}>
+                      Clear Search &amp; Filter
+                    </Button>
+                  )}
                 </Flex>
 
                 <Flex gap={3} alignItems="flex-end" wrap="wrap">
-                  {/* Collection Type Selector */}
-                  <Box style={{ width: 260, minWidth: 200 }}>
-                    <Field.Root>
-                      <Field.Label>Collection Type</Field.Label>
-                      <Combobox
-                        key={`search-col-${selectedCollectionUid}`}
-                        autocomplete="none"
-                        placeholder="Select Collection Type..."
-                        value={selectedCollectionUid || undefined}
-                        onChange={(val: any) => {
-                          if (val && typeof val === 'string') {
-                            handleCollectionChange(val);
-                          }
-                        }}
-                      >
-                        {collections.map((col) => (
-                          <ComboboxOption key={col.uid} value={col.uid} textValue={`${col.displayName} (${col.uid})`}>
-                            <Flex justifyContent="space-between" alignItems="center" style={{ width: '100%' }}>
-                              <Typography variant="pi" fontWeight="bold">
-                                {col.displayName}
-                              </Typography>
-                              {col.isSingleType ? (
-                                <Badge backgroundColor="secondary100" textColor="secondary700" size="S">
-                                  Single
-                                </Badge>
-                              ) : null}
-                            </Flex>
-                          </ComboboxOption>
-                        ))}
-                      </Combobox>
-                    </Field.Root>
-                  </Box>
-
                   {/* Search Attribute Combobox */}
                   <Box style={{ width: 280, minWidth: 230 }}>
                     <Field.Root>
