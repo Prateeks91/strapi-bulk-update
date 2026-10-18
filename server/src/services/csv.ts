@@ -33,88 +33,116 @@ function escapeCsvValue(val: any): string {
 }
 
 /**
- * Basic CSV parser supporting quotes, commas, CRLF, and newlines
+ * RFC-4180 compliant CSV parser that correctly handles:
+ * - Multiline strings & HTML content with embedded line breaks (\n, \r\n, \r) inside quotes
+ * - Commas embedded inside double-quoted cells without shifting subsequent columns
+ * - Escaped double quotes ("" -> ")
+ * - Leading/trailing whitespace outside quotes
+ * - UTF-8 Byte Order Mark (BOM)
+ * - Excel formula injection unescaping ('=, '+, '-, '@)
  */
-export function parseCsv(csvText: string): Array<Record<string, string>> {
+export function parseCsvRows(csvText: string): string[][] {
   if (!csvText) return [];
 
   // Strip UTF-8 BOM if present
-  let cleanText = csvText;
-  if (cleanText.charCodeAt(0) === 0xfeff) {
-    cleanText = cleanText.slice(1);
+  let text = csvText;
+  if (text.charCodeAt(0) === 0xfeff) {
+    text = text.slice(1);
   }
 
-  const lines: string[] = [];
-  let current = '';
+  const rows: string[][] = [];
+  let currentRow: string[] = [];
+  let currentCell = '';
   let inQuotes = false;
+  let cellIsQuoted = false;
 
-  for (let i = 0; i < cleanText.length; i++) {
-    const char = cleanText[i];
-    const nextChar = cleanText[i + 1];
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    const nextChar = text[i + 1];
 
-    if (char === '"') {
-      if (inQuotes && nextChar === '"') {
-        current += '"';
-        i++; // skip escaped quote
-      } else {
-        inQuotes = !inQuotes;
-      }
-    } else if ((char === '\r' || char === '\n') && !inQuotes) {
-      if (char === '\r' && nextChar === '\n') {
-        i++;
-      }
-      if (current.trim().length > 0) {
-        lines.push(current);
-      }
-      current = '';
-    } else {
-      current += char;
-    }
-  }
-  if (current.trim().length > 0) {
-    lines.push(current);
-  }
-
-  if (lines.length < 1) return [];
-
-  function splitLine(line: string): string[] {
-    const fields: string[] = [];
-    let field = '';
-    let inQ = false;
-    for (let i = 0; i < line.length; i++) {
-      const c = line[i];
-      const nc = line[i + 1];
-      if (c === '"') {
-        if (inQ && nc === '"') {
-          field += '"';
-          i++;
+    if (inQuotes) {
+      if (char === '"') {
+        if (nextChar === '"') {
+          // Escaped quote: "" -> "
+          currentCell += '"';
+          i++; // skip second quote
         } else {
-          inQ = !inQ;
+          // Closing quote
+          inQuotes = false;
         }
-      } else if (c === ',' && !inQ) {
-        fields.push(field);
-        field = '';
       } else {
-        field += c;
+        // Any character inside quotes (including \r, \n, commas, HTML tags) is preserved verbatim
+        currentCell += char;
+      }
+    } else {
+      if (char === '"' && !cellIsQuoted && currentCell.trim() === '') {
+        // Opening quote (discards leading whitespace before opening quote)
+        inQuotes = true;
+        cellIsQuoted = true;
+        currentCell = '';
+      } else if (char === ',') {
+        currentRow.push(cellIsQuoted ? currentCell : currentCell.trim());
+        currentCell = '';
+        cellIsQuoted = false;
+      } else if (char === '\r') {
+        if (nextChar === '\n') {
+          i++; // Skip \n in \r\n sequence
+        }
+        currentRow.push(cellIsQuoted ? currentCell : currentCell.trim());
+        if (currentRow.length > 1 || (currentRow.length === 1 && currentRow[0] !== '')) {
+          rows.push(currentRow);
+        }
+        currentRow = [];
+        currentCell = '';
+        cellIsQuoted = false;
+      } else if (char === '\n') {
+        currentRow.push(cellIsQuoted ? currentCell : currentCell.trim());
+        if (currentRow.length > 1 || (currentRow.length === 1 && currentRow[0] !== '')) {
+          rows.push(currentRow);
+        }
+        currentRow = [];
+        currentCell = '';
+        cellIsQuoted = false;
+      } else {
+        // If cell was already quoted and closed, ignore trailing whitespace between closing quote and delimiter
+        if (!(cellIsQuoted && !inQuotes && (char === ' ' || char === '\t'))) {
+          currentCell += char;
+        }
       }
     }
-    fields.push(field);
-    return fields.map((f) => f.trim());
   }
 
-  const headers = splitLine(lines[0]);
-  const rows: Array<Record<string, string>> = [];
-
-  for (let i = 1; i < lines.length; i++) {
-    const values = splitLine(lines[i]);
-    const rowObj: Record<string, string> = {};
-    headers.forEach((h, index) => {
-      rowObj[h] = values[index] !== undefined ? values[index] : '';
-    });
-    rows.push(rowObj);
+  if (currentCell !== '' || cellIsQuoted || currentRow.length > 0) {
+    currentRow.push(cellIsQuoted ? currentCell : currentCell.trim());
+    if (currentRow.length > 1 || (currentRow.length === 1 && currentRow[0] !== '')) {
+      rows.push(currentRow);
+    }
   }
 
   return rows;
+}
+
+export function parseCsv(csvText: string): Array<Record<string, string>> {
+  const rows = parseCsvRows(csvText);
+  if (rows.length < 2) return [];
+
+  const headers = rows[0].map((h) => h.trim());
+  const records: Array<Record<string, string>> = [];
+
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    const record: Record<string, string> = {};
+    headers.forEach((h, idx) => {
+      let val = row[idx] !== undefined ? row[idx] : '';
+      if (typeof val === 'string' && /^'[=+@-]/.test(val)) {
+        val = val.substring(1);
+      }
+      record[h] = val;
+    });
+    records.push(record);
+  }
+
+  return records;
 }
 
 /**

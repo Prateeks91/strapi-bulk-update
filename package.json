@@ -1,11 +1,11 @@
 {
   "name": "strapi-plugin-bulk-updater",
-  "version": "1.3.5",
-  "description": "Enterprise bulk updater for Strapi v5: unified single top-level collection dropdown, searchable column picker popover, separate search & update attributes, configurable nesting depth (L1-L5), native Content History snapshots & CE restore support, bulk publish, Excel-safe CSV export/import, maker-checker governance, off-peak scheduling, and 3-tier audit rollback.",
+  "version": "1.3.6",
+  "description": "Enterprise bulk updater for Strapi v5: unified single top-level collection dropdown, searchable column picker popover, separate search & update attributes, configurable nesting depth (L1-L5), native Content History snapshots & CE restore support, RFC-4180 multiline HTML CSV parser, streamlined Smart Auto-Detect import, bulk publish, maker-checker governance, off-peak scheduling, and 3-tier audit rollback.",
   "strapi": {
     "displayName": "Bulk Attribute & Relation Updater",
     "name": "bulk-updater",
-    "description": "Enterprise bulk updater for Strapi v5: separate search and update attributes, configurable component nesting depth (L1-L5), native Content History snapshots & CE restore support, bulk publish, Excel-safe CSV export/import, maker-checker governance, off-peak scheduling, and 3-tier audit rollback.",
+    "description": "Enterprise bulk updater for Strapi v5: separate search and update attributes, configurable component nesting depth (L1-L5), native Content History snapshots & CE restore support, RFC-4180 multiline HTML CSV parser, streamlined Smart Auto-Detect import, bulk publish, maker-checker governance, off-peak scheduling, and 3-tier audit rollback.",
     "kind": "plugin"
   },
   "license": "MIT",

@@ -18,6 +18,7 @@ import {
   Checkbox,
 } from '@strapi/design-system';
 import { Download, Upload, ArrowClockwise, Check } from '@strapi/icons';
+import { parseCsv } from '../utils/csvParser';
 
 interface CollectionModel {
   uid: string;
@@ -163,7 +164,7 @@ export default function CsvManagerTab() {
     URL.revokeObjectURL(url);
   };
 
-  // Simple client-side preview parser
+  // Robust RFC-4180 client-side preview parser
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -177,20 +178,8 @@ export default function CsvManagerTab() {
       setCsvRawText(text);
 
       try {
-        const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
-        if (lines.length > 0) {
-          const headers = lines[0].split(',').map((h) => h.replace(/^"|"$/g, '').trim());
-          const previewRows: Array<Record<string, string>> = [];
-          for (let i = 1; i < Math.min(lines.length, 6); i++) {
-            const vals = lines[i].split(',').map((v) => v.replace(/^"|"$/g, '').trim());
-            const row: Record<string, string> = {};
-            headers.forEach((h, idx) => {
-              row[h] = vals[idx] || '';
-            });
-            previewRows.push(row);
-          }
-          setParsedPreview(previewRows);
-        }
+        const records = parseCsv(text);
+        setParsedPreview(records.slice(0, 10));
       } catch (err) {
         setParsedPreview([]);
       }
@@ -349,55 +338,23 @@ export default function CsvManagerTab() {
           </Typography>
 
           {/* Configuration Modes */}
-          <Flex gap={6} marginBottom={4} wrap="wrap">
+          <Flex justifyContent="space-between" alignItems="center" marginBottom={4} wrap="wrap" gap={4}>
             <Box>
-              <Typography variant="pi" fontWeight="bold" textColor="neutral800" marginBottom={2}>
+              <Typography variant="pi" fontWeight="bold" textColor="neutral800" marginBottom={1} display="block">
                 Operation Mode
               </Typography>
-              <Flex gap={4} wrap="wrap">
-                <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
-                  <input
-                    type="radio"
-                    name="importMode"
-                    value="auto"
-                    checked={importMode === 'auto'}
-                    onChange={() => setImportMode('auto')}
-                  />
-                  <Typography variant="omega" fontWeight={importMode === 'auto' ? 'bold' : 'normal'}>
-                    Smart Auto-Detect (Auto-updates matching documentId, creates new if missing)
-                  </Typography>
-                </label>
-
-                <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
-                  <input
-                    type="radio"
-                    name="importMode"
-                    value="update"
-                    checked={importMode === 'update'}
-                    onChange={() => setImportMode('update')}
-                  />
-                  <Typography variant="omega" fontWeight={importMode === 'update' ? 'bold' : 'normal'}>
-                    Update Existing Only (Requires documentId)
-                  </Typography>
-                </label>
-
-                <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
-                  <input
-                    type="radio"
-                    name="importMode"
-                    value="create_or_override"
-                    checked={importMode === 'create_or_override'}
-                    onChange={() => setImportMode('create_or_override')}
-                  />
-                  <Typography variant="omega" fontWeight={importMode === 'create_or_override' ? 'bold' : 'normal'}>
-                    Add / Override (Inserts new or replaces existing)
-                  </Typography>
-                </label>
+              <Flex gap={2} alignItems="center" wrap="wrap">
+                <Badge backgroundColor="primary100" textColor="primary700">
+                  ⚡ Smart Auto-Detect
+                </Badge>
+                <Typography variant="pi" textColor="neutral600">
+                  Automatically updates matching records by <code>documentId</code> and creates new entries when ID is omitted.
+                </Typography>
               </Flex>
             </Box>
 
-            <Box style={{ marginLeft: 'auto' }}>
-              <Typography variant="pi" fontWeight="bold" textColor="neutral800" marginBottom={2}>
+            <Box>
+              <Typography variant="pi" fontWeight="bold" textColor="neutral800" marginBottom={1} display="block">
                 Publish Options
               </Typography>
               <Checkbox
@@ -467,66 +424,79 @@ export default function CsvManagerTab() {
                 {missingDocIdCount > 0 && (
                   <Box marginBottom={3}>
                     <Alert
-                      variant={importMode === 'update' ? 'warning' : 'default'}
-                      title={importMode === 'update' ? 'Warning: Missing Document IDs' : 'Smart Auto-Detect Active'}
+                      variant="default"
+                      title="Smart Auto-Detect Active"
                     >
                       <Typography variant="omega">
                         {missingDocIdCount} row{missingDocIdCount > 1 ? 's have' : ' has'} no <code>documentId</code>.{' '}
-                        {importMode === 'auto'
-                          ? 'Because no documentId is provided, the engine will automatically treat them as new entries and generate new database IDs for them.'
-                          : importMode === 'update'
-                          ? 'In "Update Existing Only" mode, rows without a documentId will be skipped. Switch to "Smart Auto-Detect" to automatically create them as new entries.'
-                          : 'These will be created as new entries.'}
+                        Because no documentId is provided, the engine will automatically treat them as new entries and generate new database IDs for them.
                       </Typography>
                     </Alert>
                   </Box>
                 )}
 
-                <Table colCount={headers.length + 1} rowCount={parsedPreview.length + 1}>
-                  <Thead>
-                    <Tr>
-                      <Th style={{ width: 140 }}>
-                        <Typography variant="sigma">Detected Action</Typography>
-                      </Th>
-                      {headers.map((h) => (
-                        <Th key={h}>
-                          <Typography variant="sigma">{h}</Typography>
+                <Box style={{ overflowX: 'auto', maxWidth: '100%', border: '1px solid #e0e0e0', borderRadius: 4 }}>
+                  <Table colCount={headers.length + 1} rowCount={parsedPreview.length + 1}>
+                    <Thead>
+                      <Tr>
+                        <Th style={{ width: 150, minWidth: 150 }}>
+                          <Typography variant="sigma">Detected Action</Typography>
                         </Th>
-                      ))}
-                    </Tr>
-                  </Thead>
-                  <Tbody>
-                    {parsedPreview.map((row, rIdx) => {
-                      const hasDocId = !!(row.documentId || row.id || '').trim();
-                      return (
-                        <Tr key={rIdx}>
-                          <Td>
-                            {hasDocId ? (
-                              <Badge backgroundColor="primary100" textColor="primary700">
-                                🔄 Match / Update
-                              </Badge>
-                            ) : (
-                              <Badge backgroundColor="warning100" textColor="warning700">
-                                ➕ New Entry
-                              </Badge>
-                            )}
-                          </Td>
-                          {headers.map((h) => (
-                            <Td key={h}>
-                              {(h === 'documentId' || h === 'id') && !row[h]?.trim() ? (
-                                <Typography variant="pi" textColor="warning700" fontWeight="bold">
-                                  (Auto-generate ID)
-                                </Typography>
+                        {headers.map((h) => (
+                          <Th key={h} style={{ minWidth: 160 }}>
+                            <Typography variant="sigma">{h}</Typography>
+                          </Th>
+                        ))}
+                      </Tr>
+                    </Thead>
+                    <Tbody>
+                      {parsedPreview.map((row, rIdx) => {
+                        const hasDocId = !!(row.documentId || row.id || '').trim();
+                        return (
+                          <Tr key={rIdx}>
+                            <Td>
+                              {hasDocId ? (
+                                <Badge backgroundColor="primary100" textColor="primary700">
+                                  🔄 Match / Update
+                                </Badge>
                               ) : (
-                                <Typography variant="omega">{row[h] || '-'}</Typography>
+                                <Badge backgroundColor="warning100" textColor="warning700">
+                                  ➕ New Entry
+                                </Badge>
                               )}
                             </Td>
-                          ))}
-                        </Tr>
-                      );
-                    })}
-                  </Tbody>
-                </Table>
+                            {headers.map((h) => (
+                              <Td key={h} style={{ verticalAlign: 'top', maxWidth: 300 }}>
+                                {(h === 'documentId' || h === 'id') && !row[h]?.trim() ? (
+                                  <Typography variant="pi" textColor="warning700" fontWeight="bold">
+                                    (Auto-generate ID)
+                                  </Typography>
+                                ) : (
+                                  <Typography
+                                    variant="omega"
+                                    style={{
+                                      display: '-webkit-box',
+                                      WebkitLineClamp: 3,
+                                      WebkitBoxOrient: 'vertical',
+                                      overflow: 'hidden',
+                                      textOverflow: 'ellipsis',
+                                      whiteSpace: 'pre-wrap',
+                                      wordBreak: 'break-word',
+                                      maxHeight: 65,
+                                    }}
+                                    title={row[h] || ''}
+                                  >
+                                    {row[h] || '-'}
+                                  </Typography>
+                                )}
+                              </Td>
+                            ))}
+                          </Tr>
+                        );
+                      })}
+                    </Tbody>
+                  </Table>
+                </Box>
 
                 <Flex justifyContent="flex-end" marginTop={4}>
                   <Button
@@ -536,11 +506,7 @@ export default function CsvManagerTab() {
                     onClick={handleExecuteImport}
                     loading={importing}
                   >
-                    {importMode === 'auto'
-                      ? 'Execute Smart Import (Auto-Detect)'
-                      : importMode === 'update'
-                      ? 'Execute Bulk Update'
-                      : 'Execute Add / Override'}
+                    Execute Smart Import (Auto-Detect)
                   </Button>
                 </Flex>
               </Box>
