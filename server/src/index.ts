@@ -8,6 +8,7 @@ import bulkUpdaterService from './services/bulk-updater';
 import auditService from './services/audit';
 import validationRulesService from './services/validation-rules';
 import csvService from './services/csv';
+import contentHistoryService, { recordContentHistoryVersion } from './services/content-history';
 
 import { errors } from '@strapi/utils';
 
@@ -23,8 +24,8 @@ export default {
   bootstrap({ strapi }: { strapi: any }) {
     // Register Document Service middleware to enforce cross-component quotas on the backend
     strapi.documents.use(async (context: any, next: any) => {
+      const params = context.params as any;
       if (['create', 'update'].includes(context.action)) {
-        const params = context.params as any;
         const data = params?.data;
 
         if (data && typeof data === 'object') {
@@ -154,8 +155,130 @@ export default {
         }
       }
 
-      return next();
+      const result = await next();
+      return result;
     });
+
+    // Register universal Content History fallback middleware so Content History
+    // operates reliably across all Strapi tiers (Community Edition and Enterprise)
+    strapi.server.use(async (ctx: any, next: any) => {
+      if (!ctx.path.startsWith('/content-manager/history-versions')) {
+        await next();
+        return;
+      }
+
+      await next();
+
+      if (ctx.status === 404 || ctx.status === 405) {
+        if (ctx.method === 'GET' && ctx.path === '/content-manager/history-versions') {
+          const { contentType, documentId, locale, page = 1, pageSize = 20 } = ctx.query;
+          if (!contentType) return;
+          const historyQuery = strapi.db?.query?.('plugin::content-manager.history-version');
+          if (!historyQuery) return;
+
+          const pageNum = Math.max(1, parseInt(page, 10) || 1);
+          const limit = Math.min(100, Math.max(1, parseInt(pageSize, 10) || 20));
+
+          const whereClause: any = {
+            contentType,
+            ...(documentId ? { relatedDocumentId: documentId } : {}),
+            ...(locale ? { locale } : {}),
+          };
+
+          const [results, total] = await Promise.all([
+            historyQuery.findMany({
+              where: whereClause,
+              populate: ['createdBy'],
+              orderBy: { createdAt: 'desc' },
+              limit,
+              offset: (pageNum - 1) * limit,
+            }),
+            historyQuery.count({ where: whereClause }),
+          ]);
+
+          const sanitizedResults = (results || []).map((ver: any) => ({
+            ...ver,
+            createdBy: ver.createdBy
+              ? {
+                  id: ver.createdBy.id,
+                  firstname: ver.createdBy.firstname,
+                  lastname: ver.createdBy.lastname,
+                  username: ver.createdBy.username,
+                  email: ver.createdBy.email,
+                }
+              : undefined,
+            meta: {
+              unknownAttributes: { added: {}, removed: {} },
+            },
+          }));
+
+          ctx.status = 200;
+          ctx.body = {
+            data: sanitizedResults,
+            meta: {
+              pagination: {
+                page: pageNum,
+                pageSize: limit,
+                pageCount: Math.ceil(total / limit) || 1,
+                total,
+              },
+            },
+          };
+        } else if (ctx.method === 'PUT' && ctx.path.endsWith('/restore')) {
+          const match = ctx.path.match(/\/content-manager\/history-versions\/([^/]+)\/restore/);
+          const versionId = match?.[1];
+          if (!versionId) return;
+
+          const historyQuery = strapi.db?.query?.('plugin::content-manager.history-version');
+          const version = await historyQuery?.findOne?.({ where: { id: versionId } });
+          if (!version) {
+            ctx.status = 404;
+            ctx.body = { error: 'Version not found' };
+            return;
+          }
+
+          const restored = await strapi.documents(version.contentType).update({
+            documentId: version.relatedDocumentId,
+            locale: version.locale || undefined,
+            data: version.data,
+          });
+
+          await recordContentHistoryVersion(strapi, {
+            uid: version.contentType,
+            documentId: version.relatedDocumentId,
+            statusOverride: version.status || 'published',
+          });
+
+          ctx.status = 200;
+          ctx.body = {
+            data: {
+              documentId: restored?.documentId || version.relatedDocumentId,
+            },
+          };
+        }
+      }
+    });
+
+    // Ensure database performance and concurrency resiliency for Content History
+    try {
+      const knex = strapi.db?.connection;
+      if (knex) {
+        // Optimize SQLite busy timeout to eliminate lock contention
+        if (knex.client?.config?.client === 'sqlite3' || knex.client?.dialect === 'sqlite3') {
+          knex.raw('PRAGMA busy_timeout = 10000;').catch(() => {});
+        }
+
+        // Ensure index exists on strapi_history_versions for high-speed queries
+        knex.schema.hasTable('strapi_history_versions').then((hasTable: boolean) => {
+          if (hasTable) {
+            knex.raw(`
+              CREATE INDEX IF NOT EXISTS idx_history_versions_lookup 
+              ON strapi_history_versions (content_type, related_document_id, created_at)
+            `).catch(() => {});
+          }
+        }).catch(() => {});
+      }
+    } catch {}
   },
   routes,
   contentTypes,
@@ -170,5 +293,6 @@ export default {
     audit: auditService,
     validationRules: validationRulesService,
     csv: csvService,
+    contentHistory: contentHistoryService,
   },
 };

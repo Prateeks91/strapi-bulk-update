@@ -1,6 +1,5 @@
 import type { Core } from '@strapi/strapi';
-
-import type { Core } from '@strapi/strapi';
+import { recordContentHistoryVersion } from './content-history';
 
 /**
  * Robust, Excel-Safe CSV string escaping helper (RFC-4180 compliant)
@@ -760,6 +759,15 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             }
           }
 
+          try {
+            await recordContentHistoryVersion(strapi, {
+              uid,
+              documentId: docId,
+              userId: user?.id,
+              statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
+            });
+          } catch {}
+
           stats.updated++;
           stats.diffs.push({
             uid,
@@ -799,6 +807,15 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
                 }
               }
 
+              try {
+                await recordContentHistoryVersion(strapi, {
+                  uid,
+                  documentId: docId,
+                  userId: user?.id,
+                  statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
+                });
+              } catch {}
+
               stats.updated++;
               stats.diffs.push({
                 uid,
@@ -827,6 +844,15 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
               strapi.log.warn(`[bulk-updater] Auto-publish failed for ${newDocId}:`, pubErr);
             }
           }
+
+          try {
+            await recordContentHistoryVersion(strapi, {
+              uid,
+              documentId: newDocId,
+              userId: user?.id,
+              statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
+            });
+          } catch {}
 
           stats.created++;
           if (!docId) {
@@ -873,6 +899,15 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
                 }
               }
 
+              try {
+                await recordContentHistoryVersion(strapi, {
+                  uid,
+                  documentId: docId,
+                  userId: user?.id,
+                  statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
+                });
+              } catch {}
+
               stats.updated++;
               stats.diffs.push({
                 uid,
@@ -902,6 +937,15 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
               strapi.log.warn(`[bulk-updater] Auto-publish failed for ${newDocId}:`, pubErr);
             }
           }
+
+          try {
+            await recordContentHistoryVersion(strapi, {
+              uid,
+              documentId: newDocId,
+              userId: user?.id,
+              statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
+            });
+          } catch {}
 
           stats.created++;
           if (!docId) {

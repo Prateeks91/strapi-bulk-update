@@ -1,5 +1,6 @@
 import type { Core } from '@strapi/strapi';
 import crypto from 'crypto';
+import { recordContentHistoryVersion } from './content-history';
 
 // In-process memory caches (scoped to pod)
 interface CacheEntry {
@@ -618,6 +619,13 @@ async function executeBatchInternal(
 
             invalidateCollectionCache(target.uid);
 
+            await recordContentHistoryVersion(strapi, {
+              uid: target.uid,
+              documentId: target.documentId,
+              userId: currentUser?.id,
+              statusOverride: (publishOnApproval && isDraftAndPublishComp) ? 'published' : undefined,
+            });
+
             return {
               uid: target.uid,
               collectionName: displayName,
@@ -717,6 +725,13 @@ async function executeBatchInternal(
               invalidateCollectionCache(attrDef.target);
             }
 
+            await recordContentHistoryVersion(strapi, {
+              uid: target.uid,
+              documentId: target.documentId,
+              userId: currentUser?.id,
+              statusOverride: (publishOnApproval && isDraftAndPublishRel) ? 'published' : undefined,
+            });
+
             return {
               uid: target.uid,
               collectionName: displayName,
@@ -755,6 +770,13 @@ async function executeBatchInternal(
               strapi.log.warn(`[bulk-updater] Failed to auto-publish ${target.uid}/${target.documentId}:`, publishErr);
             }
           }
+
+          await recordContentHistoryVersion(strapi, {
+            uid: target.uid,
+            documentId: target.documentId,
+            userId: currentUser?.id,
+            statusOverride: (publishOnApproval && isDraftAndPublishScalar) ? 'published' : undefined,
+          });
 
           return {
             uid: target.uid,
@@ -976,6 +998,13 @@ async function executePublishBatchInternal(
         });
 
         invalidateCollectionCache(target.uid);
+
+        await recordContentHistoryVersion(strapi, {
+          uid: target.uid,
+          documentId: target.documentId,
+          userId: currentUser?.id,
+          statusOverride: 'published',
+        });
 
         return {
           uid: target.uid,

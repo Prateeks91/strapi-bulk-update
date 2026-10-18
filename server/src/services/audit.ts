@@ -1,4 +1,5 @@
 import type { Core } from '@strapi/strapi';
+import { recordContentHistoryVersion } from './content-history';
 
 export interface AuditConfig {
   enabled: boolean;
@@ -388,7 +389,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
   /**
    * Helper to revert diff items back to original values
    */
-  async revertDiffItems(diffs: any[]) {
+  async revertDiffItems(diffs: any[], userId?: any) {
     let revertedCount = 0;
     const rollbackDetails = [];
 
@@ -450,6 +451,16 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             } catch {}
           }
 
+          // Record Content History Version for Strapi Content Manager
+          try {
+            await recordContentHistoryVersion(strapi, {
+              uid: item.uid,
+              documentId: item.documentId,
+              userId,
+              statusOverride: ct?.options?.draftAndPublish ? 'published' : undefined,
+            });
+          } catch {}
+
           try {
             const bulkService = strapi.plugin('bulk-updater').service('bulkUpdater');
             if (bulkService?.invalidateCache) {
@@ -506,7 +517,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       }
 
       const diffs = Array.isArray(record.diffs) ? record.diffs : [];
-      const { revertedCount, rollbackDetails } = await this.revertDiffItems(diffs);
+      const { revertedCount, rollbackDetails } = await this.revertDiffItems(diffs, currentUser?.id);
 
       record.isRolledBack = true;
       record.rolledBackAt = new Date().toISOString();
@@ -566,7 +577,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         ? JSON.parse(record[f.diffs])
         : record[f.diffs] || [];
 
-    const { revertedCount, rollbackDetails } = await this.revertDiffItems(diffs);
+    const { revertedCount, rollbackDetails } = await this.revertDiffItems(diffs, currentUser?.id);
 
     const updateData: any = {};
     if (f.isRolledBack) updateData[f.isRolledBack] = true;
