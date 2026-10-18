@@ -160,23 +160,50 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     const allContentTypes = strapi.contentTypes || {};
     const allComponents = strapi.components || {};
 
+    // Helper: matches a key against targetField (case-insensitive & supports dot notation)
+    function matchesRule(key: string, ruleTargetField: string): boolean {
+      if (!key || !ruleTargetField) return false;
+      const kLower = key.toLowerCase().trim();
+      const tLower = ruleTargetField.toLowerCase().trim();
+      return (
+        kLower === tLower ||
+        tLower.endsWith(`.${kLower}`) ||
+        tLower.split('.').pop() === kLower ||
+        kLower.endsWith(`.${tLower}`)
+      );
+    }
+
+    function componentHasField(compUid: string, targetField: string): boolean {
+      const comp = allComponents[compUid];
+      if (!comp?.attributes) return false;
+      for (const [attrName, attrDef] of Object.entries(comp.attributes) as any[]) {
+        if (matchesRule(attrName, targetField)) return true;
+        if (attrDef.type === 'component' && attrDef.component) {
+          if (componentHasField(attrDef.component, targetField)) return true;
+        }
+      }
+      return false;
+    }
+
     // Helper: Checks if a content-type schema or any of its components has the target field
     function schemaHasField(ctSchema: any): { hasField: boolean; populateAttrs: Record<string, any> } {
       if (!ctSchema || !ctSchema.attributes) return { hasField: false, populateAttrs: {} };
       const rawAttrs = ctSchema.attributes;
       const populateAttrs: Record<string, any> = {};
-      let hasField = Boolean(rawAttrs[targetField]);
+      let hasField = false;
 
       for (const [attrKey, attrDef] of Object.entries(rawAttrs) as any[]) {
+        if (matchesRule(attrKey, targetField)) {
+          hasField = true;
+        }
         if (attrDef.type === 'component' && attrDef.component) {
-          const comp = allComponents[attrDef.component];
-          if (comp?.attributes?.[targetField]) {
+          if (componentHasField(attrDef.component, targetField)) {
             hasField = true;
             populateAttrs[attrKey] = true;
           }
         } else if (attrDef.type === 'dynamiczone' && Array.isArray(attrDef.components)) {
           const matchingComp = attrDef.components.some(
-            (compUid: string) => allComponents[compUid]?.attributes?.[targetField]
+            (compUid: string) => componentHasField(compUid, targetField)
           );
           if (matchingComp) {
             hasField = true;
@@ -193,7 +220,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     );
 
     // Filter candidate collections to ONLY those that actually possess targetField in their schema
-    const relevantCollections: Array<{ uid: string; displayName: string; populateOption?: Record<string, any> }> = [];
+    const relevantCollections: Array<{ uid: string; displayName: string; populateOption?: Record<string, any> | string }> = [];
     for (const uid of candidateUids) {
       const ct = allContentTypes[uid];
       if (!ct) continue;
@@ -202,7 +229,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         relevantCollections.push({
           uid,
           displayName: ct.info?.displayName || uid,
-          populateOption: Object.keys(populateAttrs).length > 0 ? populateAttrs : undefined,
+          populateOption: Object.keys(populateAttrs).length > 0 ? populateAttrs : '*',
         });
       }
     }
@@ -230,8 +257,8 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
                 if (!obj || typeof obj !== 'object') return;
                 for (const key of Object.keys(obj)) {
                   const val = obj[key];
-                  if (key === targetField && typeof val === 'string' && val) {
-                    const lower = val.toLowerCase();
+                  if (matchesRule(key, targetField) && typeof val === 'string' && val.trim()) {
+                    const lower = val.toLowerCase().trim();
                     counts[lower] = (counts[lower] || 0) + 1;
                   }
                   if (typeof val === 'object' && val !== null) {
@@ -243,7 +270,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
               traverse(entry);
 
               for (const [optKey, max] of Object.entries(quotas)) {
-                const lowerOpt = optKey.toLowerCase();
+                const lowerOpt = optKey.toLowerCase().trim();
                 const actualCount = counts[lowerOpt] || 0;
                 if (actualCount > max) {
                   const entryLabel =

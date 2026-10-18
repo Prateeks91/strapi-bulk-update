@@ -55,6 +55,7 @@ function computeCrossComponentUsage(
   excludePath: string
 ): Record<string, number> {
   const counts: Record<string, number> = {};
+  const targetLower = targetFieldLeafName.toLowerCase().trim();
 
   function traverse(current: any, currentPath: string) {
     if (!current || typeof current !== 'object') return;
@@ -63,9 +64,15 @@ function computeCrossComponentUsage(
       const val = current[key];
       const fullPath = currentPath ? `${currentPath}.${key}` : key;
 
-      // Match target leaf name but exclude current field path
-      if (key === targetFieldLeafName && fullPath !== excludePath && typeof val === 'string' && val) {
-        counts[val] = (counts[val] || 0) + 1;
+      const keyLower = key.toLowerCase().trim();
+      const isTargetMatch =
+        keyLower === targetLower ||
+        targetLower.endsWith(`.${keyLower}`) ||
+        targetLower.split('.').pop() === keyLower;
+
+      if (isTargetMatch && fullPath !== excludePath && typeof val === 'string' && val.trim()) {
+        const valNorm = val.toLowerCase().trim();
+        counts[valNorm] = (counts[valNorm] || 0) + 1;
       }
 
       if (typeof val === 'object' && val !== null) {
@@ -94,7 +101,7 @@ export default function ScopedQuotaSelectInput({
   // Subscribe to live Formik/Form values in Strapi v5 Admin Edit View
   const formValues = useForm('ScopedQuotaSelectInput', (state) => state.values) || {};
 
-  // Extract the leaf property name (e.g., 'headingLevel' from 'blocks.0.headingLevel')
+  // Extract the leaf property name (e.g., 'titleStyle' from 'blocks.0.titleStyle')
   const fieldLeafName = name.split('.').pop() || name;
 
   // Active UI-configured rule state
@@ -105,9 +112,21 @@ export default function ScopedQuotaSelectInput({
     get('/bulk-updater/validation-rules')
       .then((res: any) => {
         if (isMounted && res.data && res.data.success && Array.isArray(res.data.rules)) {
-          const matching = res.data.rules.find(
-            (r: any) => r.enabled && r.targetField === fieldLeafName
-          );
+          const leafLower = fieldLeafName.toLowerCase().trim();
+          const nameLower = name.toLowerCase().trim();
+
+          const matching = res.data.rules.find((r: any) => {
+            if (!r.enabled || !r.targetField) return false;
+            const targetLower = r.targetField.toLowerCase().trim();
+            return (
+              targetLower === leafLower ||
+              targetLower === nameLower ||
+              targetLower.endsWith(`.${leafLower}`) ||
+              targetLower.split('.').pop() === leafLower ||
+              nameLower.endsWith(`.${targetLower}`)
+            );
+          });
+
           if (matching) {
             setActiveUiRule(matching);
           }
@@ -119,7 +138,7 @@ export default function ScopedQuotaSelectInput({
     return () => {
       isMounted = false;
     };
-  }, [fieldLeafName]);
+  }, [fieldLeafName, name]);
 
   const optionsConfig = attribute?.options || {};
 
@@ -127,14 +146,16 @@ export default function ScopedQuotaSelectInput({
   const items: QuotaItem[] = React.useMemo(() => {
     const rawItems: QuotaItem[] = optionsConfig.items && optionsConfig.items.length > 0
       ? optionsConfig.items
-      : (activeUiRule?.quotas ? [] : DEFAULT_HEADING_ITEMS);
+      : [];
 
     const map = new Map<string, QuotaItem>();
-    rawItems.forEach((it) => map.set(it.value.toLowerCase(), { ...it }));
+    rawItems.forEach((it) => {
+      map.set((it.value || '').toLowerCase().trim(), { ...it });
+    });
 
     if (activeUiRule?.quotas) {
       for (const [k, max] of Object.entries(activeUiRule.quotas)) {
-        const lowerK = k.toLowerCase();
+        const lowerK = k.toLowerCase().trim();
         if (map.has(lowerK)) {
           const existing = map.get(lowerK)!;
           map.set(lowerK, {
@@ -142,20 +163,18 @@ export default function ScopedQuotaSelectInput({
             maxAllowed: typeof max === 'number' ? max : existing.maxAllowed,
           });
         } else {
-          // Generate human-friendly label for custom option
-          const label = k.charAt(0).toUpperCase() + k.slice(1);
+          // If option not in schema items, add it preserving the user-defined casing
           map.set(lowerK, {
-            value: lowerK,
-            label,
+            value: k, // preserve original casing from rule, e.g. "H1"
+            label: k.toUpperCase(),
             maxAllowed: typeof max === 'number' ? max : null,
           });
         }
       }
     }
 
-    // If still empty (e.g. newly added custom field with no quotas yet), fallback to default headings
     if (map.size === 0) {
-      DEFAULT_HEADING_ITEMS.forEach((it) => map.set(it.value.toLowerCase(), { ...it }));
+      DEFAULT_HEADING_ITEMS.forEach((it) => map.set(it.value.toLowerCase().trim(), { ...it }));
     }
 
     return Array.from(map.values());
@@ -172,14 +191,15 @@ export default function ScopedQuotaSelectInput({
   const processedOptions = React.useMemo(() => {
     return items
       .map((item) => {
-        const usedCount = otherUsage[item.value] || 0;
+        const itemValLower = (item.value || '').toLowerCase().trim();
+        const usedCount = otherUsage[itemValLower] || 0;
         const max = item.maxAllowed;
 
         // Quota is exhausted if other components have already reached maxAllowed
         const isQuotaReached = typeof max === 'number' && max > 0 && usedCount >= max;
 
-        // If current field is already holding this value, allow keeping it
-        const isCurrentValue = value === item.value;
+        // Check if current field already holds this value (case-insensitively)
+        const isCurrentValue = (value || '').toLowerCase().trim() === itemValLower;
         const isDisabled = isQuotaReached && !isCurrentValue;
 
         let quotaNotice = '';
@@ -204,13 +224,16 @@ export default function ScopedQuotaSelectInput({
 
   // Identify options whose quota has been exhausted by other components
   const exhaustedItems = React.useMemo(() => {
-    return items.filter(
-      (i) =>
+    return items.filter((i) => {
+      const iValLower = (i.value || '').toLowerCase().trim();
+      const isCurrentValue = (value || '').toLowerCase().trim() === iValLower;
+      return (
         typeof i.maxAllowed === 'number' &&
         i.maxAllowed > 0 &&
-        (otherUsage[i.value] || 0) >= i.maxAllowed &&
-        value !== i.value
-    );
+        (otherUsage[iValLower] || 0) >= i.maxAllowed &&
+        !isCurrentValue
+      );
+    });
   }, [items, otherUsage, value]);
 
   const handleChange = (selectedVal: string) => {
@@ -221,13 +244,14 @@ export default function ScopedQuotaSelectInput({
 
   const displayLabel = label || activeUiRule?.name || (fieldLeafName.charAt(0).toUpperCase() + fieldLeafName.slice(1));
   const displayPlaceholder = placeholder || `Select ${displayLabel}...`;
+  const matchedItemValue = items.find((it) => (it.value || '').toLowerCase().trim() === (value || '').toLowerCase().trim())?.value || (value || '');
 
   return (
     <Field.Root name={name} required={required}>
       {displayLabel && <Field.Label>{displayLabel}</Field.Label>}
       <SingleSelect
         placeholder={displayPlaceholder}
-        value={value || ''}
+        value={matchedItemValue}
         onChange={handleChange}
         disabled={disabled}
       >

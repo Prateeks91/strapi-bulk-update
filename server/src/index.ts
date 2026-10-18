@@ -41,19 +41,29 @@ export default {
             strapi.log.warn('[bulk-updater] Failed to fetch active UI validation rules:', err);
           }
 
-          // Build fieldQuotas map from UI rules
-          const fieldQuotas: Record<string, { quotas: Record<string, number>; ruleName: string }> = {};
-
-          for (const rule of activeUiRules) {
-            if (rule.targetField && rule.quotas) {
-              fieldQuotas[rule.targetField] = {
-                quotas: rule.quotas,
-                ruleName: rule.name,
-              };
-            }
+          // Helper to match field key against a rule's targetField (supports case-insensitivity & component.field paths)
+          function matchesRule(key: string, ruleTargetField: string): boolean {
+            if (!key || !ruleTargetField) return false;
+            const kLower = key.toLowerCase().trim();
+            const tLower = ruleTargetField.toLowerCase().trim();
+            return (
+              kLower === tLower ||
+              tLower.endsWith(`.${kLower}`) ||
+              tLower.split('.').pop() === kLower ||
+              kLower.endsWith(`.${tLower}`)
+            );
           }
 
           // 2. Discover attributes from schemas as fallback if not in UI rules
+          const effectiveRules: Array<{ id: string; name: string; targetField: string; quotas: Record<string, number> }> = [
+            ...activeUiRules.map((r: any) => ({
+              id: r.id || r.targetField,
+              name: r.name || r.targetField,
+              targetField: r.targetField,
+              quotas: r.quotas || {},
+            })),
+          ];
+
           const allComponents = strapi.components || {};
           for (const comp of Object.values(allComponents) as any[]) {
             const attrs = comp.attributes || {};
@@ -62,7 +72,7 @@ export default {
                 attrDef.type === 'customField' &&
                 (attrDef.customField === 'plugin::bulk-updater.scoped-select' ||
                  attrDef.customField === 'global::scoped-select') &&
-                !fieldQuotas[attrName]
+                !effectiveRules.some((r) => matchesRule(attrName, r.targetField))
               ) {
                 const quotas = attrDef.options?.quotas || {};
                 const items = attrDef.options?.items || [];
@@ -74,27 +84,19 @@ export default {
                   }
                 }
 
-                const mergedQuotas = {
-                  h1: 1,
-                  h2: 3,
-                  ...itemQuotas,
-                  ...quotas,
-                };
-
-                fieldQuotas[attrName] = {
-                  quotas: mergedQuotas,
-                  ruleName: `${attrName} quota rule`,
-                };
+                effectiveRules.push({
+                  id: `schema_${attrName}`,
+                  name: `${attrName} quota rule`,
+                  targetField: attrName,
+                  quotas: {
+                    h1: 1,
+                    h2: 3,
+                    ...itemQuotas,
+                    ...quotas,
+                  },
+                });
               }
             }
-          }
-
-          // Fallback rule for standard headingLevel if not configured yet
-          if (!fieldQuotas.headingLevel) {
-            fieldQuotas.headingLevel = {
-              quotas: { h1: 1, h2: 3 },
-              ruleName: 'Default SEO Heading Rule',
-            };
           }
 
           const counts: Record<string, Record<string, number>> = {};
@@ -105,10 +107,12 @@ export default {
             for (const key of Object.keys(obj)) {
               const val = obj[key];
 
-              if (fieldQuotas[key] && typeof val === 'string' && val) {
-                const lowerVal = val.toLowerCase();
-                counts[key] = counts[key] || {};
-                counts[key][lowerVal] = (counts[key][lowerVal] || 0) + 1;
+              for (const rule of effectiveRules) {
+                if (matchesRule(key, rule.targetField) && typeof val === 'string' && val.trim()) {
+                  const lowerVal = val.toLowerCase().trim();
+                  counts[rule.id] = counts[rule.id] || {};
+                  counts[rule.id][lowerVal] = (counts[rule.id][lowerVal] || 0) + 1;
+                }
               }
 
               if (typeof val === 'object' && val !== null) {
@@ -117,23 +121,22 @@ export default {
             }
           }
 
-          // If updating an existing document and updating a scalar field that has quota rules,
-          // merge with the existing document state to ensure full cross-component tree compliance
+          // If updating an existing document, merge incoming data with existing document
+          // state so cross-component dynamic zone quotas are evaluated across the full tree
           let dataToScan = data;
           if (context.action === 'update' && (params?.documentId || params?.where?.documentId)) {
             const docId = params?.documentId || params?.where?.documentId;
-            const hasQuotaFieldInPayload = Object.keys(fieldQuotas).some((k) => k in data);
-            if (hasQuotaFieldInPayload && context.uid) {
+            if (context.uid && docId) {
               try {
-                const existing = await strapi.documents(context.uid as any).findOne({
-                  documentId: docId,
-                  populate: '*',
+                const existing = await strapi.db?.query?.(context.uid)?.findOne?.({
+                  where: { documentId: docId },
+                  populate: true,
                 });
                 if (existing) {
                   dataToScan = { ...existing, ...data };
                 }
               } catch {
-                // If lookup fails, scan incoming data
+                // If lookup fails, scan incoming payload
               }
             }
           }
@@ -141,13 +144,15 @@ export default {
           scanDataTree(dataToScan);
 
           // Validate collected counts against active quotas
-          for (const [fieldKey, ruleMeta] of Object.entries(fieldQuotas)) {
-            for (const [val, maxAllowed] of Object.entries(ruleMeta.quotas)) {
-              const lowerVal = val.toLowerCase();
-              const actualCount = counts[fieldKey]?.[lowerVal] || 0;
-              if (actualCount > maxAllowed) {
+          for (const rule of effectiveRules) {
+            const ruleCounts = counts[rule.id] || {};
+
+            for (const [quotaKey, maxAllowed] of Object.entries(rule.quotas || {})) {
+              const lowerVal = quotaKey.toLowerCase().trim();
+              const actualCount = ruleCounts[lowerVal] || 0;
+              if (actualCount > (maxAllowed as number)) {
                 throw new errors.ApplicationError(
-                  `Validation Error (${ruleMeta.ruleName}): Option "${val.toUpperCase()}" on field "${fieldKey}" cannot appear more than ${maxAllowed} time(s) across this entry (found ${actualCount}).`
+                  `Validation Error (${rule.name}): Option "${quotaKey.toUpperCase()}" on field "${rule.targetField}" cannot appear more than ${maxAllowed} time(s) across this entry (found ${actualCount}).`
                 );
               }
             }
