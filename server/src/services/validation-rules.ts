@@ -82,29 +82,34 @@ export function extractHeadingsFromRichText(content: any): Record<string, number
   return counts;
 }
 
+function cleanKey(str: string): string {
+  return (str || '').replace(/[-_]/g, '').toLowerCase().trim();
+}
+
 /**
- * Matches a current property path against a rule targetField (supports dot paths and leaf keys)
+ * Matches a current property path against a rule targetField (supports dot paths, leaf keys, and dynamic zone component names)
  */
 export function matchesPath(normalizedPath: string, leafKey: string, targetField: string): boolean {
   if (!targetField) return false;
-  const pLower = (normalizedPath || '').toLowerCase().trim();
-  const kLower = (leafKey || '').toLowerCase().trim();
-  const tLower = targetField.toLowerCase().trim();
+  const pClean = cleanKey(normalizedPath);
+  const kClean = cleanKey(leafKey);
+  const tClean = cleanKey(targetField);
 
   // If targetField has no dots, match either leafKey or end of path
-  if (!tLower.includes('.')) {
+  if (!tClean.includes('.')) {
     return (
-      kLower === tLower ||
-      pLower === tLower ||
-      pLower.endsWith(`.${tLower}`)
+      kClean === tClean ||
+      pClean === tClean ||
+      pClean.endsWith(`.${tClean}`)
     );
   }
 
-  // If targetField has dots (e.g., 'st-featured.titleHeadingStyle.titleStyle' or 'titleHeadingStyle.titleStyle')
+  // If targetField has dots (e.g., 'titleHeadingStyle.titleStyle', 'content.titleHeadingStyle.titleStyle', or 'st-featured.titleHeadingStyle.titleStyle')
   return (
-    pLower === tLower ||
-    pLower.endsWith(`.${tLower}`) ||
-    pLower.endsWith(tLower)
+    pClean === tClean ||
+    pClean.endsWith(`.${tClean}`) ||
+    pClean.endsWith(tClean) ||
+    pClean.includes(`.${tClean}`)
   );
 }
 
@@ -252,8 +257,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     function componentHasField(compUid: string, targetField: string): boolean {
       const comp = allComponents[compUid];
       if (!comp?.attributes) return false;
+      if (matchesPath(compUid, compUid, targetField)) return true;
       for (const [attrName, attrDef] of Object.entries(comp.attributes) as any[]) {
-        if (matchesPath(attrName, attrName, targetField)) return true;
+        if (matchesPath(attrName, attrName, targetField) || matchesPath(`${compUid}.${attrName}`, attrName, targetField)) return true;
         if (attrDef.type === 'component' && attrDef.component) {
           if (componentHasField(attrDef.component, targetField)) return true;
         }
@@ -279,7 +285,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           }
         } else if (attrDef.type === 'dynamiczone' && Array.isArray(attrDef.components)) {
           const matchingComp = attrDef.components.some(
-            (compUid: string) => componentHasField(compUid, targetField)
+            (compUid: string) => componentHasField(compUid, targetField) || matchesPath(`${attrKey}.${compUid}`, compUid, targetField)
           );
           if (matchingComp) {
             hasField = true;
@@ -337,12 +343,22 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
               function traverse(obj: any, currentPath = '') {
                 if (!obj || typeof obj !== 'object') return;
+                const compName = typeof obj.__component === 'string' ? obj.__component : '';
+
                 for (const key of Object.keys(obj)) {
+                  if (key === '__component') continue;
                   const val = obj[key];
                   const newPath = currentPath ? `${currentPath}.${key}` : key;
                   const normalizedPath = newPath.replace(/\.\d+/g, '');
 
-                  if (matchesPath(normalizedPath, key, targetField) && typeof val === 'string' && val.trim()) {
+                  const compPath = compName
+                    ? (currentPath ? `${currentPath}.${compName}.${key}` : `${compName}.${key}`).replace(/\.\d+/g, '')
+                    : '';
+
+                  const isMatch = matchesPath(normalizedPath, key, targetField) ||
+                    (compPath ? matchesPath(compPath, key, targetField) : false);
+
+                  if (isMatch && typeof val === 'string' && val.trim()) {
                     const lower = val.toLowerCase().trim();
                     structuredCounts[lower] = (structuredCounts[lower] || 0) + 1;
                   }

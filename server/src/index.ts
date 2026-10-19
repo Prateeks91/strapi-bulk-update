@@ -108,15 +108,24 @@ export default {
 
           function scanDataTree(obj: any, currentPath = '') {
             if (!obj || typeof obj !== 'object') return;
+            const compName = typeof obj.__component === 'string' ? obj.__component : '';
 
             for (const key of Object.keys(obj)) {
+              if (key === '__component') continue;
               const val = obj[key];
               const newPath = currentPath ? `${currentPath}.${key}` : key;
               const normalizedPath = newPath.replace(/\.\d+/g, '');
 
-              // Check structured rules matching targetField (supports dot notation like st-featured.titleHeadingStyle.titleStyle)
+              const compPath = compName
+                ? (currentPath ? `${currentPath}.${compName}.${key}` : `${compName}.${key}`).replace(/\.\d+/g, '')
+                : '';
+
+              // Check structured rules matching targetField (supports dot notation like st-featured.titleHeadingStyle.titleStyle or titleHeadingStyle.titleStyle)
               for (const rule of effectiveRules) {
-                if (matchesPath(normalizedPath, key, rule.targetField) && typeof val === 'string' && val.trim()) {
+                const isMatch = matchesPath(normalizedPath, key, rule.targetField) ||
+                  (compPath ? matchesPath(compPath, key, rule.targetField) : false);
+
+                if (isMatch && typeof val === 'string' && val.trim()) {
                   const lowerVal = val.toLowerCase().trim();
                   structuredCounts[rule.id] = structuredCounts[rule.id] || {};
                   structuredCounts[rule.id][lowerVal] = (structuredCounts[rule.id][lowerVal] || 0) + 1;

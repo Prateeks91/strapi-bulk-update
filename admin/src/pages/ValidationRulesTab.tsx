@@ -70,13 +70,19 @@ export default function ValidationRulesTab() {
   const fetchCollections = async () => {
     try {
       const res = await get('/bulk-updater/models');
-      if (res.data?.targetUids && res.data?.metaByUid) {
-        const list = res.data.targetUids.map((uid: string) => ({
+      let list: Array<{ uid: string; displayName: string }> = [];
+      if (Array.isArray(res.data?.collections)) {
+        list = res.data.collections.map((c: any) => ({
+          uid: c.uid,
+          displayName: c.displayName || c.singularName || c.uid,
+        }));
+      } else if (res.data?.targetUids && res.data?.metaByUid) {
+        list = res.data.targetUids.map((uid: string) => ({
           uid,
           displayName: res.data.metaByUid[uid]?.displayName || uid,
         }));
-        setAvailableCollections(list);
       }
+      setAvailableCollections(list);
     } catch {
       // Fallback silently if models not loaded
     }
@@ -123,6 +129,7 @@ export default function ValidationRulesTab() {
   }, []);
 
   const openCreateModal = () => {
+    fetchCollections();
     setEditingRule(null);
     setFormName('');
     setFormDesc('');
@@ -138,6 +145,7 @@ export default function ValidationRulesTab() {
   };
 
   const openEditModal = (rule: ValidationRule) => {
+    fetchCollections();
     setEditingRule(rule);
     setFormName(rule.name);
     setFormDesc(rule.description || '');
@@ -277,6 +285,11 @@ export default function ValidationRulesTab() {
 
   return (
     <Box>
+      <style>{`
+        [data-radix-popper-content-wrapper] {
+          z-index: 10005 !important;
+        }
+      `}</style>
       {/* Header Panel */}
       <Box padding={6} background="neutral0" shadow="filterShadow" hasRadius marginBottom={6}>
         <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={3}>
@@ -439,7 +452,7 @@ export default function ValidationRulesTab() {
             position: 'fixed',
             inset: 0,
             backgroundColor: 'rgba(33, 33, 52, 0.65)',
-            zIndex: 9999,
+            zIndex: 1000,
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
@@ -614,7 +627,7 @@ export default function ValidationRulesTab() {
             position: 'fixed',
             inset: 0,
             backgroundColor: 'rgba(33, 33, 52, 0.65)',
-            zIndex: 9999,
+            zIndex: 1000,
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
