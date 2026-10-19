@@ -172,7 +172,7 @@ export function discoverComponentAttributes(
     }
   }
 
-  return discoveredAttrs;
+  return Array.from(new Set(discoveredAttrs));
 }
 
 /**
@@ -1370,7 +1370,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
             return true;
           });
 
-          const allColAttrs = [...validAttrs, ...nestedComponentAttrs];
+          const allColAttrs = Array.from(new Set([...validAttrs, ...nestedComponentAttrs]));
           allColAttrs.forEach((attr) => {
             allAttributesSet.add(attr);
             if (colAttributesMeta[attr]) {
