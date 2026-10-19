@@ -17,6 +17,7 @@ import {
   Th,
   Td,
   Alert,
+  Checkbox,
 } from '@strapi/design-system';
 import { Plus, Trash, Check, ArrowClockwise, Search, Download } from '@strapi/icons';
 
@@ -24,11 +25,14 @@ export interface ValidationRule {
   id: string;
   name: string;
   description?: string;
+  collectionUid?: string;
   targetField: string;
   quotas: Record<string, number>;
   exceededAction: 'disable' | 'hide';
   enabled: boolean;
   scope: 'entry' | 'document';
+  includeRichTextHtml?: boolean;
+  richTextFields?: string[];
   createdAt?: string;
   updatedAt?: string;
 }
@@ -42,11 +46,16 @@ export default function ValidationRulesTab() {
   const [modalOpen, setModalOpen] = useState<boolean>(false);
   const [editingRule, setEditingRule] = useState<ValidationRule | null>(null);
 
+  // Available collections from backend models
+  const [availableCollections, setAvailableCollections] = useState<Array<{ uid: string; displayName: string }>>([]);
+
   // Form state for creating/editing a rule
   const [formName, setFormName] = useState<string>('');
   const [formDesc, setFormDesc] = useState<string>('');
+  const [formCollectionUid, setFormCollectionUid] = useState<string>('*');
   const [formField, setFormField] = useState<string>('');
   const [formAction, setFormAction] = useState<'disable' | 'hide'>('disable');
+  const [formIncludeRichText, setFormIncludeRichText] = useState<boolean>(true);
   const [formQuotas, setFormQuotas] = useState<Array<{ key: string; maxAllowed: number }>>([
     { key: 'h1', maxAllowed: 1 },
     { key: 'h2', maxAllowed: 3 },
@@ -57,6 +66,21 @@ export default function ValidationRulesTab() {
   const [scanModalOpen, setScanModalOpen] = useState<boolean>(false);
   const [scanningRuleId, setScanningRuleId] = useState<string | null>(null);
   const [scanReport, setScanReport] = useState<any>(null);
+
+  const fetchCollections = async () => {
+    try {
+      const res = await get('/bulk-updater/models');
+      if (res.data?.targetUids && res.data?.metaByUid) {
+        const list = res.data.targetUids.map((uid: string) => ({
+          uid,
+          displayName: res.data.metaByUid[uid]?.displayName || uid,
+        }));
+        setAvailableCollections(list);
+      }
+    } catch {
+      // Fallback silently if models not loaded
+    }
+  };
 
   const handleScanRule = async (rule: ValidationRule) => {
     try {
@@ -95,14 +119,17 @@ export default function ValidationRulesTab() {
 
   useEffect(() => {
     fetchRules();
+    fetchCollections();
   }, []);
 
   const openCreateModal = () => {
     setEditingRule(null);
     setFormName('');
     setFormDesc('');
+    setFormCollectionUid('*');
     setFormField('headingLevel');
     setFormAction('disable');
+    setFormIncludeRichText(true);
     setFormQuotas([
       { key: 'h1', maxAllowed: 1 },
       { key: 'h2', maxAllowed: 3 },
@@ -114,8 +141,10 @@ export default function ValidationRulesTab() {
     setEditingRule(rule);
     setFormName(rule.name);
     setFormDesc(rule.description || '');
+    setFormCollectionUid(rule.collectionUid || '*');
     setFormField(rule.targetField);
     setFormAction(rule.exceededAction || 'disable');
+    setFormIncludeRichText(rule.includeRichTextHtml ?? true);
     const quotaPairs = Object.entries(rule.quotas || {}).map(([k, v]) => ({
       key: k,
       maxAllowed: v,
@@ -176,11 +205,13 @@ export default function ValidationRulesTab() {
         id: editingRule ? editingRule.id : undefined,
         name: formName.trim(),
         description: formDesc.trim(),
+        collectionUid: formCollectionUid,
         targetField: formField.trim(),
         quotas: quotasRecord,
         exceededAction: formAction,
         enabled: editingRule ? editingRule.enabled : true,
         scope: 'entry',
+        includeRichTextHtml: formIncludeRichText,
       };
 
       const res = await post('/bulk-updater/validation-rules', { rule: payload });
@@ -251,10 +282,10 @@ export default function ValidationRulesTab() {
         <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={3}>
           <Box>
             <Typography variant="delta" tag="h2" fontWeight="bold">
-              Cross-Component Validation & Quota Rules
+              Scoped & Cross-Component Validation Rules
             </Typography>
             <Typography variant="pi" textColor="neutral600" style={{ marginTop: 4 }}>
-              Define and enforce limits across Dynamic Zone components without writing code. Changes take effect immediately in both Admin edit view and Document Service APIs.
+              Define collection-scoped rules and combined heading limits across structured components and free-form Rich Text / CKEditor HTML / Markdown content.
             </Typography>
           </Box>
           <Flex gap={2}>
@@ -290,12 +321,13 @@ export default function ValidationRulesTab() {
             Click "Create New Rule" above to add your first cross-component quota rule.
           </Alert>
         ) : (
-          <Table colCount={6} rowCount={rules.length + 1}>
+          <Table colCount={7} rowCount={rules.length + 1}>
             <Thead>
               <Tr>
                 <Th><Typography variant="sigma">RULE NAME & TARGET FIELD</Typography></Th>
-                <Th><Typography variant="sigma">DESCRIPTION</Typography></Th>
+                <Th><Typography variant="sigma">COLLECTION SCOPE</Typography></Th>
                 <Th><Typography variant="sigma">QUOTA CONSTRAINTS</Typography></Th>
+                <Th><Typography variant="sigma">RICH TEXT / HTML</Typography></Th>
                 <Th><Typography variant="sigma">EXCEEDED ACTION</Typography></Th>
                 <Th><Typography variant="sigma">STATUS</Typography></Th>
                 <Th style={{ textAlign: 'right' }}><Typography variant="sigma">ACTIONS</Typography></Th>
@@ -304,6 +336,11 @@ export default function ValidationRulesTab() {
             <Tbody>
               {rules.map((rule) => {
                 const quotaKeys = Object.entries(rule.quotas || {});
+                const isGlobal = !rule.collectionUid || rule.collectionUid === '*';
+                const collectionName = !isGlobal
+                  ? (availableCollections.find((c) => c.uid === rule.collectionUid)?.displayName || rule.collectionUid)
+                  : 'All Collections (Global)';
+
                 return (
                   <Tr key={rule.id}>
                     <Td style={{ minWidth: 200 }}>
@@ -311,15 +348,18 @@ export default function ValidationRulesTab() {
                         {rule.name}
                       </Typography>
                       <Typography variant="pi" textColor="neutral500">
-                        Target Field: <code>{rule.targetField}</code>
+                        Target: <code>{rule.targetField}</code>
                       </Typography>
                     </Td>
-                    <Td style={{ maxWidth: 300 }}>
-                      <Typography variant="pi" textColor="neutral600">
-                        {rule.description || '—'}
-                      </Typography>
+                    <Td style={{ minWidth: 160 }}>
+                      <Badge
+                        backgroundColor={isGlobal ? 'neutral150' : 'primary100'}
+                        textColor={isGlobal ? 'neutral700' : 'primary700'}
+                      >
+                        {collectionName}
+                      </Badge>
                     </Td>
-                    <Td style={{ minWidth: 220 }}>
+                    <Td style={{ minWidth: 180 }}>
                       <Flex gap={1} wrap="wrap">
                         {quotaKeys.map(([optVal, maxVal]) => (
                           <Badge key={optVal} backgroundColor="neutral100" textColor="primary700">
@@ -328,7 +368,18 @@ export default function ValidationRulesTab() {
                         ))}
                       </Flex>
                     </Td>
-                    <Td style={{ minWidth: 120 }}>
+                    <Td style={{ minWidth: 140 }}>
+                      {rule.includeRichTextHtml ? (
+                        <Badge backgroundColor="success100" textColor="success700">
+                          HTML & Rich Text Active
+                        </Badge>
+                      ) : (
+                        <Badge backgroundColor="neutral150" textColor="neutral600">
+                          Structured Only
+                        </Badge>
+                      )}
+                    </Td>
+                    <Td style={{ minWidth: 110 }}>
                       <Badge
                         backgroundColor={rule.exceededAction === 'hide' ? 'secondary100' : 'warning100'}
                         textColor={rule.exceededAction === 'hide' ? 'secondary700' : 'warning700'}
@@ -399,32 +450,62 @@ export default function ValidationRulesTab() {
             hasRadius
             shadow="popupShadow"
             padding={6}
-            style={{ width: '90%', maxWidth: 620, maxHeight: '90vh', overflowY: 'auto' }}
+            style={{ width: '90%', maxWidth: 640, maxHeight: '90vh', overflowY: 'auto' }}
           >
             <Typography variant="delta" tag="h2" fontWeight="bold" marginBottom={1}>
               {editingRule ? 'Edit Validation Rule' : 'Create New Validation Rule'}
             </Typography>
             <Typography variant="pi" textColor="neutral600" marginBottom={4} style={{ display: 'block' }}>
-              Configure cross-component limits. The rule will automatically apply to any Dynamic Zone or Component using this attribute.
+              Configure collection-scoped quotas. Rules apply consistently to target properties and optionally scan rich text HTML content.
             </Typography>
 
             <Flex direction="column" gap={4} alignItems="stretch">
               <TextInput
                 label="Rule Name"
-                placeholder="e.g. SEO Single H1 Rule"
+                placeholder="e.g. SEO Single H1 Page Rule"
                 value={formName}
                 onChange={(e: any) => setFormName(e.target.value)}
                 required
               />
 
+              <SingleSelect
+                label="Target Collection Type"
+                value={formCollectionUid}
+                onChange={(val: any) => setFormCollectionUid(val)}
+                hint="Scope this rule to a specific collection type, or select All Collections."
+              >
+                <SingleSelectOption value="*">* (All Collections / Global)</SingleSelectOption>
+                {availableCollections.map((c) => (
+                  <SingleSelectOption key={c.uid} value={c.uid}>
+                    {c.displayName} ({c.uid})
+                  </SingleSelectOption>
+                ))}
+              </SingleSelect>
+
               <TextInput
-                label="Target Field Name"
-                placeholder="e.g. headingLevel, titleStyle, or color"
+                label="Target Field / Component Property Path"
+                placeholder="e.g. headingLevel, titleStyle, or st-featured.titleHeadingStyle.titleStyle"
                 value={formField}
                 onChange={(e: any) => setFormField(e.target.value)}
-                hint="Attribute name on the component/customField to monitor across the entry."
+                hint="Attribute name or dot-notated hierarchy (e.g. 'titleStyle' or 'st-featured.titleHeadingStyle.titleStyle')."
                 required
               />
+
+              <Box padding={3} background="neutral100" hasRadius style={{ border: '1px solid #e0e0e0' }}>
+                <Checkbox
+                  checked={formIncludeRichText}
+                  onCheckedChange={(checked: boolean) => setFormIncludeRichText(checked)}
+                >
+                  <Box marginLeft={2}>
+                    <Typography variant="omega" fontWeight="bold">
+                      Scan & Combine Rich Text / CKEditor HTML Headings
+                    </Typography>
+                    <Typography variant="pi" textColor="neutral600" display="block">
+                      When enabled, any &lt;h1&gt;..&lt;h6&gt; tags, Markdown headings (#), or Strapi Blocks inside rich text fields are counted together with structured component choices towards the quota.
+                    </Typography>
+                  </Box>
+                </Checkbox>
+              </Box>
 
               <Textarea
                 label="Rule Description"
@@ -595,6 +676,11 @@ export default function ValidationRulesTab() {
                           <Typography variant="pi" textColor="neutral500" display="block">
                             Collection: {v.collectionDisplayName}
                           </Typography>
+                          {v.detail && (
+                            <Typography variant="pi" textColor="neutral600" display="block" style={{ fontSize: 11 }}>
+                              Breakdown: {v.detail}
+                            </Typography>
+                          )}
                         </Td>
                         <Td>
                           <Badge backgroundColor="warning100" textColor="warning700">

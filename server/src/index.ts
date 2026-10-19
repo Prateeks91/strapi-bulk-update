@@ -6,7 +6,7 @@ import validationRulesController from './controllers/validation-rules';
 import csvController from './controllers/csv';
 import bulkUpdaterService from './services/bulk-updater';
 import auditService from './services/audit';
-import validationRulesService from './services/validation-rules';
+import validationRulesService, { extractHeadingsFromRichText, matchesPath } from './services/validation-rules';
 import csvService from './services/csv';
 import contentHistoryService, { recordContentHistoryVersion } from './services/content-history';
 
@@ -41,27 +41,28 @@ export default {
             strapi.log.warn('[bulk-updater] Failed to fetch active UI validation rules:', err);
           }
 
-          // Helper to match field key against a rule's targetField (supports case-insensitivity & component.field paths)
-          function matchesRule(key: string, ruleTargetField: string): boolean {
-            if (!key || !ruleTargetField) return false;
-            const kLower = key.toLowerCase().trim();
-            const tLower = ruleTargetField.toLowerCase().trim();
-            return (
-              kLower === tLower ||
-              tLower.endsWith(`.${kLower}`) ||
-              tLower.split('.').pop() === kLower ||
-              kLower.endsWith(`.${tLower}`)
-            );
-          }
-
           // 2. Discover attributes from schemas as fallback if not in UI rules
-          const effectiveRules: Array<{ id: string; name: string; targetField: string; quotas: Record<string, number> }> = [
-            ...activeUiRules.map((r: any) => ({
-              id: r.id || r.targetField,
-              name: r.name || r.targetField,
-              targetField: r.targetField,
-              quotas: r.quotas || {},
-            })),
+          // Filter UI rules scoped to this collection type (or '*' for global)
+          const effectiveRules: Array<{
+            id: string;
+            name: string;
+            collectionUid?: string;
+            targetField: string;
+            quotas: Record<string, number>;
+            includeRichTextHtml?: boolean;
+            richTextFields?: string[];
+          }> = [
+            ...activeUiRules
+              .filter((r: any) => !r.collectionUid || r.collectionUid === '*' || r.collectionUid === context.uid)
+              .map((r: any) => ({
+                id: r.id || r.targetField,
+                name: r.name || r.targetField,
+                collectionUid: r.collectionUid || '*',
+                targetField: r.targetField,
+                quotas: r.quotas || {},
+                includeRichTextHtml: Boolean(r.includeRichTextHtml),
+                richTextFields: r.richTextFields || [],
+              })),
           ];
 
           const allComponents = strapi.components || {};
@@ -72,7 +73,7 @@ export default {
                 attrDef.type === 'customField' &&
                 (attrDef.customField === 'plugin::bulk-updater.scoped-select' ||
                  attrDef.customField === 'global::scoped-select') &&
-                !effectiveRules.some((r) => matchesRule(attrName, r.targetField))
+                !effectiveRules.some((r) => matchesPath(attrName, attrName, r.targetField))
               ) {
                 const quotas = attrDef.options?.quotas || {};
                 const items = attrDef.options?.items || [];
@@ -87,6 +88,7 @@ export default {
                 effectiveRules.push({
                   id: `schema_${attrName}`,
                   name: `${attrName} quota rule`,
+                  collectionUid: '*',
                   targetField: attrName,
                   quotas: {
                     h1: 1,
@@ -94,29 +96,54 @@ export default {
                     ...itemQuotas,
                     ...quotas,
                   },
+                  includeRichTextHtml: true,
+                  richTextFields: [],
                 });
               }
             }
           }
 
-          const counts: Record<string, Record<string, number>> = {};
+          const structuredCounts: Record<string, Record<string, number>> = {};
+          const richTextCounts: Record<string, number> = { h1: 0, h2: 0, h3: 0, h4: 0, h5: 0, h6: 0 };
 
-          function scanDataTree(obj: any) {
+          function scanDataTree(obj: any, currentPath = '') {
             if (!obj || typeof obj !== 'object') return;
 
             for (const key of Object.keys(obj)) {
               const val = obj[key];
+              const newPath = currentPath ? `${currentPath}.${key}` : key;
+              const normalizedPath = newPath.replace(/\.\d+/g, '');
 
+              // Check structured rules matching targetField (supports dot notation like st-featured.titleHeadingStyle.titleStyle)
               for (const rule of effectiveRules) {
-                if (matchesRule(key, rule.targetField) && typeof val === 'string' && val.trim()) {
+                if (matchesPath(normalizedPath, key, rule.targetField) && typeof val === 'string' && val.trim()) {
                   const lowerVal = val.toLowerCase().trim();
-                  counts[rule.id] = counts[rule.id] || {};
-                  counts[rule.id][lowerVal] = (counts[rule.id][lowerVal] || 0) + 1;
+                  structuredCounts[rule.id] = structuredCounts[rule.id] || {};
+                  structuredCounts[rule.id][lowerVal] = (structuredCounts[rule.id][lowerVal] || 0) + 1;
                 }
               }
 
+              // Check rich text HTML / Markdown / Blocks content
+              if (typeof val === 'string' && (val.includes('<h') || val.includes('#'))) {
+                const headings = extractHeadingsFromRichText(val);
+                for (const [tag, count] of Object.entries(headings)) {
+                  if (count > 0) {
+                    richTextCounts[tag] = (richTextCounts[tag] || 0) + count;
+                  }
+                }
+              } else if (Array.isArray(val) && val.length > 0 && typeof val[0] === 'object' && val[0]?.type) {
+                // Strapi Blocks array
+                const headings = extractHeadingsFromRichText(val);
+                for (const [tag, count] of Object.entries(headings)) {
+                  if (count > 0) {
+                    richTextCounts[tag] = (richTextCounts[tag] || 0) + count;
+                  }
+                }
+                continue;
+              }
+
               if (typeof val === 'object' && val !== null) {
-                scanDataTree(val);
+                scanDataTree(val, newPath);
               }
             }
           }
@@ -145,15 +172,24 @@ export default {
 
           // Validate collected counts against active quotas
           for (const rule of effectiveRules) {
-            const ruleCounts = counts[rule.id] || {};
+            const ruleCounts = structuredCounts[rule.id] || {};
 
             for (const [quotaKey, maxAllowed] of Object.entries(rule.quotas || {})) {
               const lowerVal = quotaKey.toLowerCase().trim();
-              const actualCount = ruleCounts[lowerVal] || 0;
-              if (actualCount > (maxAllowed as number)) {
-                throw new errors.ApplicationError(
-                  `Validation Error (${rule.name}): Option "${quotaKey.toUpperCase()}" on field "${rule.targetField}" cannot appear more than ${maxAllowed} time(s) across this entry (found ${actualCount}).`
-                );
+              const structCount = ruleCounts[lowerVal] || 0;
+              const rtCount = rule.includeRichTextHtml ? (richTextCounts[lowerVal] || 0) : 0;
+              const totalFound = structCount + rtCount;
+
+              if (totalFound > (maxAllowed as number)) {
+                let detailMsg = `Option "${quotaKey.toUpperCase()}" cannot appear more than ${maxAllowed} time(s) across this entry.`;
+                if (rtCount > 0 && structCount > 0) {
+                  detailMsg += ` Found ${totalFound} occurrences combined: ${structCount} in structured component ('${rule.targetField}') and ${rtCount} in rich text HTML / Markdown.`;
+                } else if (rtCount > 0) {
+                  detailMsg += ` Found ${totalFound} in rich text HTML / Markdown content.`;
+                } else {
+                  detailMsg += ` Found ${totalFound} in structured field '${rule.targetField}'.`;
+                }
+                throw new errors.ApplicationError(`Validation Error (${rule.name}): ${detailMsg}`);
               }
             }
           }

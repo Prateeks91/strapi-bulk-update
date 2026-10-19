@@ -52,7 +52,8 @@ const DEFAULT_HEADING_ITEMS: QuotaItem[] = [
 function computeCrossComponentUsage(
   data: any,
   targetFieldLeafName: string,
-  excludePath: string
+  excludePath: string,
+  includeRichTextHtml: boolean = false
 ): Record<string, number> {
   const counts: Record<string, number> = {};
   const targetLower = targetFieldLeafName.toLowerCase().trim();
@@ -73,6 +74,21 @@ function computeCrossComponentUsage(
       if (isTargetMatch && fullPath !== excludePath && typeof val === 'string' && val.trim()) {
         const valNorm = val.toLowerCase().trim();
         counts[valNorm] = (counts[valNorm] || 0) + 1;
+      }
+
+      // If rule checks rich text HTML, scan strings with HTML or Markdown headings
+      if (includeRichTextHtml && typeof val === 'string' && (val.includes('<h') || val.includes('#'))) {
+        for (let level = 1; level <= 6; level++) {
+          const tag = `h${level}`;
+          const htmlMatches = val.match(new RegExp(`<${tag}\\b[^>]*>`, 'gi'));
+          if (htmlMatches) {
+            counts[tag] = (counts[tag] || 0) + htmlMatches.length;
+          }
+          const mdMatches = val.match(new RegExp(`(?:^|\\n)${'#'.repeat(level)}\\s+[^\\n]+`, 'g'));
+          if (mdMatches) {
+            counts[tag] = (counts[tag] || 0) + mdMatches.length;
+          }
+        }
       }
 
       if (typeof val === 'object' && val !== null) {
@@ -182,10 +198,10 @@ export default function ScopedQuotaSelectInput({
 
   const disabledBehavior = activeUiRule?.exceededAction || optionsConfig.disabledBehavior || 'disable';
 
-  // Compute other components' usage across the entire entry
+  // Compute other components' usage across the entire entry (and rich text HTML if rule enabled)
   const otherUsage = React.useMemo(() => {
-    return computeCrossComponentUsage(formValues, fieldLeafName, name);
-  }, [formValues, fieldLeafName, name]);
+    return computeCrossComponentUsage(formValues, fieldLeafName, name, Boolean(activeUiRule?.includeRichTextHtml));
+  }, [formValues, fieldLeafName, name, activeUiRule]);
 
   // Compute processed options: evaluate quotas and apply disable or hide rules
   const processedOptions = React.useMemo(() => {

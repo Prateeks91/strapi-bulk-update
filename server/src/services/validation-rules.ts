@@ -4,11 +4,14 @@ export interface ValidationRule {
   id: string;
   name: string;
   description?: string;
-  targetField: string;
+  collectionUid?: string; // specific collection UID (e.g. 'api::article.article') or '*' (all)
+  targetField: string;    // dot-path or attribute name, e.g. 'headingLevel' or 'st-featured.titleHeadingStyle.titleStyle'
   quotas: Record<string, number>;
   exceededAction: 'disable' | 'hide';
   enabled: boolean;
   scope: 'entry' | 'document';
+  includeRichTextHtml?: boolean; // Scans rich text / CKEditor HTML / Markdown / Blocks headings
+  richTextFields?: string[];     // Optional specific rich text paths to scan
   createdAt: string;
   updatedAt: string;
 }
@@ -17,7 +20,8 @@ const DEFAULT_RULES: ValidationRule[] = [
   {
     id: 'rule_seo_heading_h1',
     name: 'SEO Single H1 Page Rule',
-    description: 'Enforces that only one H1 heading tag can be selected across all dynamic zone heading blocks within an entry.',
+    description: 'Enforces that only one H1 heading tag can be selected across all dynamic zone heading blocks within an entry, combined with rich text HTML.',
+    collectionUid: '*',
     targetField: 'headingLevel',
     quotas: {
       h1: 1,
@@ -26,10 +30,83 @@ const DEFAULT_RULES: ValidationRule[] = [
     exceededAction: 'disable',
     enabled: true,
     scope: 'entry',
+    includeRichTextHtml: true,
+    richTextFields: [],
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   },
 ];
+
+/**
+ * Extracts heading counts (h1..h6) from rich text content (HTML strings, Markdown strings, or Strapi Blocks AST)
+ */
+export function extractHeadingsFromRichText(content: any): Record<string, number> {
+  const counts: Record<string, number> = { h1: 0, h2: 0, h3: 0, h4: 0, h5: 0, h6: 0 };
+  if (!content) return counts;
+
+  // 1. Strapi 5 Blocks AST (Array of block nodes)
+  if (Array.isArray(content)) {
+    for (const node of content) {
+      if (node && typeof node === 'object') {
+        if (node.type === 'heading' && typeof node.level === 'number') {
+          const tag = `h${node.level}`;
+          if (counts[tag] !== undefined) counts[tag]++;
+        }
+        if (Array.isArray(node.children)) {
+          const sub = extractHeadingsFromRichText(node.children);
+          for (const k of Object.keys(counts)) counts[k] += sub[k];
+        }
+      }
+    }
+    return counts;
+  }
+
+  // 2. String (HTML or Markdown)
+  if (typeof content === 'string') {
+    for (let level = 1; level <= 6; level++) {
+      const tag = `h${level}`;
+      // HTML regex: <h1 ...> or <h1> (case-insensitive)
+      const htmlMatches = content.match(new RegExp(`<${tag}\\b[^>]*>`, 'gi'));
+      if (htmlMatches) {
+        counts[tag] += htmlMatches.length;
+      }
+      // Markdown regex: '# Heading' at beginning of line
+      const mdRegex = new RegExp(`(?:^|\\n)${'#'.repeat(level)}\\s+[^\\n]+`, 'g');
+      const mdMatches = content.match(mdRegex);
+      if (mdMatches) {
+        counts[tag] += mdMatches.length;
+      }
+    }
+  }
+
+  return counts;
+}
+
+/**
+ * Matches a current property path against a rule targetField (supports dot paths and leaf keys)
+ */
+export function matchesPath(normalizedPath: string, leafKey: string, targetField: string): boolean {
+  if (!targetField) return false;
+  const pLower = (normalizedPath || '').toLowerCase().trim();
+  const kLower = (leafKey || '').toLowerCase().trim();
+  const tLower = targetField.toLowerCase().trim();
+
+  // If targetField has no dots, match either leafKey or end of path
+  if (!tLower.includes('.')) {
+    return (
+      kLower === tLower ||
+      pLower === tLower ||
+      pLower.endsWith(`.${tLower}`)
+    );
+  }
+
+  // If targetField has dots (e.g., 'st-featured.titleHeadingStyle.titleStyle' or 'titleHeadingStyle.titleStyle')
+  return (
+    pLower === tLower ||
+    pLower.endsWith(`.${tLower}`) ||
+    pLower.endsWith(tLower)
+  );
+}
 
 export default ({ strapi }: { strapi: Core.Strapi }) => ({
   async getStore() {
@@ -65,6 +142,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         savedRule = {
           ...rules[index],
           ...ruleData,
+          collectionUid: ruleData.collectionUid !== undefined ? ruleData.collectionUid : (rules[index].collectionUid || '*'),
+          includeRichTextHtml: ruleData.includeRichTextHtml !== undefined ? Boolean(ruleData.includeRichTextHtml) : Boolean(rules[index].includeRichTextHtml),
+          richTextFields: Array.isArray(ruleData.richTextFields) ? ruleData.richTextFields : (rules[index].richTextFields || []),
           updatedAt: now,
         } as ValidationRule;
         rules[index] = savedRule;
@@ -73,11 +153,14 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           id: ruleData.id,
           name: ruleData.name || 'New Rule',
           description: ruleData.description || '',
+          collectionUid: ruleData.collectionUid || '*',
           targetField: ruleData.targetField || 'headingLevel',
           quotas: ruleData.quotas || { h1: 1 },
           exceededAction: ruleData.exceededAction || 'disable',
           enabled: ruleData.enabled ?? true,
           scope: ruleData.scope || 'entry',
+          includeRichTextHtml: Boolean(ruleData.includeRichTextHtml),
+          richTextFields: Array.isArray(ruleData.richTextFields) ? ruleData.richTextFields : [],
           createdAt: now,
           updatedAt: now,
         };
@@ -90,11 +173,14 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         id,
         name: ruleData.name || 'Custom Quota Rule',
         description: ruleData.description || '',
+        collectionUid: ruleData.collectionUid || '*',
         targetField: ruleData.targetField || 'headingLevel',
         quotas: ruleData.quotas || { h1: 1 },
         exceededAction: ruleData.exceededAction || 'disable',
         enabled: ruleData.enabled ?? true,
         scope: ruleData.scope || 'entry',
+        includeRichTextHtml: Boolean(ruleData.includeRichTextHtml),
+        richTextFields: Array.isArray(ruleData.richTextFields) ? ruleData.richTextFields : [],
         createdAt: now,
         updatedAt: now,
       };
@@ -142,8 +228,11 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       entryLabel: string;
       violatingOption: string;
       foundCount: number;
+      structuredCount: number;
+      richTextCount: number;
       maxAllowed: number;
       editUrl: string;
+      detail?: string;
     }>;
   }> {
     const rules = await this.getRules();
@@ -160,24 +249,11 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     const allContentTypes = strapi.contentTypes || {};
     const allComponents = strapi.components || {};
 
-    // Helper: matches a key against targetField (case-insensitive & supports dot notation)
-    function matchesRule(key: string, ruleTargetField: string): boolean {
-      if (!key || !ruleTargetField) return false;
-      const kLower = key.toLowerCase().trim();
-      const tLower = ruleTargetField.toLowerCase().trim();
-      return (
-        kLower === tLower ||
-        tLower.endsWith(`.${kLower}`) ||
-        tLower.split('.').pop() === kLower ||
-        kLower.endsWith(`.${tLower}`)
-      );
-    }
-
     function componentHasField(compUid: string, targetField: string): boolean {
       const comp = allComponents[compUid];
       if (!comp?.attributes) return false;
       for (const [attrName, attrDef] of Object.entries(comp.attributes) as any[]) {
-        if (matchesRule(attrName, targetField)) return true;
+        if (matchesPath(attrName, attrName, targetField)) return true;
         if (attrDef.type === 'component' && attrDef.component) {
           if (componentHasField(attrDef.component, targetField)) return true;
         }
@@ -193,7 +269,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       let hasField = false;
 
       for (const [attrKey, attrDef] of Object.entries(rawAttrs) as any[]) {
-        if (matchesRule(attrKey, targetField)) {
+        if (matchesPath(attrKey, attrKey, targetField)) {
           hasField = true;
         }
         if (attrDef.type === 'component' && attrDef.component) {
@@ -215,17 +291,22 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       return { hasField, populateAttrs };
     }
 
-    const candidateUids = Object.keys(allContentTypes).filter(
-      (uid) => uid.startsWith('api::') && !uid.includes('bulk-updater')
-    );
+    const candidateUids = Object.keys(allContentTypes).filter((uid) => {
+      if (!uid.startsWith('api::') || uid.includes('bulk-updater')) return false;
+      if (rule.collectionUid && rule.collectionUid !== '*' && rule.collectionUid !== uid) {
+        return false;
+      }
+      return true;
+    });
 
-    // Filter candidate collections to ONLY those that actually possess targetField in their schema
+    // Filter candidate collections to those that possess targetField in schema, OR if rule has collectionUid specified
     const relevantCollections: Array<{ uid: string; displayName: string; populateOption?: Record<string, any> | string }> = [];
     for (const uid of candidateUids) {
       const ct = allContentTypes[uid];
       if (!ct) continue;
       const { hasField, populateAttrs } = schemaHasField(ct);
-      if (hasField) {
+      // If collectionUid is specifically targeted, include it even if populateAttrs needs to be '*'
+      if (hasField || (rule.collectionUid && rule.collectionUid === uid)) {
         relevantCollections.push({
           uid,
           displayName: ct.info?.displayName || uid,
@@ -251,18 +332,42 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
             for (const entry of entries) {
               totalScanned++;
-              const counts: Record<string, number> = {};
+              const structuredCounts: Record<string, number> = {};
+              const richTextCounts: Record<string, number> = { h1: 0, h2: 0, h3: 0, h4: 0, h5: 0, h6: 0 };
 
-              function traverse(obj: any) {
+              function traverse(obj: any, currentPath = '') {
                 if (!obj || typeof obj !== 'object') return;
                 for (const key of Object.keys(obj)) {
                   const val = obj[key];
-                  if (matchesRule(key, targetField) && typeof val === 'string' && val.trim()) {
+                  const newPath = currentPath ? `${currentPath}.${key}` : key;
+                  const normalizedPath = newPath.replace(/\.\d+/g, '');
+
+                  if (matchesPath(normalizedPath, key, targetField) && typeof val === 'string' && val.trim()) {
                     const lower = val.toLowerCase().trim();
-                    counts[lower] = (counts[lower] || 0) + 1;
+                    structuredCounts[lower] = (structuredCounts[lower] || 0) + 1;
                   }
+
+                  if (rule.includeRichTextHtml) {
+                    if (typeof val === 'string' && (val.includes('<h') || val.includes('#'))) {
+                      const headings = extractHeadingsFromRichText(val);
+                      for (const [tag, count] of Object.entries(headings)) {
+                        if (count > 0) {
+                          richTextCounts[tag] = (richTextCounts[tag] || 0) + count;
+                        }
+                      }
+                    } else if (Array.isArray(val) && val.length > 0 && typeof val[0] === 'object' && val[0]?.type) {
+                      const headings = extractHeadingsFromRichText(val);
+                      for (const [tag, count] of Object.entries(headings)) {
+                        if (count > 0) {
+                          richTextCounts[tag] = (richTextCounts[tag] || 0) + count;
+                        }
+                      }
+                      continue;
+                    }
+                  }
+
                   if (typeof val === 'object' && val !== null) {
-                    traverse(val);
+                    traverse(val, newPath);
                   }
                 }
               }
@@ -271,18 +376,34 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
               for (const [optKey, max] of Object.entries(quotas)) {
                 const lowerOpt = optKey.toLowerCase().trim();
-                const actualCount = counts[lowerOpt] || 0;
-                if (actualCount > max) {
+                const structCount = structuredCounts[lowerOpt] || 0;
+                const rtCount = rule.includeRichTextHtml ? (richTextCounts[lowerOpt] || 0) : 0;
+                const combinedCount = structCount + rtCount;
+
+                if (combinedCount > max) {
                   const entryLabel =
                     entry.title || entry.name || entry.email || `Entry #${entry.documentId}`;
+                  
+                  let detail = '';
+                  if (rtCount > 0 && structCount > 0) {
+                    detail = `${structCount} structured + ${rtCount} in rich text HTML`;
+                  } else if (rtCount > 0) {
+                    detail = `${rtCount} in rich text HTML / Markdown`;
+                  } else {
+                    detail = `${structCount} in structured component`;
+                  }
+
                   violations.push({
                     uid,
                     collectionDisplayName: displayName,
                     documentId: entry.documentId,
                     entryLabel,
                     violatingOption: optKey.toUpperCase(),
-                    foundCount: actualCount,
+                    foundCount: combinedCount,
+                    structuredCount: structCount,
+                    richTextCount: rtCount,
                     maxAllowed: max,
+                    detail,
                     editUrl: `/admin/content-manager/collection-types/${uid}/${entry.documentId}`,
                   });
                 }
