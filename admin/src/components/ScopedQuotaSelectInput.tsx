@@ -45,18 +45,101 @@ const DEFAULT_HEADING_ITEMS: QuotaItem[] = [
   { value: 'h6', label: 'H6 - Minor Heading', maxAllowed: null },
 ];
 
+function cleanKey(str: string): string {
+  return (str || '').replace(/[-_]/g, '').toLowerCase().trim();
+}
+
+function matchesPath(normalizedPath: string, leafKey: string, targetField: string): boolean {
+  if (!targetField) return false;
+  const pClean = cleanKey(normalizedPath);
+  const kClean = cleanKey(leafKey);
+  const tClean = cleanKey(targetField);
+
+  if (kClean === tClean || pClean === tClean) return true;
+
+  const targetSegments = targetField
+    .replace(/^api::/i, '')
+    .split('.')
+    .map(cleanKey)
+    .filter(Boolean);
+
+  const pathSegments = normalizedPath
+    .split('.')
+    .map(cleanKey)
+    .filter(Boolean);
+
+  if (targetSegments.length === 0 || pathSegments.length === 0) return false;
+
+  if (targetSegments.length === 1) {
+    const single = targetSegments[0];
+    return kClean === single || pathSegments[pathSegments.length - 1] === single;
+  }
+
+  let isSuffix = true;
+  for (let i = 0; i < targetSegments.length; i++) {
+    const tSeg = targetSegments[targetSegments.length - 1 - i];
+    const pSeg = pathSegments[pathSegments.length - 1 - i];
+    if (tSeg !== '*' && tSeg !== pSeg) {
+      isSuffix = false;
+      break;
+    }
+  }
+  if (isSuffix) return true;
+
+  for (let startIdx = 1; startIdx < targetSegments.length; startIdx++) {
+    const subTarget = targetSegments.slice(startIdx);
+    if (subTarget.length > pathSegments.length) continue;
+    let subSuffix = true;
+    for (let i = 0; i < subTarget.length; i++) {
+      const tSeg = subTarget[subTarget.length - 1 - i];
+      const pSeg = pathSegments[pathSegments.length - 1 - i];
+      if (tSeg !== '*' && tSeg !== pSeg) {
+        subSuffix = false;
+        break;
+      }
+    }
+    if (subSuffix) return true;
+  }
+
+  let pIdx = 0;
+  let matchesInOrder = true;
+  let tStart = 0;
+  if (targetSegments.length > 2 && targetSegments[0] !== pathSegments[0] && targetSegments[0] !== '*') {
+    tStart = 1;
+  }
+  for (let tIdx = tStart; tIdx < targetSegments.length; tIdx++) {
+    const tSeg = targetSegments[tIdx];
+    if (tSeg === '*') continue;
+    let found = false;
+    while (pIdx < pathSegments.length) {
+      if (pathSegments[pIdx] === tSeg) {
+        found = true;
+        pIdx++;
+        break;
+      }
+      pIdx++;
+    }
+    if (!found) {
+      matchesInOrder = false;
+      break;
+    }
+  }
+
+  return matchesInOrder;
+}
+
 /**
  * Recursively traverses the entire form data tree to count occurrences of target field values,
  * excluding the current input's exact field path.
  */
 function computeCrossComponentUsage(
   data: any,
-  targetFieldLeafName: string,
+  targetFieldRule: string,
+  fieldLeafName: string,
   excludePath: string,
   includeRichTextHtml: boolean = false
 ): Record<string, number> {
   const counts: Record<string, number> = {};
-  const targetLower = targetFieldLeafName.toLowerCase().trim();
 
   function traverse(current: any, currentPath: string) {
     if (!current || typeof current !== 'object') return;
@@ -64,12 +147,9 @@ function computeCrossComponentUsage(
     for (const key of Object.keys(current)) {
       const val = current[key];
       const fullPath = currentPath ? `${currentPath}.${key}` : key;
+      const normalizedPath = fullPath.replace(/\.\d+/g, '');
 
-      const keyLower = key.toLowerCase().trim();
-      const isTargetMatch =
-        keyLower === targetLower ||
-        targetLower.endsWith(`.${keyLower}`) ||
-        targetLower.split('.').pop() === keyLower;
+      const isTargetMatch = matchesPath(normalizedPath, key, targetFieldRule || fieldLeafName);
 
       if (isTargetMatch && fullPath !== excludePath && typeof val === 'string' && val.trim()) {
         const valNorm = val.toLowerCase().trim();
@@ -119,6 +199,7 @@ export default function ScopedQuotaSelectInput({
 
   // Extract the leaf property name (e.g., 'titleStyle' from 'blocks.0.titleStyle')
   const fieldLeafName = name.split('.').pop() || name;
+  const normalizedFieldPath = name.replace(/\.\d+/g, '');
 
   // Active UI-configured rule state
   const [activeUiRule, setActiveUiRule] = React.useState<any>(null);
@@ -128,19 +209,9 @@ export default function ScopedQuotaSelectInput({
     get('/bulk-updater/validation-rules')
       .then((res: any) => {
         if (isMounted && res.data && res.data.success && Array.isArray(res.data.rules)) {
-          const leafLower = fieldLeafName.toLowerCase().trim();
-          const nameLower = name.toLowerCase().trim();
-
           const matching = res.data.rules.find((r: any) => {
             if (!r.enabled || !r.targetField) return false;
-            const targetLower = r.targetField.toLowerCase().trim();
-            return (
-              targetLower === leafLower ||
-              targetLower === nameLower ||
-              targetLower.endsWith(`.${leafLower}`) ||
-              targetLower.split('.').pop() === leafLower ||
-              nameLower.endsWith(`.${targetLower}`)
-            );
+            return matchesPath(normalizedFieldPath, fieldLeafName, r.targetField);
           });
 
           if (matching) {
@@ -154,7 +225,7 @@ export default function ScopedQuotaSelectInput({
     return () => {
       isMounted = false;
     };
-  }, [fieldLeafName, name]);
+  }, [fieldLeafName, normalizedFieldPath]);
 
   const optionsConfig = attribute?.options || {};
 
@@ -200,7 +271,13 @@ export default function ScopedQuotaSelectInput({
 
   // Compute other components' usage across the entire entry (and rich text HTML if rule enabled)
   const otherUsage = React.useMemo(() => {
-    return computeCrossComponentUsage(formValues, fieldLeafName, name, Boolean(activeUiRule?.includeRichTextHtml));
+    return computeCrossComponentUsage(
+      formValues,
+      activeUiRule?.targetField || fieldLeafName,
+      fieldLeafName,
+      name,
+      Boolean(activeUiRule?.includeRichTextHtml)
+    );
   }, [formValues, fieldLeafName, name, activeUiRule]);
 
   // Compute processed options: evaluate quotas and apply disable or hide rules

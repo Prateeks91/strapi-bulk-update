@@ -77,7 +77,9 @@ export function buildDeepPopulate(
         populate[key] = true;
       }
     } else if (def.type === 'dynamiczone') {
-      populate[key] = true;
+      populate[key] = {
+        populate: '*',
+      };
     } else if (def.type === 'relation' || def.type === 'media') {
       populate[key] = true;
     }
@@ -109,11 +111,30 @@ export function discoverComponentAttributes(
 
   for (const [subKey, subAttr] of Object.entries(compSchema.attributes) as any[]) {
     if (systemFields.includes(subKey)) continue;
-    if (subAttr.type === 'dynamiczone') continue;
     const fullPath = prefix ? `${prefix}.${subKey}` : subKey;
 
+    if (subAttr.type === 'dynamiczone') {
+      const dzComps = Array.isArray(subAttr.components) ? subAttr.components : [];
+      for (const dzCompUid of dzComps) {
+        const deeper = discoverComponentAttributes(
+          strapi,
+          dzCompUid,
+          fullPath,
+          currentDepth + 1,
+          maxDepth,
+          systemFields,
+          allContentTypes,
+          relationsByAttr,
+          allRelationsMeta,
+          attributesMeta
+        );
+        discoveredAttrs.push(...deeper);
+      }
+      continue;
+    }
+
     if (subAttr.type === 'component') {
-      if (!subAttr.repeatable && subAttr.component) {
+      if (subAttr.component) {
         const deeper = discoverComponentAttributes(
           strapi,
           subAttr.component,
@@ -160,16 +181,35 @@ export function discoverComponentAttributes(
 export function isDeepComponentField(contentType: any, allComponents: Record<string, any>, attribute: string): boolean {
   if (!attribute || !attribute.includes('.')) return false;
   const parts = attribute.split('.');
-  let currentSchema = contentType;
-  for (let i = 0; i < parts.length - 1; i++) {
-    const part = parts[i];
-    const attrDef = currentSchema?.attributes?.[part];
-    if (!attrDef || attrDef.type !== 'component' || !attrDef.component) return false;
-    currentSchema = allComponents[attrDef.component];
-    if (!currentSchema) return false;
+
+  function checkPath(currentSchema: any, pathParts: string[]): boolean {
+    if (pathParts.length === 0) return true;
+    if (!currentSchema || !currentSchema.attributes) return false;
+    const [head, ...tail] = pathParts;
+    const attrDef = currentSchema.attributes[head];
+    if (!attrDef) return false;
+
+    if (tail.length === 0) {
+      return true;
+    }
+
+    if (attrDef.type === 'component' && attrDef.component) {
+      const comp = allComponents[attrDef.component];
+      return checkPath(comp, tail);
+    }
+
+    if (attrDef.type === 'dynamiczone') {
+      const compUids = Array.isArray(attrDef.components) ? attrDef.components : [];
+      return compUids.some((compUid: string) => {
+        const comp = allComponents[compUid];
+        return checkPath(comp, tail);
+      });
+    }
+
+    return false;
   }
-  const leafField = parts[parts.length - 1];
-  return Boolean(currentSchema?.attributes?.[leafField]);
+
+  return checkPath(contentType, parts);
 }
 
 /**
@@ -179,39 +219,110 @@ export function getLeafAttributeSchema(contentType: any, allComponents: Record<s
   if (!attribute) return null;
   if (!attribute.includes('.')) return contentType?.attributes?.[attribute] || null;
   const parts = attribute.split('.');
-  let currentSchema = contentType;
-  for (let i = 0; i < parts.length - 1; i++) {
-    const part = parts[i];
-    const attrDef = currentSchema?.attributes?.[part];
-    if (!attrDef || attrDef.type !== 'component' || !attrDef.component) return null;
-    currentSchema = allComponents[attrDef.component];
-    if (!currentSchema) return null;
+
+  function resolveLeaf(currentSchema: any, pathParts: string[]): any {
+    if (!currentSchema || !currentSchema.attributes) return null;
+    const [head, ...tail] = pathParts;
+    const attrDef = currentSchema.attributes[head];
+    if (!attrDef) return null;
+
+    if (tail.length === 0) {
+      return attrDef;
+    }
+
+    if (attrDef.type === 'component' && attrDef.component) {
+      return resolveLeaf(allComponents[attrDef.component], tail);
+    }
+
+    if (attrDef.type === 'dynamiczone') {
+      const compUids = Array.isArray(attrDef.components) ? attrDef.components : [];
+      for (const compUid of compUids) {
+        const found = resolveLeaf(allComponents[compUid], tail);
+        if (found) return found;
+      }
+    }
+
+    return null;
   }
-  return currentSchema?.attributes?.[parts[parts.length - 1]] || null;
+
+  return resolveLeaf(contentType, parts);
 }
 
 /**
- * Immutably sets a nested property at an arbitrary depth while preserving all sibling properties
+ * Immutably sets a nested property at an arbitrary depth while preserving all sibling properties.
+ * Fully supports nested dynamic zones (arrays of components) and repeatable components.
  */
 export function setDeepProperty(obj: any, pathParts: string[], value: any): any {
   if (pathParts.length === 0) return value;
-  const current = { ...(obj || {}) };
   const [head, ...tail] = pathParts;
+
+  // Case 1: If current obj is an Array (e.g. Dynamic Zone or Repeatable Component)
+  if (Array.isArray(obj)) {
+    // If head is a numeric index, update only that specific index
+    if (/^\d+$/.test(head)) {
+      const idx = parseInt(head, 10);
+      const copy = [...obj];
+      copy[idx] = setDeepProperty(copy[idx] || {}, tail, value);
+      return copy;
+    }
+
+    // Otherwise, head is a property name inside the array items!
+    // Update every item in the array that has (or can accept) this property
+    return obj.map((item) => {
+      if (!item || typeof item !== 'object') return item;
+      if (head in item || (tail.length > 0 && typeof item[head] === 'object')) {
+        return {
+          ...item,
+          [head]: setDeepProperty(item[head], tail, value),
+        };
+      }
+      return item;
+    });
+  }
+
+  // Case 2: obj is an Object
+  const current = { ...(obj || {}) };
   if (tail.length === 0) {
     current[head] = value;
   } else {
-    current[head] = setDeepProperty(current[head] || {}, tail, value);
+    const subTarget = current[head];
+    if (Array.isArray(subTarget)) {
+      current[head] = setDeepProperty(subTarget, tail, value);
+    } else {
+      current[head] = setDeepProperty(subTarget || {}, tail, value);
+    }
   }
   return current;
 }
 
 /**
- * Safely resolves a nested dot-notation property (e.g. "a.b.c.d")
+ * Safely resolves a nested dot-notation property (e.g. "a.b.c.d") across objects and dynamic zone arrays
  */
 export function getDeepProperty(obj: any, path: string): any {
   if (!obj || !path) return undefined;
-  if (!path.includes('.')) return obj[path];
-  return path.split('.').reduce((acc, part) => (acc && typeof acc === 'object' ? acc[part] : undefined), obj);
+  const parts = path.split('.');
+
+  function extract(current: any, remainingParts: string[]): any {
+    if (current === undefined || current === null) return undefined;
+    if (remainingParts.length === 0) return current;
+
+    const [head, ...tail] = remainingParts;
+
+    if (Array.isArray(current)) {
+      if (/^\d+$/.test(head)) {
+        return extract(current[parseInt(head, 10)], tail);
+      }
+      for (const item of current) {
+        const found = extract(item?.[head], tail);
+        if (found !== undefined && found !== null) return found;
+      }
+      return undefined;
+    }
+
+    return extract(current[head], tail);
+  }
+
+  return extract(obj, parts);
 }
 
 /**
@@ -588,7 +699,8 @@ async function executeBatchInternal(
               findOneArgs.populate = populateOption;
             }
             const currentEntryWithPopulate: any = await strapi.documents(target.uid as any).findOne(findOneArgs);
-            const existingRoot = currentEntryWithPopulate?.[rootKey] || {};
+            const isRootDz = contentType?.attributes?.[rootKey]?.type === 'dynamiczone';
+            const existingRoot = currentEntryWithPopulate?.[rootKey] || (isRootDz ? [] : {});
             const currentVal = getDeepProperty(existingRoot, parts.slice(1).join('.'));
 
             let newValue = value;
@@ -1193,12 +1305,31 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
           const validAttrs = Object.keys(rawAttrs).filter((attrKey) => {
             if (systemFields.includes(attrKey)) return false;
-            if (rawAttrs[attrKey].type === 'dynamiczone') return false;
+
+            if (rawAttrs[attrKey].type === 'dynamiczone') {
+              const dzDef = rawAttrs[attrKey];
+              const dzComponents = Array.isArray(dzDef.components) ? dzDef.components : [];
+              for (const compUid of dzComponents) {
+                const compAttrs = discoverComponentAttributes(
+                  strapi,
+                  compUid,
+                  attrKey,
+                  1,
+                  5,
+                  systemFields,
+                  allContentTypes,
+                  relationsByAttr,
+                  allRelationsMeta,
+                  colAttributesMeta
+                );
+                nestedComponentAttrs.push(...compAttrs);
+              }
+              return false;
+            }
 
             if (rawAttrs[attrKey].type === 'component') {
               const compDef = rawAttrs[attrKey];
-              // Support non-repeatable components recursively up to depth 5
-              if (!compDef.repeatable && compDef.component) {
+              if (compDef.component) {
                 const compAttrs = discoverComponentAttributes(
                   strapi,
                   compDef.component,

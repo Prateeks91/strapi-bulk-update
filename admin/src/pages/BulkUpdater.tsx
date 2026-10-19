@@ -151,12 +151,34 @@ export interface ColumnDef {
 }
 
 /**
- * Safely resolves a nested dot-notation property (e.g. "defaultSeo.metaDescription")
+ * Safely resolves a nested dot-notation property (e.g. "defaultSeo.metaDescription" or "content.titleHeadingStyle.titleStyle")
+ * across both objects and dynamic zone / repeatable component arrays.
  */
 export function getNestedValue(obj: any, path: string): any {
   if (!obj || !path) return undefined;
-  if (!path.includes('.')) return obj[path];
-  return path.split('.').reduce((acc, part) => (acc && typeof acc === 'object' ? acc[part] : undefined), obj);
+  const parts = path.split('.');
+
+  function extract(current: any, remainingParts: string[]): any {
+    if (current === undefined || current === null) return undefined;
+    if (remainingParts.length === 0) return current;
+
+    const [head, ...tail] = remainingParts;
+
+    if (Array.isArray(current)) {
+      if (/^\d+$/.test(head)) {
+        return extract(current[parseInt(head, 10)], tail);
+      }
+      for (const item of current) {
+        const found = extract(item?.[head], tail);
+        if (found !== undefined && found !== null) return found;
+      }
+      return undefined;
+    }
+
+    return extract(current[head], tail);
+  }
+
+  return extract(obj, parts);
 }
 
 /**

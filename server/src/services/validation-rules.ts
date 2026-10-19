@@ -82,12 +82,19 @@ export function extractHeadingsFromRichText(content: any): Record<string, number
   return counts;
 }
 
-function cleanKey(str: string): string {
+export function cleanKey(str: string): string {
   return (str || '').replace(/[-_]/g, '').toLowerCase().trim();
 }
 
 /**
- * Matches a current property path against a rule targetField (supports dot paths, leaf keys, and dynamic zone component names)
+ * Matches a current property path against a rule targetField.
+ * Supports:
+ * - Leaf keys (e.g. 'titleStyle')
+ * - Component dot paths (e.g. 'titleHeadingStyle.titleStyle')
+ * - Dynamic zone paths (e.g. 'content.titleHeadingStyle.titleStyle')
+ * - Collection-prefixed paths (e.g. 'st-featured.titleHeadingStyle.titleStyle' or 'api::st-featured.st-featured.titleHeadingStyle.titleStyle')
+ * - Wildcards (e.g. 'content.*.titleHeadingStyle.titleStyle')
+ * - Sequence matching through intermediate components or dynamic zones
  */
 export function matchesPath(normalizedPath: string, leafKey: string, targetField: string): boolean {
   if (!targetField) return false;
@@ -95,22 +102,86 @@ export function matchesPath(normalizedPath: string, leafKey: string, targetField
   const kClean = cleanKey(leafKey);
   const tClean = cleanKey(targetField);
 
-  // If targetField has no dots, match either leafKey or end of path
-  if (!tClean.includes('.')) {
-    return (
-      kClean === tClean ||
-      pClean === tClean ||
-      pClean.endsWith(`.${tClean}`)
-    );
+  // Exact or leaf match
+  if (kClean === tClean || pClean === tClean) return true;
+
+  // Split into dot-segments
+  const targetSegments = targetField
+    .replace(/^api::/i, '')
+    .split('.')
+    .map(cleanKey)
+    .filter(Boolean);
+
+  const pathSegments = normalizedPath
+    .split('.')
+    .map(cleanKey)
+    .filter(Boolean);
+
+  if (targetSegments.length === 0 || pathSegments.length === 0) return false;
+
+  // 1. Single-segment targetField: matches leafKey or the final path segment
+  if (targetSegments.length === 1) {
+    const single = targetSegments[0];
+    return kClean === single || pathSegments[pathSegments.length - 1] === single;
   }
 
-  // If targetField has dots (e.g., 'titleHeadingStyle.titleStyle', 'content.titleHeadingStyle.titleStyle', or 'st-featured.titleHeadingStyle.titleStyle')
-  return (
-    pClean === tClean ||
-    pClean.endsWith(`.${tClean}`) ||
-    pClean.endsWith(tClean) ||
-    pClean.includes(`.${tClean}`)
-  );
+  // 2. Direct suffix match (e.g. path 'content.titleHeadingStyle.titleStyle' ends with 'titleHeadingStyle.titleStyle')
+  let isSuffix = true;
+  for (let i = 0; i < targetSegments.length; i++) {
+    const tSeg = targetSegments[targetSegments.length - 1 - i];
+    const pSeg = pathSegments[pathSegments.length - 1 - i];
+    if (tSeg !== '*' && tSeg !== pSeg) {
+      isSuffix = false;
+      break;
+    }
+  }
+  if (isSuffix) return true;
+
+  // 3. Collection prefix stripping: if targetField starts with collection name (e.g. 'st-featured.titleHeadingStyle.titleStyle')
+  // Check if targetSegments without the first (or first two) elements matches suffix
+  for (let startIdx = 1; startIdx < targetSegments.length; startIdx++) {
+    const subTarget = targetSegments.slice(startIdx);
+    if (subTarget.length > pathSegments.length) continue;
+    let subSuffix = true;
+    for (let i = 0; i < subTarget.length; i++) {
+      const tSeg = subTarget[subTarget.length - 1 - i];
+      const pSeg = pathSegments[pathSegments.length - 1 - i];
+      if (tSeg !== '*' && tSeg !== pSeg) {
+        subSuffix = false;
+        break;
+      }
+    }
+    if (subSuffix) return true;
+  }
+
+  // 4. In-order sequence match: all target segments appear in relative order along pathSegments
+  // e.g. target ['content', 'titleheadingstyle', 'titlestyle'] matches ['content', 'zones', 'herobanner', 'titleheadingstyle', 'titlestyle']
+  let pIdx = 0;
+  let matchesInOrder = true;
+  let tStart = 0;
+  // If first target segment looks like collection name and doesn't match first path segment, skip it
+  if (targetSegments.length > 2 && targetSegments[0] !== pathSegments[0] && targetSegments[0] !== '*') {
+    tStart = 1;
+  }
+  for (let tIdx = tStart; tIdx < targetSegments.length; tIdx++) {
+    const tSeg = targetSegments[tIdx];
+    if (tSeg === '*') continue;
+    let found = false;
+    while (pIdx < pathSegments.length) {
+      if (pathSegments[pIdx] === tSeg) {
+        found = true;
+        pIdx++;
+        break;
+      }
+      pIdx++;
+    }
+    if (!found) {
+      matchesInOrder = false;
+      break;
+    }
+  }
+
+  return matchesInOrder;
 }
 
 export default ({ strapi }: { strapi: Core.Strapi }) => ({
@@ -262,6 +333,8 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         if (matchesPath(attrName, attrName, targetField) || matchesPath(`${compUid}.${attrName}`, attrName, targetField)) return true;
         if (attrDef.type === 'component' && attrDef.component) {
           if (componentHasField(attrDef.component, targetField)) return true;
+        } else if (attrDef.type === 'dynamiczone' && Array.isArray(attrDef.components)) {
+          if (attrDef.components.some((c: string) => componentHasField(c, targetField))) return true;
         }
       }
       return false;
@@ -281,7 +354,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         if (attrDef.type === 'component' && attrDef.component) {
           if (componentHasField(attrDef.component, targetField)) {
             hasField = true;
-            populateAttrs[attrKey] = true;
+            populateAttrs[attrKey] = { populate: '*' };
           }
         } else if (attrDef.type === 'dynamiczone' && Array.isArray(attrDef.components)) {
           const matchingComp = attrDef.components.some(
@@ -289,7 +362,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           );
           if (matchingComp) {
             hasField = true;
-            populateAttrs[attrKey] = true;
+            populateAttrs[attrKey] = { populate: '*' };
           }
         }
       }
@@ -299,7 +372,11 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
     const candidateUids = Object.keys(allContentTypes).filter((uid) => {
       if (!uid.startsWith('api::') || uid.includes('bulk-updater')) return false;
-      if (rule.collectionUid && rule.collectionUid !== '*' && rule.collectionUid !== uid) {
+      if (rule.collectionUid && rule.collectionUid !== '*') {
+        if (rule.collectionUid === uid) return true;
+        const cleanRuleCol = cleanKey(rule.collectionUid);
+        const cleanUid = cleanKey(uid);
+        if (cleanUid.includes(cleanRuleCol) || cleanRuleCol.includes(cleanUid)) return true;
         return false;
       }
       return true;
@@ -311,8 +388,8 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       const ct = allContentTypes[uid];
       if (!ct) continue;
       const { hasField, populateAttrs } = schemaHasField(ct);
-      // If collectionUid is specifically targeted, include it even if populateAttrs needs to be '*'
-      if (hasField || (rule.collectionUid && rule.collectionUid === uid)) {
+      const isTargetCol = rule.collectionUid && (rule.collectionUid === uid || cleanKey(uid).includes(cleanKey(rule.collectionUid)));
+      if (hasField || isTargetCol) {
         relevantCollections.push({
           uid,
           displayName: ct.info?.displayName || uid,

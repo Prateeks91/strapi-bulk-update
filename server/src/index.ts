@@ -6,7 +6,7 @@ import validationRulesController from './controllers/validation-rules';
 import csvController from './controllers/csv';
 import bulkUpdaterService from './services/bulk-updater';
 import auditService from './services/audit';
-import validationRulesService, { extractHeadingsFromRichText, matchesPath } from './services/validation-rules';
+import validationRulesService, { extractHeadingsFromRichText, matchesPath, cleanKey } from './services/validation-rules';
 import csvService from './services/csv';
 import contentHistoryService, { recordContentHistoryVersion } from './services/content-history';
 
@@ -42,7 +42,7 @@ export default {
           }
 
           // 2. Discover attributes from schemas as fallback if not in UI rules
-          // Filter UI rules scoped to this collection type (or '*' for global)
+          // Filter UI rules scoped to this collection type (or '*' for global, with flexible UID / name matching)
           const effectiveRules: Array<{
             id: string;
             name: string;
@@ -53,7 +53,13 @@ export default {
             richTextFields?: string[];
           }> = [
             ...activeUiRules
-              .filter((r: any) => !r.collectionUid || r.collectionUid === '*' || r.collectionUid === context.uid)
+              .filter((r: any) => {
+                if (!r.collectionUid || r.collectionUid === '*') return true;
+                if (r.collectionUid === context.uid) return true;
+                const cleanRuleCol = cleanKey(r.collectionUid);
+                const cleanCtxCol = cleanKey(context.uid);
+                return cleanCtxCol.includes(cleanRuleCol) || cleanRuleCol.includes(cleanCtxCol);
+              })
               .map((r: any) => ({
                 id: r.id || r.targetField,
                 name: r.name || r.targetField,

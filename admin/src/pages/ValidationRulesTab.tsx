@@ -497,10 +497,10 @@ export default function ValidationRulesTab() {
 
               <TextInput
                 label="Target Field / Component Property Path"
-                placeholder="e.g. headingLevel, titleStyle, or st-featured.titleHeadingStyle.titleStyle"
+                placeholder="e.g. titleStyle, titleHeadingStyle.titleStyle, or content.titleHeadingStyle.titleStyle"
                 value={formField}
                 onChange={(e: any) => setFormField(e.target.value)}
-                hint="Attribute name or dot-notated hierarchy (e.g. 'titleStyle' or 'st-featured.titleHeadingStyle.titleStyle')."
+                hint="Matches leaf key ('titleStyle'), component path ('titleHeadingStyle.titleStyle'), dynamic zone path ('content.titleHeadingStyle.titleStyle'), or collection-prefixed path ('st-featured.titleHeadingStyle.titleStyle')."
                 required
               />
 
