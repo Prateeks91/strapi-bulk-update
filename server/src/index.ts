@@ -12,6 +12,19 @@ import contentHistoryService, { recordContentHistoryVersion } from './services/c
 
 import { errors } from '@strapi/utils';
 
+function createValidationError(ruleName: string, detailMsg: string, targetField: string) {
+  const fullMessage = `Validation Error (${ruleName}): ${detailMsg}`;
+  const ApplicationErrorClass: any = (errors as any)?.ApplicationError || Error;
+
+  const err = new ApplicationErrorClass(fullMessage);
+  err.name = 'ApplicationError';
+  err.status = 400;
+  (err as any).isQuotaViolation = true;
+  (err as any).targetField = targetField;
+  (err as any).details = {};
+  return err;
+}
+
 export default {
   register({ strapi }: { strapi: any }) {
     // Register the server definition for custom field plugin::bulk-updater.scoped-select
@@ -22,6 +35,35 @@ export default {
     });
   },
   bootstrap({ strapi }: { strapi: any }) {
+    // Intercept quota validation errors to return HTTP 400 ApplicationError so Strapi's admin UI displays specific danger banner
+    strapi.server.use(async (ctx: any, next: any) => {
+      try {
+        await next();
+      } catch (err: any) {
+        const isQuotaErr =
+          err?.isQuotaViolation ||
+          err?.name === 'ApplicationError' ||
+          err?.name === 'ValidationError' ||
+          (typeof err?.message === 'string' &&
+            (err.message.startsWith('Validation Error') || err.message.includes('cannot appear more than')));
+
+        if (isQuotaErr) {
+          ctx.status = 400;
+          ctx.body = {
+            data: null,
+            error: {
+              status: 400,
+              name: 'ApplicationError',
+              message: err.message,
+              details: {},
+            },
+          };
+          return;
+        }
+        throw err;
+      }
+    });
+
     // Register Document Service middleware to enforce cross-component quotas on the backend
     strapi.documents.use(async (context: any, next: any) => {
       const params = context.params as any;
@@ -204,7 +246,7 @@ export default {
                 } else {
                   detailMsg += ` Found ${totalFound} in structured field '${rule.targetField}'.`;
                 }
-                throw new errors.ApplicationError(`Validation Error (${rule.name}): ${detailMsg}`);
+                throw createValidationError(rule.name, detailMsg, rule.targetField);
               }
             }
           }
