@@ -193,6 +193,71 @@ export function extractDocId(row: Record<string, any>): string {
   return '';
 }
 
+export function extractLocale(row: Record<string, any>): string | undefined {
+  if (!row || typeof row !== 'object') return undefined;
+  const candidates = [row.locale, row.Locale, row['locale'], row['Locale']];
+  for (const c of candidates) {
+    if (c !== undefined && c !== null) {
+      const str = String(c).trim();
+      if (str && str.toLowerCase() !== 'null' && str.toLowerCase() !== 'undefined') {
+        return str;
+      }
+    }
+  }
+  return undefined;
+}
+
+export function extractDetailedErrorMessage(err: any): string {
+  if (!err) return 'Error processing row';
+
+  // 1. Check err.details?.errors or err.error?.details?.errors (Strapi / Yup standard format)
+  const detailsErrors = err.details?.errors || err.error?.details?.errors;
+  if (Array.isArray(detailsErrors) && detailsErrors.length > 0) {
+    const messages = detailsErrors
+      .map((e: any) => {
+        if (!e) return '';
+        const path = Array.isArray(e.path) ? e.path.join('.') : e.path;
+        const msg = e.message || (typeof e === 'string' ? e : JSON.stringify(e));
+        return path ? `${path}: ${msg}` : msg;
+      })
+      .filter(Boolean);
+    if (messages.length > 0) return messages.join('; ');
+  }
+
+  // 2. Check err.inner (Yup's nested ValidationError instances)
+  if (Array.isArray(err.inner) && err.inner.length > 0) {
+    const messages = err.inner
+      .map((e: any) => {
+        if (!e) return '';
+        const path = e.path;
+        const msg = e.message || (typeof e === 'string' ? e : JSON.stringify(e));
+        return path ? `${path}: ${msg}` : msg;
+      })
+      .filter(Boolean);
+    if (messages.length > 0) return messages.join('; ');
+  }
+
+  // 3. Check err.errors (Yup validation error string array)
+  if (Array.isArray(err.errors) && err.errors.length > 0) {
+    return err.errors.join('; ');
+  }
+
+  // 4. Check err.details if it is a string or object with message
+  if (typeof err.details === 'string' && err.details.trim()) {
+    return err.details;
+  }
+  if (err.details?.message) {
+    return err.details.message;
+  }
+
+  // 5. Check err.message if descriptive
+  if (err.message && err.message !== '[object Object]') {
+    return err.message;
+  }
+
+  return 'Error processing row';
+}
+
 /**
  * Field definition discovered for export
  */
@@ -723,12 +788,12 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     const userEmail = user?.email || 'admin@strapi.io';
     const userName = user ? `${user.firstname || ''} ${user.lastname || ''}`.trim() : 'CSV Importer';
 
-    const findExistingDocument = async (targetDocId: string): Promise<any> => {
+    const findExistingDocument = async (targetDocId: string, docLocale?: string): Promise<any> => {
       if (!targetDocId) return null;
       try {
-        const found = await (strapi.documents(uid as any) as any).findOne({
-          documentId: targetDocId,
-        });
+        const queryArgs: any = { documentId: targetDocId };
+        if (docLocale) queryArgs.locale = docLocale;
+        const found = await (strapi.documents(uid as any) as any).findOne(queryArgs);
         if (found) return found;
       } catch {
         // Strapi 5 throws NotFoundError if documentId does not exist
@@ -736,10 +801,12 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
       if (/^\d+$/.test(targetDocId)) {
         try {
-          const list = await (strapi.documents(uid as any) as any).findMany({
+          const queryArgs: any = {
             filters: { id: parseInt(targetDocId, 10) },
             limit: 1,
-          });
+          };
+          if (docLocale) queryArgs.locale = docLocale;
+          const list = await (strapi.documents(uid as any) as any).findMany(queryArgs);
           if (list && list.length > 0) return list[0];
         } catch {
           // Ignore
@@ -749,16 +816,46 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       return null;
     };
 
+    const SYSTEM_FIELD_KEYS = new Set([
+      'documentid',
+      'document_id',
+      'docid',
+      'id',
+      'createdat',
+      'updatedat',
+      'publishedat',
+      'createdby',
+      'updatedby',
+      'localizations',
+      'locale',
+      'status',
+    ]);
+
     for (let i = 0; i < parsedRows.length; i++) {
       const rowNumber = i + 2; // Row 1 is header
       const row = parsedRows[i];
 
-      const docId = extractDocId(row);
+      let docId = extractDocId(row);
+      const rowLocale = extractLocale(row);
+
+      // If singleType and no documentId provided in row, auto-detect existing single document
+      if (ct.kind === 'singleType' && !docId) {
+        try {
+          const findSingleArgs: any = {};
+          if (rowLocale) findSingleArgs.locale = rowLocale;
+          const singleDoc = await (strapi.documents(uid as any) as any).findFirst(findSingleArgs);
+          if (singleDoc?.documentId) {
+            docId = singleDoc.documentId;
+          }
+        } catch {}
+      }
+
       const payload: Record<string, any> = {};
 
       // Transform and cast row columns to schema field types
       for (const [key, rawVal] of Object.entries(row)) {
-        if (['documentId', 'document_id', 'Document ID', 'Document Id', 'docId', 'id', 'ID', 'Id'].includes(key)) continue;
+        const normalizedKey = key.toLowerCase().replace(/[\s_-]/g, '');
+        if (SYSTEM_FIELD_KEYS.has(normalizedKey)) continue;
 
         if (key.includes('.')) {
           const [parent, child] = key.split('.');
@@ -772,11 +869,19 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
               if (rawVal === '' || rawVal === null || rawVal === undefined) {
                 val = null;
               } else if (childDef.type === 'integer' || childDef.type === 'biginteger') {
-                val = parseInt(rawVal, 10);
+                const parsedInt = parseInt(rawVal, 10);
+                val = isNaN(parsedInt) ? null : parsedInt;
               } else if (childDef.type === 'float' || childDef.type === 'decimal') {
-                val = parseFloat(rawVal);
+                const parsedFloat = parseFloat(rawVal);
+                val = isNaN(parsedFloat) ? null : parsedFloat;
               } else if (childDef.type === 'boolean') {
                 val = rawVal.toLowerCase() === 'true' || rawVal === '1';
+              } else if (childDef.type === 'json') {
+                try {
+                  val = JSON.parse(rawVal);
+                } catch {
+                  val = rawVal;
+                }
               }
               payload[parent][child] = val;
             }
@@ -784,23 +889,38 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           continue;
         }
 
-        const attrDef = attrs[key];
+        let attrDef = attrs[key];
+        if (!attrDef) {
+          const matchKey = Object.keys(attrs).find(
+            (k) => k.toLowerCase() === key.toLowerCase() || k.toLowerCase() === key.toLowerCase().replace(/\s+/g, '')
+          );
+          if (matchKey) {
+            attrDef = attrs[matchKey];
+          }
+        }
         if (!attrDef) continue; // Skip unknown columns
 
         if (rawVal === '' || rawVal === null || rawVal === undefined) {
-          payload[key] = null;
+          // Do not overwrite dynamiczone or repeatable component with null unless explicitly desired
+          if (attrDef.type !== 'dynamiczone' && !(attrDef.type === 'component' && attrDef.repeatable)) {
+            payload[key] = null;
+          }
           continue;
         }
 
         switch (attrDef.type) {
           case 'integer':
-          case 'biginteger':
-            payload[key] = parseInt(rawVal, 10);
+          case 'biginteger': {
+            const parsedInt = parseInt(rawVal, 10);
+            payload[key] = isNaN(parsedInt) ? null : parsedInt;
             break;
+          }
           case 'float':
-          case 'decimal':
-            payload[key] = parseFloat(rawVal);
+          case 'decimal': {
+            const parsedFloat = parseFloat(rawVal);
+            payload[key] = isNaN(parsedFloat) ? null : parsedFloat;
             break;
+          }
           case 'boolean':
             payload[key] = rawVal.toLowerCase() === 'true' || rawVal === '1';
             break;
@@ -811,6 +931,75 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
               payload[key] = rawVal;
             }
             break;
+          case 'dynamiczone': {
+            // Dynamic zones in Strapi 5 must be an array of component objects with __component
+            try {
+              const parsed = JSON.parse(rawVal);
+              if (
+                Array.isArray(parsed) &&
+                parsed.every((item) => item && typeof item === 'object' && typeof item.__component === 'string')
+              ) {
+                payload[key] = parsed;
+              }
+            } catch {
+              // Summary text or unparseable format from export: omit to avoid schema validation errors
+            }
+            break;
+          }
+          case 'component': {
+            if (attrDef.repeatable) {
+              try {
+                const parsed = JSON.parse(rawVal);
+                if (Array.isArray(parsed) && parsed.every((item) => item && typeof item === 'object')) {
+                  payload[key] = parsed;
+                }
+              } catch {
+                // Summary text: omit to preserve existing repeatable components
+              }
+            } else {
+              try {
+                const parsed = JSON.parse(rawVal);
+                if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+                  payload[key] = parsed;
+                }
+              } catch {
+                // Summary text: omit
+              }
+            }
+            break;
+          }
+          case 'relation': {
+            try {
+              const parsed = JSON.parse(rawVal);
+              if (Array.isArray(parsed) || (typeof parsed === 'object' && parsed !== null)) {
+                payload[key] = parsed;
+                break;
+              }
+            } catch {}
+
+            if (isValidDocId(rawVal)) {
+              payload[key] = rawVal;
+            } else if (rawVal.includes(';') || rawVal.includes(',')) {
+              const parts = rawVal.split(/[;,]/).map((s) => s.trim()).filter(Boolean);
+              if (parts.length > 0 && parts.every((p) => isValidDocId(p))) {
+                payload[key] = parts;
+              }
+            }
+            break;
+          }
+          case 'media': {
+            if (/^\d+$/.test(rawVal.trim())) {
+              payload[key] = parseInt(rawVal.trim(), 10);
+            } else {
+              try {
+                const parsed = JSON.parse(rawVal);
+                if (typeof parsed === 'number' || typeof parsed === 'object') {
+                  payload[key] = parsed;
+                }
+              } catch {}
+            }
+            break;
+          }
           default:
             payload[key] = rawVal;
         }
@@ -827,7 +1016,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             continue;
           }
 
-          const existing = await findExistingDocument(docId);
+          const existing = await findExistingDocument(docId, rowLocale);
 
           if (!existing) {
             stats.skipped++;
@@ -847,14 +1036,35 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             }
           }
 
-          await (strapi.documents(uid as any) as any).update({
+          if (Object.keys(mergedPayload).length === 0) {
+            stats.skipped++;
+            stats.diffs.push({
+              uid,
+              collectionName: ct.info?.displayName || uid,
+              documentId: resolvedDocId,
+              label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
+              attribute: '',
+              oldValue: existing,
+              newValue: {},
+              status: 'skipped',
+              message: `Skipped (no editable attributes in row ${rowNumber})`,
+            });
+            continue;
+          }
+
+          const updateArgs: any = {
             documentId: resolvedDocId,
             data: mergedPayload,
-          });
+          };
+          if (rowLocale) updateArgs.locale = rowLocale;
+
+          await (strapi.documents(uid as any) as any).update(updateArgs);
 
           if (publish && ct.options?.draftAndPublish) {
             try {
-              await (strapi.documents(uid as any) as any).publish({ documentId: resolvedDocId });
+              const pubArgs: any = { documentId: resolvedDocId };
+              if (rowLocale) pubArgs.locale = rowLocale;
+              await (strapi.documents(uid as any) as any).publish(pubArgs);
             } catch (pubErr) {
               strapi.log.warn(`[bulk-updater] Auto-publish failed for ${resolvedDocId}:`, pubErr);
             }
@@ -884,7 +1094,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         } else if (mode === 'create_or_override') {
           let existing: any = null;
           if (docId) {
-            existing = await findExistingDocument(docId);
+            existing = await findExistingDocument(docId, rowLocale);
           }
 
           if (existing) {
@@ -896,14 +1106,19 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
               }
             }
 
-            await (strapi.documents(uid as any) as any).update({
+            const updateArgs: any = {
               documentId: resolvedDocId,
               data: mergedPayload,
-            });
+            };
+            if (rowLocale) updateArgs.locale = rowLocale;
+
+            await (strapi.documents(uid as any) as any).update(updateArgs);
 
             if (publish && ct.options?.draftAndPublish) {
               try {
-                await (strapi.documents(uid as any) as any).publish({ documentId: resolvedDocId });
+                const pubArgs: any = { documentId: resolvedDocId };
+                if (rowLocale) pubArgs.locale = rowLocale;
+                await (strapi.documents(uid as any) as any).publish(pubArgs);
               } catch (pubErr) {
                 strapi.log.warn(`[bulk-updater] Auto-publish failed for ${resolvedDocId}:`, pubErr);
               }
@@ -933,14 +1148,16 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             continue;
           }
 
-          const created: any = await strapi.documents(uid as any).create({
-            data: payload,
-          });
+          const createArgs: any = { data: payload };
+          if (rowLocale) createArgs.locale = rowLocale;
+          const created: any = await strapi.documents(uid as any).create(createArgs);
 
           const newDocId = created?.documentId || docId;
           if (publish && ct.options?.draftAndPublish && newDocId) {
             try {
-              await (strapi.documents(uid as any) as any).publish({ documentId: newDocId });
+              const pubArgs: any = { documentId: newDocId };
+              if (rowLocale) pubArgs.locale = rowLocale;
+              await (strapi.documents(uid as any) as any).publish(pubArgs);
             } catch (pubErr) {
               strapi.log.warn(`[bulk-updater] Auto-publish failed for ${newDocId}:`, pubErr);
             }
@@ -976,7 +1193,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           // Default: Smart Auto-Detect ('auto')
           let existing: any = null;
           if (docId) {
-            existing = await findExistingDocument(docId);
+            existing = await findExistingDocument(docId, rowLocale);
           }
 
           if (existing) {
@@ -988,14 +1205,19 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
               }
             }
 
-            await (strapi.documents(uid as any) as any).update({
+            const updateArgs: any = {
               documentId: resolvedDocId,
               data: mergedPayload,
-            });
+            };
+            if (rowLocale) updateArgs.locale = rowLocale;
+
+            await (strapi.documents(uid as any) as any).update(updateArgs);
 
             if (publish && ct.options?.draftAndPublish) {
               try {
-                await (strapi.documents(uid as any) as any).publish({ documentId: resolvedDocId });
+                const pubArgs: any = { documentId: resolvedDocId };
+                if (rowLocale) pubArgs.locale = rowLocale;
+                await (strapi.documents(uid as any) as any).publish(pubArgs);
               } catch (pubErr) {
                 strapi.log.warn(`[bulk-updater] Auto-publish failed for ${resolvedDocId}:`, pubErr);
               }
@@ -1026,14 +1248,16 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           }
 
           // Missing docId OR provided docId does not exist in DB -> create new
-          const created: any = await strapi.documents(uid as any).create({
-            data: payload,
-          });
+          const createArgs: any = { data: payload };
+          if (rowLocale) createArgs.locale = rowLocale;
+          const created: any = await strapi.documents(uid as any).create(createArgs);
 
           const newDocId = created?.documentId || docId;
           if (publish && ct.options?.draftAndPublish && newDocId) {
             try {
-              await (strapi.documents(uid as any) as any).publish({ documentId: newDocId });
+              const pubArgs: any = { documentId: newDocId };
+              if (rowLocale) pubArgs.locale = rowLocale;
+              await (strapi.documents(uid as any) as any).publish(pubArgs);
             } catch (pubErr) {
               strapi.log.warn(`[bulk-updater] Auto-publish failed for ${newDocId}:`, pubErr);
             }
@@ -1070,7 +1294,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         stats.errors.push({
           row: rowNumber,
           documentId: docId || undefined,
-          error: err.message || 'Error processing row',
+          error: extractDetailedErrorMessage(err),
         });
       }
     }

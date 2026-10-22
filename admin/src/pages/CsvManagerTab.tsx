@@ -547,14 +547,19 @@ export default function CsvManagerTab() {
                       Errors encountered ({importResult.stats.errors.length}):
                     </Typography>
                     <ul style={{ margin: '4px 0 0 16px', padding: 0 }}>
-                      {importResult.stats.errors.slice(0, 5).map((err: any, idx: number) => (
-                        <li key={idx}>
+                      {importResult.stats.errors.slice(0, 10).map((err: any, idx: number) => (
+                        <li key={idx} style={{ marginBottom: '2px' }}>
                           <Typography variant="pi" textColor="danger600">
                             Row {err.row}: {err.error}
                           </Typography>
                         </li>
                       ))}
                     </ul>
+                    {importResult.stats.errors.length > 10 && (
+                      <Typography variant="pi" textColor="neutral600" style={{ display: 'block', marginTop: 4, fontStyle: 'italic' }}>
+                        ...and {importResult.stats.errors.length - 10} more error{importResult.stats.errors.length - 10 > 1 ? 's' : ''}
+                      </Typography>
+                    )}
                   </Box>
                 )}
               </Alert>
