@@ -145,6 +145,54 @@ export function parseCsv(csvText: string): Array<Record<string, string>> {
   return records;
 }
 
+const LIFECYCLE_STATUS_WORDS = new Set([
+  'pending review',
+  'pending_review',
+  'pending approval',
+  'pending_approval',
+  'approved',
+  'rejected',
+  'draft',
+  'published',
+  'modified',
+  'supported',
+  'ignored',
+]);
+
+export function isValidDocId(val: any): boolean {
+  if (!val || typeof val !== 'string') return false;
+  const trimmed = val.trim();
+  if (!trimmed) return false;
+  if (LIFECYCLE_STATUS_WORDS.has(trimmed.toLowerCase())) return false;
+  if (/\s/.test(trimmed)) return false;
+  return /^[a-zA-Z0-9_-]+$/.test(trimmed);
+}
+
+export function extractDocId(row: Record<string, any>): string {
+  if (!row || typeof row !== 'object') return '';
+  const candidates = [
+    row.documentId,
+    row.document_id,
+    row['Document ID'],
+    row['Document Id'],
+    row['document_id'],
+    row.docId,
+    row['docId'],
+    row.id,
+    row.ID,
+    row.Id,
+  ];
+  for (const c of candidates) {
+    if (c !== undefined && c !== null) {
+      const str = String(c).trim();
+      if (isValidDocId(str)) {
+        return str;
+      }
+    }
+  }
+  return '';
+}
+
 /**
  * Field definition discovered for export
  */
@@ -675,16 +723,42 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     const userEmail = user?.email || 'admin@strapi.io';
     const userName = user ? `${user.firstname || ''} ${user.lastname || ''}`.trim() : 'CSV Importer';
 
+    const findExistingDocument = async (targetDocId: string): Promise<any> => {
+      if (!targetDocId) return null;
+      try {
+        const found = await (strapi.documents(uid as any) as any).findOne({
+          documentId: targetDocId,
+        });
+        if (found) return found;
+      } catch {
+        // Strapi 5 throws NotFoundError if documentId does not exist
+      }
+
+      if (/^\d+$/.test(targetDocId)) {
+        try {
+          const list = await (strapi.documents(uid as any) as any).findMany({
+            filters: { id: parseInt(targetDocId, 10) },
+            limit: 1,
+          });
+          if (list && list.length > 0) return list[0];
+        } catch {
+          // Ignore
+        }
+      }
+
+      return null;
+    };
+
     for (let i = 0; i < parsedRows.length; i++) {
       const rowNumber = i + 2; // Row 1 is header
       const row = parsedRows[i];
 
-      const docId = (row.documentId || row.id || '').trim();
+      const docId = extractDocId(row);
       const payload: Record<string, any> = {};
 
       // Transform and cast row columns to schema field types
       for (const [key, rawVal] of Object.entries(row)) {
-        if (key === 'documentId' || key === 'id') continue;
+        if (['documentId', 'document_id', 'Document ID', 'Document Id', 'docId', 'id', 'ID', 'Id'].includes(key)) continue;
 
         if (key.includes('.')) {
           const [parent, child] = key.split('.');
@@ -748,25 +822,24 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             stats.skipped++;
             stats.errors.push({
               row: rowNumber,
-              error: 'Missing documentId for Update mode. (Tip: Use Smart Auto-Detect mode to auto-add entries without document IDs).',
+              error: 'Missing or invalid documentId for Update mode. (Tip: Use Smart Auto-Detect mode to auto-add entries without document IDs).',
             });
             continue;
           }
 
-          const existing = await strapi.documents(uid as any).findOne({
-            documentId: docId,
-          });
+          const existing = await findExistingDocument(docId);
 
           if (!existing) {
             stats.skipped++;
             stats.errors.push({
               row: rowNumber,
               documentId: docId,
-              error: `Document with documentId "${docId}" not found.`,
+              error: `Document with ID "${docId}" not found in database.`,
             });
             continue;
           }
 
+          const resolvedDocId = existing.documentId || docId;
           const mergedPayload = { ...payload };
           for (const key of Object.keys(payload)) {
             if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
@@ -774,23 +847,23 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             }
           }
 
-          await strapi.documents(uid as any).update({
-            documentId: docId,
+          await (strapi.documents(uid as any) as any).update({
+            documentId: resolvedDocId,
             data: mergedPayload,
           });
 
           if (publish && ct.options?.draftAndPublish) {
             try {
-              await (strapi.documents(uid as any) as any).publish({ documentId: docId });
+              await (strapi.documents(uid as any) as any).publish({ documentId: resolvedDocId });
             } catch (pubErr) {
-              strapi.log.warn(`[bulk-updater] Auto-publish failed for ${docId}:`, pubErr);
+              strapi.log.warn(`[bulk-updater] Auto-publish failed for ${resolvedDocId}:`, pubErr);
             }
           }
 
           try {
             await recordContentHistoryVersion(strapi, {
               uid,
-              documentId: docId,
+              documentId: resolvedDocId,
               userId: user?.id,
               statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
             });
@@ -800,8 +873,8 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           stats.diffs.push({
             uid,
             collectionName: ct.info?.displayName || uid,
-            documentId: docId,
-            label: (existing as any).title || (existing as any).name || `Entry #${docId}`,
+            documentId: resolvedDocId,
+            label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
             attribute: Object.keys(payload).join(', '),
             oldValue: existing,
             newValue: payload,
@@ -809,55 +882,55 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             message: `Updated via CSV import (row ${rowNumber})`,
           });
         } else if (mode === 'create_or_override') {
+          let existing: any = null;
           if (docId) {
-            const existing = await strapi.documents(uid as any).findOne({
-              documentId: docId,
+            existing = await findExistingDocument(docId);
+          }
+
+          if (existing) {
+            const resolvedDocId = existing.documentId || docId;
+            const mergedPayload = { ...payload };
+            for (const key of Object.keys(payload)) {
+              if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
+                mergedPayload[key] = { ...((existing as any)[key] || {}), ...payload[key] };
+              }
+            }
+
+            await (strapi.documents(uid as any) as any).update({
+              documentId: resolvedDocId,
+              data: mergedPayload,
             });
 
-            if (existing) {
-              const mergedPayload = { ...payload };
-              for (const key of Object.keys(payload)) {
-                if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
-                  mergedPayload[key] = { ...((existing as any)[key] || {}), ...payload[key] };
-                }
-              }
-
-              await strapi.documents(uid as any).update({
-                documentId: docId,
-                data: mergedPayload,
-              });
-
-              if (publish && ct.options?.draftAndPublish) {
-                try {
-                  await (strapi.documents(uid as any) as any).publish({ documentId: docId });
-                } catch (pubErr) {
-                  strapi.log.warn(`[bulk-updater] Auto-publish failed for ${docId}:`, pubErr);
-                }
-              }
-
+            if (publish && ct.options?.draftAndPublish) {
               try {
-                await recordContentHistoryVersion(strapi, {
-                  uid,
-                  documentId: docId,
-                  userId: user?.id,
-                  statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
-                });
-              } catch {}
-
-              stats.updated++;
-              stats.diffs.push({
-                uid,
-                collectionName: ct.info?.displayName || uid,
-                documentId: docId,
-                label: (existing as any).title || (existing as any).name || `Entry #${docId}`,
-                attribute: Object.keys(payload).join(', '),
-                oldValue: existing,
-                newValue: payload,
-                status: 'updated',
-                message: `Overridden via CSV import (row ${rowNumber})`,
-              });
-              continue;
+                await (strapi.documents(uid as any) as any).publish({ documentId: resolvedDocId });
+              } catch (pubErr) {
+                strapi.log.warn(`[bulk-updater] Auto-publish failed for ${resolvedDocId}:`, pubErr);
+              }
             }
+
+            try {
+              await recordContentHistoryVersion(strapi, {
+                uid,
+                documentId: resolvedDocId,
+                userId: user?.id,
+                statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
+              });
+            } catch {}
+
+            stats.updated++;
+            stats.diffs.push({
+              uid,
+              collectionName: ct.info?.displayName || uid,
+              documentId: resolvedDocId,
+              label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
+              attribute: Object.keys(payload).join(', '),
+              oldValue: existing,
+              newValue: payload,
+              status: 'updated',
+              message: `Overridden via CSV import (row ${rowNumber})`,
+            });
+            continue;
           }
 
           const created: any = await strapi.documents(uid as any).create({
@@ -901,55 +974,55 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           });
         } else {
           // Default: Smart Auto-Detect ('auto')
+          let existing: any = null;
           if (docId) {
-            const existing = await strapi.documents(uid as any).findOne({
-              documentId: docId,
+            existing = await findExistingDocument(docId);
+          }
+
+          if (existing) {
+            const resolvedDocId = existing.documentId || docId;
+            const mergedPayload = { ...payload };
+            for (const key of Object.keys(payload)) {
+              if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
+                mergedPayload[key] = { ...((existing as any)[key] || {}), ...payload[key] };
+              }
+            }
+
+            await (strapi.documents(uid as any) as any).update({
+              documentId: resolvedDocId,
+              data: mergedPayload,
             });
 
-            if (existing) {
-              const mergedPayload = { ...payload };
-              for (const key of Object.keys(payload)) {
-                if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
-                  mergedPayload[key] = { ...((existing as any)[key] || {}), ...payload[key] };
-                }
-              }
-
-              await strapi.documents(uid as any).update({
-                documentId: docId,
-                data: mergedPayload,
-              });
-
-              if (publish && ct.options?.draftAndPublish) {
-                try {
-                  await (strapi.documents(uid as any) as any).publish({ documentId: docId });
-                } catch (pubErr) {
-                  strapi.log.warn(`[bulk-updater] Auto-publish failed for ${docId}:`, pubErr);
-                }
-              }
-
+            if (publish && ct.options?.draftAndPublish) {
               try {
-                await recordContentHistoryVersion(strapi, {
-                  uid,
-                  documentId: docId,
-                  userId: user?.id,
-                  statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
-                });
-              } catch {}
-
-              stats.updated++;
-              stats.diffs.push({
-                uid,
-                collectionName: ct.info?.displayName || uid,
-                documentId: docId,
-                label: (existing as any).title || (existing as any).name || `Entry #${docId}`,
-                attribute: Object.keys(payload).join(', '),
-                oldValue: existing,
-                newValue: payload,
-                status: 'updated',
-                message: `Updated existing entry via smart match (row ${rowNumber})`,
-              });
-              continue;
+                await (strapi.documents(uid as any) as any).publish({ documentId: resolvedDocId });
+              } catch (pubErr) {
+                strapi.log.warn(`[bulk-updater] Auto-publish failed for ${resolvedDocId}:`, pubErr);
+              }
             }
+
+            try {
+              await recordContentHistoryVersion(strapi, {
+                uid,
+                documentId: resolvedDocId,
+                userId: user?.id,
+                statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
+              });
+            } catch {}
+
+            stats.updated++;
+            stats.diffs.push({
+              uid,
+              collectionName: ct.info?.displayName || uid,
+              documentId: resolvedDocId,
+              label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
+              attribute: Object.keys(payload).join(', '),
+              oldValue: existing,
+              newValue: payload,
+              status: 'updated',
+              message: `Updated existing entry via smart match (row ${rowNumber})`,
+            });
+            continue;
           }
 
           // Missing docId OR provided docId does not exist in DB -> create new

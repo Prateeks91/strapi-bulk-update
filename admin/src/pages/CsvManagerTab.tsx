@@ -18,7 +18,8 @@ import {
   Checkbox,
 } from '@strapi/design-system';
 import { Download, Upload, ArrowClockwise, Check } from '@strapi/icons';
-import { parseCsv } from '../utils/csvParser';
+import { parseCsv, extractDocId } from '../utils/csvParser';
+import { isAbortError } from '../utils/isAbortError';
 
 interface CollectionModel {
   uid: string;
@@ -78,6 +79,7 @@ export default function CsvManagerTab() {
         }
       }
     } catch (err: any) {
+      if (isAbortError(err)) return;
       toggleNotification({
         type: 'danger',
         message: err.message || 'Failed loading collections for CSV Manager',
@@ -99,6 +101,7 @@ export default function CsvManagerTab() {
         message: 'CSV Template downloaded successfully',
       });
     } catch (err: any) {
+      if (isAbortError(err)) return;
       toggleNotification({
         type: 'danger',
         message: err.message || 'Failed downloading CSV template',
@@ -118,6 +121,7 @@ export default function CsvManagerTab() {
         message: 'Collection exported to CSV successfully',
       });
     } catch (err: any) {
+      if (isAbortError(err)) return;
       toggleNotification({
         type: 'danger',
         message: err.message || 'Failed exporting collection to CSV',
@@ -137,6 +141,7 @@ export default function CsvManagerTab() {
         message: 'Rule violations exported to CSV successfully',
       });
     } catch (err: any) {
+      if (isAbortError(err)) return;
       toggleNotification({
         type: 'danger',
         message: err.message || 'Failed exporting violations to CSV',
@@ -216,6 +221,7 @@ export default function CsvManagerTab() {
         throw new Error(res.data?.error || 'Import failed');
       }
     } catch (err: any) {
+      if (isAbortError(err)) return;
       toggleNotification({
         type: 'danger',
         message: err.message || 'Error processing CSV import',
@@ -398,7 +404,7 @@ export default function CsvManagerTab() {
           {/* Parsed Preview Table */}
           {parsedPreview.length > 0 && (() => {
             const missingDocIdCount = parsedPreview.filter(
-              (row) => !(row.documentId || row.id || '').trim()
+              (row) => !extractDocId(row)
             ).length;
             const headers = Object.keys(parsedPreview[0]);
 
@@ -451,7 +457,7 @@ export default function CsvManagerTab() {
                     </Thead>
                     <Tbody>
                       {parsedPreview.map((row, rIdx) => {
-                        const hasDocId = !!(row.documentId || row.id || '').trim();
+                        const hasDocId = !!extractDocId(row);
                         return (
                           <Tr key={rIdx}>
                             <Td>

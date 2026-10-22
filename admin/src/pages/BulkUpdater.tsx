@@ -27,6 +27,7 @@ import ValidationRulesTab from './ValidationRulesTab';
 import CsvManagerTab from './CsvManagerTab';
 import ProcessingDashboardModal from '../components/ProcessingDashboardModal';
 import BulkUpdatePreviewModal from '../components/BulkUpdatePreviewModal';
+import { isAbortError } from '../utils/isAbortError';
 
 interface Entry {
   id: number | string;
@@ -235,17 +236,19 @@ export function getAvailableColumnsForCollection(
     });
   }
 
-  // Target attribute column
-  const targetLabel = searchAttribute && searchAttribute !== selectedAttribute
-    ? `Update Target: "${selectedAttribute}"`
-    : `Current "${selectedAttribute}"`;
+  // Target attribute column (only if an update attribute has been selected)
+  if (selectedAttribute && selectedAttribute.trim()) {
+    const targetLabel = searchAttribute && searchAttribute !== selectedAttribute
+      ? `Update Target: "${selectedAttribute}"`
+      : `Current "${selectedAttribute}"`;
 
-  cols.push({
-    key: 'target_attr',
-    label: targetLabel,
-    sortable: !col.isSingleType && col.attributes.includes(selectedAttribute),
-    defaultVisible: true,
-  });
+    cols.push({
+      key: 'target_attr',
+      label: targetLabel,
+      sortable: !col.isSingleType && col.attributes.includes(selectedAttribute),
+      defaultVisible: true,
+    });
+  }
 
   // Status column
   cols.push({
@@ -342,6 +345,85 @@ export function formatDisplayValue(val: any): string {
 }
 
 /**
+ * Flat helper: Determines the real lifecycle status of an entry (Pending Review, Modified, Published, Draft).
+ */
+export function getEntryLifecycleStatus(
+  entry: Entry,
+  col: CollectionModel | null,
+  pendingBatches: PendingBatch[] = []
+): { status: 'pending_review' | 'modified' | 'published' | 'draft'; label: string; badgeColor: string; textColor: string } {
+  // 1. Check if this entry is pending review in any pending_approval batch
+  const isPendingApproval = pendingBatches.some((b) => {
+    if (b.status !== 'pending_approval') return false;
+    const targets = b.payload?.selectedEntries || [];
+    return targets.some((t) => t.documentId === entry.documentId || String(t.documentId) === String(entry.id));
+  });
+
+  if (isPendingApproval) {
+    return {
+      status: 'pending_review',
+      label: 'Pending Review',
+      badgeColor: 'warning100',
+      textColor: 'warning700',
+    };
+  }
+
+  // 2. Check Strapi 5 document status
+  if (entry.status === 'modified') {
+    return {
+      status: 'modified',
+      label: 'Modified',
+      badgeColor: 'primary100',
+      textColor: 'primary700',
+    };
+  }
+
+  if (entry.status === 'draft') {
+    return {
+      status: 'draft',
+      label: 'Draft',
+      badgeColor: 'neutral150',
+      textColor: 'neutral700',
+    };
+  }
+
+  if (entry.status === 'published') {
+    return {
+      status: 'published',
+      label: 'Published',
+      badgeColor: 'success100',
+      textColor: 'success700',
+    };
+  }
+
+  // 3. Fallback: check publishedAt
+  if (col && col.draftAndPublish === false) {
+    return {
+      status: 'published',
+      label: 'Published',
+      badgeColor: 'success100',
+      textColor: 'success700',
+    };
+  }
+
+  if (entry.publishedAt) {
+    return {
+      status: 'published',
+      label: 'Published',
+      badgeColor: 'success100',
+      textColor: 'success700',
+    };
+  }
+
+  return {
+    status: 'draft',
+    label: 'Draft',
+    badgeColor: 'neutral150',
+    textColor: 'neutral700',
+  };
+}
+
+/**
  * Flat helper: Renders a single cell content using clean early returns.
  * Zero deep nesting.
  */
@@ -354,7 +436,8 @@ function renderCellContent(
   isMatch: boolean,
   hasAttr: boolean,
   isSelected: boolean,
-  onToggleSelect: () => void
+  onToggleSelect: () => void,
+  pendingBatches: PendingBatch[] = []
 ): React.ReactNode {
   switch (colDef.key) {
     case 'select':
@@ -423,17 +506,18 @@ function renderCellContent(
     }
 
     case 'status': {
-      if (!hasAttr) {
+      if (selectedAttribute && !hasAttr) {
         return (
           <Badge backgroundColor="neutral200" textColor="neutral600">
             Ignored
           </Badge>
         );
       }
+      const lifecycle = getEntryLifecycleStatus(entry, col, pendingBatches);
       return (
         <Flex gap={1} alignItems="center">
-          <Badge backgroundColor="success100" textColor="success700">
-            Supported
+          <Badge backgroundColor={lifecycle.badgeColor} textColor={lifecycle.textColor}>
+            {lifecycle.label}
           </Badge>
           {isMatch && (
             <Badge backgroundColor="secondary100" textColor="secondary700">
@@ -539,7 +623,7 @@ const BulkUpdater: React.FC = () => {
       const stored = localStorage.getItem(LAST_ATTR_KEY);
       if (stored) return stored;
     } catch {}
-    return 'metaDescription';
+    return '';
   };
   const [selectedAttribute, setSelectedAttribute] = useState<string>(getInitialAttribute);
   const [attributeValue, setAttributeValue] = useState<string>('');
@@ -603,12 +687,15 @@ const BulkUpdater: React.FC = () => {
   const [filterOperator, setFilterOperator] = useState<FilterOperator>('none');
   const [filterQuery, setFilterQuery] = useState<string>('');
   const [entrySearch, setEntrySearch] = useState<string>('');
+  type StatusFilter = 'all' | 'pending_review' | 'draft' | 'published' | 'modified';
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
 
   const isFilterActive =
     Boolean(searchAttribute && searchAttribute !== selectedAttribute) ||
     (filterOperator !== 'none' &&
       (['empty', 'not_empty'].includes(filterOperator) || Boolean(filterQuery.trim()))) ||
     Boolean(entrySearch.trim()) ||
+    Boolean(statusFilter !== 'all') ||
     Boolean(useRegex && regexPattern.trim());
 
   // Result state
@@ -744,7 +831,7 @@ const BulkUpdater: React.FC = () => {
     const resolvedAttr =
       storedAttr && activeAttrs.includes(storedAttr)
         ? storedAttr
-        : (selectedAttribute && activeAttrs.includes(selectedAttribute) ? selectedAttribute : (activeAttrs[0] || ''));
+        : (selectedAttribute && activeAttrs.includes(selectedAttribute) ? selectedAttribute : '');
 
     setSelectedAttribute(resolvedAttr);
     if (resolvedAttr && data.relationsMeta && data.relationsMeta[resolvedAttr]) {
@@ -777,14 +864,7 @@ const BulkUpdater: React.FC = () => {
         } catch {}
       }
     } catch (err: any) {
-      const isAborted =
-        err?.name === 'AbortError' ||
-        err?.name === 'CanceledError' ||
-        err?.code === 'ERR_CANCELED' ||
-        err?.message?.includes('aborted') ||
-        err?.message?.includes('canceled');
-
-      if (!isAborted) {
+      if (!isAbortError(err)) {
         toggleNotification({
           type: 'danger',
           message: err?.message || 'Failed to load collections data',
@@ -883,14 +963,7 @@ const BulkUpdater: React.FC = () => {
         }
       }
     } catch (err: any) {
-      const isAborted =
-        err?.name === 'AbortError' ||
-        err?.name === 'CanceledError' ||
-        err?.code === 'ERR_CANCELED' ||
-        err?.message?.includes('aborted') ||
-        err?.message?.includes('canceled');
-
-      if (!isAborted) {
+      if (!isAbortError(err)) {
         toggleNotification({
           type: 'danger',
           message: `Failed to load entries for ${colUid}: ${err?.message || 'Network error'}`,
@@ -920,14 +993,7 @@ const BulkUpdater: React.FC = () => {
         }
       }
     } catch (err: any) {
-      const isAborted =
-        err?.name === 'AbortError' ||
-        err?.name === 'CanceledError' ||
-        err?.code === 'ERR_CANCELED' ||
-        err?.message?.includes('aborted') ||
-        err?.message?.includes('canceled');
-
-      if (!isAborted) {
+      if (!isAbortError(err)) {
         toggleNotification({
           type: 'danger',
           message: err?.message || 'Failed to fetch audit history.',
@@ -1028,23 +1094,19 @@ const BulkUpdater: React.FC = () => {
     const colAttrs = targetCol?.attributes || [];
     setAttributes(colAttrs);
 
-    if (!colAttrs.includes(selectedAttribute)) {
-      const newAttr = colAttrs[0] || '';
-      setSelectedAttribute(newAttr);
+    if (selectedAttribute && !colAttrs.includes(selectedAttribute)) {
+      setSelectedAttribute('');
       try {
-        localStorage.setItem(LAST_ATTR_KEY, newAttr);
+        localStorage.removeItem(LAST_ATTR_KEY);
       } catch {}
-      if (newAttr && relationsMeta[newAttr]) {
-        fetchRelationOptions(relationsMeta[newAttr].targetUid);
-      } else {
-        setSelectedRelationDocId('');
-      }
+      setSelectedRelationDocId('');
+      setAttributeValue('');
     }
 
     loadCollectionPage(newUid, 1, undefined, undefined, undefined, filterOperator, filterQuery, entrySearch, true, '');
   };
 
-  // Handle attribute selection change: unchecks all existing selections if attribute changes
+  // Handle attribute selection change: updates selectedAttribute without clearing search/filters/selected entries
   const handleAttributeChange = (newAttr: string) => {
     if (newAttr !== selectedAttribute) {
       setSelectedAttribute(newAttr);
@@ -1055,10 +1117,7 @@ const BulkUpdater: React.FC = () => {
           localStorage.removeItem(LAST_ATTR_KEY);
         }
       } catch {}
-      setSelectedEntries({});
-      setFilterOperator('none');
-      setFilterQuery('');
-      setEntrySearch('');
+      // Keep searchAttribute, selectedEntries, filterOperator, filterQuery, and entrySearch intact
       setSelectedRelationDocId('');
       setAttributeValue('');
 
@@ -1066,10 +1125,6 @@ const BulkUpdater: React.FC = () => {
         fetchRelationOptions(relationsMeta[newAttr].targetUid);
       } else {
         setRelationOptions([]);
-      }
-
-      if (newAttr && selectedCollectionUid) {
-        loadCollectionPage(selectedCollectionUid, 1);
       }
     }
   };
@@ -1095,10 +1150,10 @@ const BulkUpdater: React.FC = () => {
 
   // Filtered attributes for Update Attribute combobox (handles camelCase, dot-notation, relations)
   const filteredAttributes = useMemo(() => {
-    if (!attributeSearch.trim()) {
+    const q = attributeSearch.toLowerCase().trim();
+    if (!q || q === (selectedAttribute || '').toLowerCase().trim()) {
       return depthFilteredAttributes;
     }
-    const q = attributeSearch.toLowerCase().trim();
     const cleanQ = q.replace(/[^a-z0-9]/g, '');
 
     return depthFilteredAttributes.filter((attr) => {
@@ -1113,14 +1168,14 @@ const BulkUpdater: React.FC = () => {
         relTarget.includes(q)
       );
     });
-  }, [depthFilteredAttributes, attributeSearch, relationsMeta]);
+  }, [depthFilteredAttributes, attributeSearch, selectedAttribute, relationsMeta]);
 
   // Filtered attributes for Search Attribute combobox
   const filteredSearchAttributes = useMemo(() => {
-    if (!searchAttributeSearch.trim()) {
+    const q = searchAttributeSearch.toLowerCase().trim();
+    if (!q || q === (searchAttribute || '').toLowerCase().trim()) {
       return depthFilteredAttributes;
     }
-    const q = searchAttributeSearch.toLowerCase().trim();
     const cleanQ = q.replace(/[^a-z0-9]/g, '');
 
     return depthFilteredAttributes.filter((attr) => {
@@ -1135,7 +1190,7 @@ const BulkUpdater: React.FC = () => {
         relTarget.includes(q)
       );
     });
-  }, [depthFilteredAttributes, searchAttributeSearch, relationsMeta]);
+  }, [depthFilteredAttributes, searchAttributeSearch, searchAttribute, relationsMeta]);
 
   // Memoized Combobox options for Update Attribute
   const memoizedComboboxOptions = useMemo(() => {
@@ -1319,26 +1374,27 @@ const BulkUpdater: React.FC = () => {
 
   const getVisibleEntries = (col: CollectionModel) => {
     const pageState = collectionPages[col.uid];
-    return pageState ? pageState.entries : (col.entries || []);
+    const raw = pageState ? pageState.entries : (col.entries || []);
+    if (statusFilter === 'all') return raw;
+    return raw.filter((entry) => {
+      const lifecycle = getEntryLifecycleStatus(entry, col, pendingBatches);
+      return lifecycle.status === statusFilter;
+    });
   };
 
   const matchingEntriesCount = React.useMemo(() => {
     if (!isFilterActive) return 0;
     let count = 0;
     filteredCollections.forEach((col) => {
-      const pageState = collectionPages[col.uid];
-      if (pageState) {
-        count += pageState.total;
-      }
+      count += getVisibleEntries(col).length;
     });
     return count;
-  }, [filteredCollections, collectionPages, isFilterActive]);
+  }, [filteredCollections, collectionPages, isFilterActive, statusFilter, pendingBatches]);
 
   const selectAllMatching = () => {
     const updated = { ...selectedEntries };
     filteredCollections.forEach((col) => {
-      const pageState = collectionPages[col.uid];
-      const entries = pageState ? pageState.entries : (col.entries || []);
+      const entries = getVisibleEntries(col);
       entries.forEach((e) => {
         updated[`${col.uid}${KEY_SEP}${e.documentId}`] = true;
       });
@@ -1349,8 +1405,7 @@ const BulkUpdater: React.FC = () => {
   const deselectAllMatching = () => {
     const updated = { ...selectedEntries };
     filteredCollections.forEach((col) => {
-      const pageState = collectionPages[col.uid];
-      const entries = pageState ? pageState.entries : (col.entries || []);
+      const entries = getVisibleEntries(col);
       entries.forEach((e) => {
         delete updated[`${col.uid}${KEY_SEP}${e.documentId}`];
       });
@@ -1364,6 +1419,7 @@ const BulkUpdater: React.FC = () => {
     setFilterOperator('none');
     setFilterQuery('');
     setEntrySearch('');
+    setStatusFilter('all');
     setRegexPattern('');
     setSelectedEntries({});
     collections.forEach((col) => {
@@ -1501,10 +1557,12 @@ const BulkUpdater: React.FC = () => {
         throw new Error(res.data?.error || 'Failed to generate preview');
       }
     } catch (err: any) {
-      toggleNotification({
-        type: 'danger',
-        message: err.message || 'Failed to fetch preview diffs',
-      });
+      if (!isAbortError(err)) {
+        toggleNotification({
+          type: 'danger',
+          message: err.message || 'Failed to fetch preview diffs',
+        });
+      }
       setShowPreviewModal(false);
     } finally {
       setPreviewLoading(false);
@@ -2319,7 +2377,7 @@ const BulkUpdater: React.FC = () => {
             </Flex>
           </Box>
 
-          {/* Main Control Panel: Attribute Dropdown + Value Input + Action Button */}
+          {/* 1. Search & Filter Targets */}
           <Box
             padding={6}
             background="neutral0"
@@ -2331,260 +2389,10 @@ const BulkUpdater: React.FC = () => {
             <Flex justifyContent="space-between" alignItems="center" marginBottom={4} wrap="wrap" gap={3}>
               <Box>
                 <Typography variant="delta" tag="h2" fontWeight="semiBold">
-                  1. Configure Attribute Update
+                  1. Search &amp; Filter Targets
                 </Typography>
                 <Typography variant="pi" textColor="neutral600">
-                  Select the target attribute to update and configure the replacement value.
-                </Typography>
-              </Box>
-            </Flex>
-
-            <Flex gap={3} alignItems="flex-end" wrap="wrap">
-              {/* Attribute Dropdown (Searchable Combobox) */}
-              <Box style={{ width: 280, minWidth: 230 }}>
-                <Field.Root>
-                  <Field.Label>Attribute to Update</Field.Label>
-                  <Combobox
-                    key={`update-attr-${selectedCollectionUid}-${selectedAttribute}`}
-                    autocomplete="none"
-                    placeholder="Search attribute by name or relation..."
-                    value={selectedAttribute || undefined}
-                    clearLabel="Clear attribute selection"
-                    onClear={() => {
-                      handleAttributeChange('');
-                      setAttributeSearch('');
-                    }}
-                    onInputChange={(e: React.ChangeEvent<HTMLInputElement>) => {
-                      setAttributeSearch(e.target.value);
-                    }}
-                    onOpenChange={(isOpen: boolean) => {
-                      if (!isOpen) {
-                        setAttributeSearch('');
-                      }
-                    }}
-                    loading={loading && attributes.length === 0}
-                    loadingMessage="Discovering schema attributes..."
-                    onChange={(val: any) => {
-                      if (val && typeof val === 'string' && val !== '__none__') {
-                        handleAttributeChange(val);
-                        setAttributeSearch('');
-                      }
-                    }}
-                  >
-                    {memoizedComboboxOptions}
-                  </Combobox>
-                </Field.Root>
-              </Box>
-
-              {/* New Value Input or Relation Target Selector */}
-              <Box style={{ flex: 1, minWidth: 340 }}>
-                {relationsMeta[selectedAttribute] ? (
-                  <Flex direction="column" gap={1} style={{ width: '100%' }}>
-                    <Flex gap={2} alignItems="center" wrap="wrap">
-                      <Typography variant="pi" fontWeight="bold" textColor="neutral700">
-                        Target {relationsMeta[selectedAttribute].targetDisplayName} Relation:
-                      </Typography>
-                      <Badge backgroundColor="secondary100" textColor="secondary700">
-                        {relationsMeta[selectedAttribute].relationType} &rarr; {relationsMeta[selectedAttribute].targetDisplayName}
-                      </Badge>
-                      {relationsMeta[selectedAttribute].isMulti && (
-                        <Badge backgroundColor="primary100" textColor="primary700">
-                          Multi-Relation
-                        </Badge>
-                      )}
-                    </Flex>
-                    <Flex gap={2} alignItems="center" style={{ width: '100%' }}>
-                      <Box style={{ flex: 1, minWidth: 200 }}>
-                        <Field.Root>
-                          <Field.Label>{`Choose ${relationsMeta[selectedAttribute].targetDisplayName}`}</Field.Label>
-                          <Combobox
-                            autocomplete={{ type: 'list', filter: 'contains' }}
-                            placeholder={relationOptionsLoading ? 'Loading entities...' : `Search & pick ${relationsMeta[selectedAttribute].targetDisplayName}...`}
-                            value={selectedRelationDocId}
-                            onChange={(val: any) => {
-                              const docId = val ? String(val) : '';
-                              setSelectedRelationDocId(docId);
-                              if (docId === '__clear__') {
-                                setAttributeValue(JSON.stringify({ mode: 'clear', label: '(clear relation)' }));
-                              } else {
-                                const opt = relationOptions.find((o) => o.documentId === docId);
-                                setAttributeValue(JSON.stringify({ mode: relationMode, documentIds: [docId], label: opt?.label || docId }));
-                              }
-                            }}
-                          >
-                            <ComboboxOption value="__clear__" textValue="Clear / Unlink Relation">
-                              -- Clear / Unlink Relation --
-                            </ComboboxOption>
-                            {relationOptions.map((opt) => (
-                              <ComboboxOption key={opt.documentId} value={opt.documentId} textValue={opt.label}>
-                                {opt.label}
-                              </ComboboxOption>
-                            ))}
-                          </Combobox>
-                        </Field.Root>
-                      </Box>
-                      {relationsMeta[selectedAttribute].isMulti && (
-                        <Box style={{ width: 170 }}>
-                          <SingleSelect
-                            label="Action Mode"
-                            value={relationMode}
-                            onChange={(val) => {
-                              const m = String(val) as 'set' | 'connect' | 'disconnect' | 'clear';
-                              setRelationMode(m);
-                              if (selectedRelationDocId) {
-                                if (selectedRelationDocId === '__clear__' || m === 'clear') {
-                                  setAttributeValue(JSON.stringify({ mode: 'clear', label: '(clear relation)' }));
-                                } else {
-                                  const opt = relationOptions.find((o) => o.documentId === selectedRelationDocId);
-                                  setAttributeValue(JSON.stringify({ mode: m, documentIds: [selectedRelationDocId], label: opt?.label || selectedRelationDocId }));
-                                }
-                              }
-                            }}
-                          >
-                            <SingleSelectOption value="set">Set / Overwrite</SingleSelectOption>
-                            <SingleSelectOption value="connect">Add / Connect</SingleSelectOption>
-                            <SingleSelectOption value="disconnect">Remove / Disconnect</SingleSelectOption>
-                            <SingleSelectOption value="clear">Clear All</SingleSelectOption>
-                          </SingleSelect>
-                        </Box>
-                      )}
-                    </Flex>
-                  </Flex>
-                ) : (
-                  <TextInput
-                    label={useRegex ? 'Replacement Value' : 'New Attribute Value'}
-                    name="attributeValue"
-                    placeholder={useRegex ? 'Replace matched pattern with...' : 'Enter the value to apply...'}
-                    value={attributeValue}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                      setAttributeValue(e.target.value)
-                    }
-                  />
-                )}
-              </Box>
-
-              {/* Action Buttons: Preview, Update & Publish */}
-              <Flex gap={2} alignItems="center" wrap="wrap">
-                <Button
-                  startIcon={<Eye />}
-                  variant="secondary"
-                  size="L"
-                  onClick={handleOpenPreviewModal}
-                  loading={previewLoading}
-                  disabled={loading || totalSelectedCount === 0 || !selectedAttribute}
-                >
-                  Preview Changes ({totalSelectedCount})
-                </Button>
-                <Button
-                  startIcon={<Play />}
-                  variant="default"
-                  size="L"
-                  onClick={handleOpenConfirmModal}
-                  loading={updating}
-                  disabled={loading || totalSelectedCount === 0 || !selectedAttribute}
-                >
-                  Update Selected ({totalSelectedCount})
-                </Button>
-                <Button
-                  startIcon={<Check />}
-                  variant="success-light"
-                  size="L"
-                  onClick={handleOpenPublishModal}
-                  loading={publishing}
-                  disabled={loading || totalSelectedCount === 0}
-                  title="Directly publish selected draft records across collections"
-                >
-                  Publish Selected ({totalSelectedCount})
-                </Button>
-                <Button
-                  startIcon={<Download />}
-                  variant="tertiary"
-                  size="L"
-                  onClick={handleBulkExportSelected}
-                  loading={bulkExporting}
-                  disabled={loading || totalSelectedCount === 0}
-                  title="Export selected entries to Excel-compatible CSV with full nested component support"
-                >
-                  Export Selected ({totalSelectedCount})
-                </Button>
-              </Flex>
-            </Flex>
-
-            {/* Auto-Publish upon Update Setting */}
-            <Box marginTop={4} padding={4} background="neutral100" hasRadius style={{ border: '1px solid #eaeaef' }}>
-              <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={3}>
-                <Flex gap={2} alignItems="center">
-                  <Checkbox
-                    checked={publishOnApproval}
-                    onCheckedChange={(checked: boolean) => setPublishOnApproval(Boolean(checked))}
-                  >
-                    <Typography fontWeight="bold">Auto-Publish after Update</Typography>
-                  </Checkbox>
-                  <Badge
-                    backgroundColor={publishOnApproval ? 'success100' : 'warning100'}
-                    textColor={publishOnApproval ? 'success700' : 'warning700'}
-                  >
-                    {publishOnApproval ? '✓ LIVE PUBLISH' : 'DRAFT ONLY'}
-                  </Badge>
-                </Flex>
-                <Typography variant="pi" textColor="neutral600">
-                  {publishOnApproval
-                    ? 'When enabled, entries will be published live immediately upon batch execution for draft-enabled content types.'
-                    : 'When disabled, entries will be saved as draft versions without publishing to live visitors.'}
-                </Typography>
-              </Flex>
-            </Box>
-
-            {/* Selected Attribute & Collection Context */}
-            {selectedCol && selectedAttribute && (
-              <Box marginTop={4} padding={3} background="neutral100" hasRadius style={{ border: '1px solid #eaeaef' }}>
-                <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={3}>
-                  <Flex gap={2} alignItems="center" wrap="wrap">
-                    <Typography variant="pi" fontWeight="bold">
-                      Target Selection:
-                    </Typography>
-                    <Badge backgroundColor="primary100" textColor="primary700">
-                      Collection: {selectedCol.displayName}
-                    </Badge>
-                    <Badge backgroundColor="secondary100" textColor="secondary700">
-                      Attribute: {selectedAttribute} {attributesMeta[selectedAttribute]?.type ? `(${attributesMeta[selectedAttribute].type})` : ''}
-                    </Badge>
-                    {attributesMeta[selectedAttribute]?.depth ? (
-                      <Badge backgroundColor="neutral200" textColor="neutral700">
-                        Nesting Level: L{attributesMeta[selectedAttribute].depth}
-                      </Badge>
-                    ) : null}
-                    {selectedCol.draftAndPublish ? (
-                      <Badge backgroundColor="success100" textColor="success700">
-                        Draft &amp; Publish Enabled
-                      </Badge>
-                    ) : (
-                      <Badge backgroundColor="warning100" textColor="warning700">
-                        Direct Publish Only
-                      </Badge>
-                    )}
-                  </Flex>
-                </Flex>
-              </Box>
-            )}
-          </Box>
-
-          {/* Target Selection: Collections & Entries */}
-          <Box
-            padding={6}
-            background="neutral0"
-            shadow="filterShadow"
-            hasRadius
-            marginBottom={6}
-            style={{ width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box' }}
-          >
-            <Flex justifyContent="space-between" alignItems="center" marginBottom={4} wrap="wrap" gap={3}>
-              <Box>
-                <Typography variant="delta" tag="h2" fontWeight="semiBold">
-                  2. Select Targets
-                </Typography>
-                <Typography variant="pi" textColor="neutral600">
-                  Search and select entries to apply the update to within {selectedCol ? selectedCol.displayName : 'the selected collection'}.
+                  Search, filter, and select entries within {selectedCol ? selectedCol.displayName : 'the selected collection'} before updating.
                 </Typography>
               </Box>
               <Flex gap={2}>
@@ -2635,7 +2443,7 @@ const BulkUpdater: React.FC = () => {
                     <Field.Root>
                       <Field.Label>Search Attribute</Field.Label>
                       <Combobox
-                        key={`search-attr-${selectedCollectionUid}-${searchAttribute}`}
+                        key={`search-attr-${selectedCollectionUid}`}
                         autocomplete="none"
                         placeholder={searchAttribute || `Same as Update (${selectedAttribute || 'None'})`}
                         value={searchAttribute || '__default__'}
@@ -2700,6 +2508,21 @@ const BulkUpdater: React.FC = () => {
                       value={entrySearch}
                       onChange={(e: React.ChangeEvent<HTMLInputElement>) => setEntrySearch(e.target.value)}
                     />
+                  </Box>
+
+                  {/* Lifecycle Status Filter */}
+                  <Box style={{ width: 190, minWidth: 160 }}>
+                    <SingleSelect
+                      label="Lifecycle Status"
+                      value={statusFilter}
+                      onChange={(val) => setStatusFilter(String(val) as any)}
+                    >
+                      <SingleSelectOption value="all">All Statuses</SingleSelectOption>
+                      <SingleSelectOption value="pending_review">Pending Review (Due)</SingleSelectOption>
+                      <SingleSelectOption value="draft">Draft</SingleSelectOption>
+                      <SingleSelectOption value="published">Published</SingleSelectOption>
+                      <SingleSelectOption value="modified">Modified</SingleSelectOption>
+                    </SingleSelect>
                   </Box>
 
                   {/* Quick Action Buttons when filter is active */}
@@ -3160,7 +2983,8 @@ const BulkUpdater: React.FC = () => {
                                         isMatch,
                                         hasAttr,
                                         isSelected,
-                                        () => toggleEntry(col.uid, entry.documentId)
+                                        () => toggleEntry(col.uid, entry.documentId),
+                                        pendingBatches
                                       )}
                                     </Td>
                                   ))}
@@ -3238,6 +3062,257 @@ const BulkUpdater: React.FC = () => {
                 );
               })()}
           </Box>
+
+          {/* 2. Configure Attribute Update & Execution */}
+          <Box
+            padding={6}
+            background="neutral0"
+            shadow="filterShadow"
+            hasRadius
+            marginBottom={6}
+            style={{ width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box' }}
+          >
+            <Flex justifyContent="space-between" alignItems="center" marginBottom={4} wrap="wrap" gap={3}>
+              <Box>
+                <Typography variant="delta" tag="h2" fontWeight="semiBold">
+                  2. Configure Attribute Update
+                </Typography>
+                <Typography variant="pi" textColor="neutral600">
+                  Select the target attribute to update and configure the replacement value for your selected entries.
+                </Typography>
+              </Box>
+            </Flex>
+
+            <Flex gap={3} alignItems="flex-end" wrap="wrap">
+              {/* Attribute Dropdown (Searchable Combobox) */}
+              <Box style={{ width: 280, minWidth: 230 }}>
+                <Field.Root>
+                  <Field.Label>Attribute to Update</Field.Label>
+                  <Combobox
+                    key={`update-attr-${selectedCollectionUid}`}
+                    autocomplete="none"
+                    placeholder="Search attribute by name or relation..."
+                    value={selectedAttribute || undefined}
+                    clearLabel="Clear attribute selection"
+                    onClear={() => {
+                      handleAttributeChange('');
+                      setAttributeSearch('');
+                    }}
+                    onInputChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+                      setAttributeSearch(e.target.value);
+                    }}
+                    onOpenChange={(isOpen: boolean) => {
+                      if (!isOpen) {
+                        setAttributeSearch('');
+                      }
+                    }}
+                    loading={loading && attributes.length === 0}
+                    loadingMessage="Discovering schema attributes..."
+                    onChange={(val: any) => {
+                      if (val && typeof val === 'string' && val !== '__none__') {
+                        handleAttributeChange(val);
+                        setAttributeSearch('');
+                      }
+                    }}
+                  >
+                    {memoizedComboboxOptions}
+                  </Combobox>
+                </Field.Root>
+              </Box>
+
+              {/* New Value Input or Relation Target Selector */}
+              <Box style={{ flex: 1, minWidth: 340 }}>
+                {relationsMeta[selectedAttribute] ? (
+                  <Flex direction="column" gap={1} style={{ width: '100%' }}>
+                    <Flex gap={2} alignItems="center" wrap="wrap">
+                      <Typography variant="pi" fontWeight="bold" textColor="neutral700">
+                        Target {relationsMeta[selectedAttribute].targetDisplayName} Relation:
+                      </Typography>
+                      <Badge backgroundColor="secondary100" textColor="secondary700">
+                        {relationsMeta[selectedAttribute].relationType} &rarr; {relationsMeta[selectedAttribute].targetDisplayName}
+                      </Badge>
+                      {relationsMeta[selectedAttribute].isMulti && (
+                        <Badge backgroundColor="primary100" textColor="primary700">
+                          Multi-Relation
+                        </Badge>
+                      )}
+                    </Flex>
+                    <Flex gap={2} alignItems="center" style={{ width: '100%' }}>
+                      <Box style={{ flex: 1, minWidth: 200 }}>
+                        <Field.Root>
+                          <Field.Label>{`Choose ${relationsMeta[selectedAttribute].targetDisplayName}`}</Field.Label>
+                          <Combobox
+                            autocomplete={{ type: 'list', filter: 'contains' }}
+                            placeholder={relationOptionsLoading ? 'Loading entities...' : `Search & pick ${relationsMeta[selectedAttribute].targetDisplayName}...`}
+                            value={selectedRelationDocId}
+                            onChange={(val: any) => {
+                              const docId = val ? String(val) : '';
+                              setSelectedRelationDocId(docId);
+                              if (docId === '__clear__') {
+                                setAttributeValue(JSON.stringify({ mode: 'clear', label: '(clear relation)' }));
+                              } else {
+                                const opt = relationOptions.find((o) => o.documentId === docId);
+                                setAttributeValue(JSON.stringify({ mode: relationMode, documentIds: [docId], label: opt?.label || docId }));
+                              }
+                            }}
+                          >
+                            <ComboboxOption value="__clear__" textValue="Clear / Unlink Relation">
+                              -- Clear / Unlink Relation --
+                            </ComboboxOption>
+                            {relationOptions.map((opt) => (
+                              <ComboboxOption key={opt.documentId} value={opt.documentId} textValue={opt.label}>
+                                {opt.label}
+                              </ComboboxOption>
+                            ))}
+                          </Combobox>
+                        </Field.Root>
+                      </Box>
+                      {relationsMeta[selectedAttribute].isMulti && (
+                        <Box style={{ width: 170 }}>
+                          <SingleSelect
+                            label="Action Mode"
+                            value={relationMode}
+                            onChange={(val) => {
+                              const m = String(val) as 'set' | 'connect' | 'disconnect' | 'clear';
+                              setRelationMode(m);
+                              if (selectedRelationDocId) {
+                                if (selectedRelationDocId === '__clear__' || m === 'clear') {
+                                  setAttributeValue(JSON.stringify({ mode: 'clear', label: '(clear relation)' }));
+                                } else {
+                                  const opt = relationOptions.find((o) => o.documentId === selectedRelationDocId);
+                                  setAttributeValue(JSON.stringify({ mode: m, documentIds: [selectedRelationDocId], label: opt?.label || selectedRelationDocId }));
+                                }
+                              }
+                            }}
+                          >
+                            <SingleSelectOption value="set">Set / Overwrite</SingleSelectOption>
+                            <SingleSelectOption value="connect">Add / Connect</SingleSelectOption>
+                            <SingleSelectOption value="disconnect">Remove / Disconnect</SingleSelectOption>
+                            <SingleSelectOption value="clear">Clear All</SingleSelectOption>
+                          </SingleSelect>
+                        </Box>
+                      )}
+                    </Flex>
+                  </Flex>
+                ) : (
+                  <TextInput
+                    label={useRegex ? 'Replacement Value' : 'New Attribute Value'}
+                    name="attributeValue"
+                    placeholder={useRegex ? 'Replace matched pattern with...' : 'Enter the value to apply...'}
+                    value={attributeValue}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                      setAttributeValue(e.target.value)
+                    }
+                  />
+                )}
+              </Box>
+
+              {/* Action Buttons: Preview, Update & Publish */}
+              <Flex gap={2} alignItems="center" wrap="wrap">
+                <Button
+                  startIcon={<Eye />}
+                  variant="secondary"
+                  size="L"
+                  onClick={handleOpenPreviewModal}
+                  loading={previewLoading}
+                  disabled={loading || totalSelectedCount === 0 || !selectedAttribute || !selectedAttribute.trim()}
+                >
+                  Preview Changes ({totalSelectedCount})
+                </Button>
+                <Button
+                  startIcon={<Play />}
+                  variant="default"
+                  size="L"
+                  onClick={handleOpenConfirmModal}
+                  loading={updating}
+                  disabled={loading || totalSelectedCount === 0 || !selectedAttribute || !selectedAttribute.trim()}
+                >
+                  Update Selected ({totalSelectedCount})
+                </Button>
+                <Button
+                  startIcon={<Check />}
+                  variant="success-light"
+                  size="L"
+                  onClick={handleOpenPublishModal}
+                  loading={publishing}
+                  disabled={loading || totalSelectedCount === 0}
+                  title="Directly publish selected draft records across collections"
+                >
+                  Publish Selected ({totalSelectedCount})
+                </Button>
+                <Button
+                  startIcon={<Download />}
+                  variant="tertiary"
+                  size="L"
+                  onClick={handleBulkExportSelected}
+                  loading={bulkExporting}
+                  disabled={loading || totalSelectedCount === 0}
+                  title="Export selected entries to Excel-compatible CSV with full nested component support"
+                >
+                  Export Selected ({totalSelectedCount})
+                </Button>
+              </Flex>
+            </Flex>
+
+            {/* Auto-Publish upon Update Setting */}
+            <Box marginTop={4} padding={4} background="neutral100" hasRadius style={{ border: '1px solid #eaeaef' }}>
+              <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={3}>
+                <Flex gap={2} alignItems="center">
+                  <Checkbox
+                    checked={publishOnApproval}
+                    onCheckedChange={(checked: boolean) => setPublishOnApproval(Boolean(checked))}
+                  >
+                    <Typography fontWeight="bold">Auto-Publish after Update</Typography>
+                  </Checkbox>
+                  <Badge
+                    backgroundColor={publishOnApproval ? 'success100' : 'warning100'}
+                    textColor={publishOnApproval ? 'success700' : 'warning700'}
+                  >
+                    {publishOnApproval ? '✓ LIVE PUBLISH' : 'DRAFT ONLY'}
+                  </Badge>
+                </Flex>
+                <Typography variant="pi" textColor="neutral600">
+                  {publishOnApproval
+                    ? 'When enabled, entries will be published live immediately upon batch execution for draft-enabled content types.'
+                    : 'When disabled, entries will be saved as draft versions without publishing to live visitors.'}
+                </Typography>
+              </Flex>
+            </Box>
+
+            {/* Selected Attribute & Collection Context */}
+            {selectedCol && selectedAttribute && (
+              <Box marginTop={4} padding={3} background="neutral100" hasRadius style={{ border: '1px solid #eaeaef' }}>
+                <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={3}>
+                  <Flex gap={2} alignItems="center" wrap="wrap">
+                    <Typography variant="pi" fontWeight="bold">
+                      Target Selection:
+                    </Typography>
+                    <Badge backgroundColor="primary100" textColor="primary700">
+                      Collection: {selectedCol.displayName}
+                    </Badge>
+                    <Badge backgroundColor="secondary100" textColor="secondary700">
+                      Attribute: {selectedAttribute} {attributesMeta[selectedAttribute]?.type ? `(${attributesMeta[selectedAttribute].type})` : ''}
+                    </Badge>
+                    {attributesMeta[selectedAttribute]?.depth ? (
+                      <Badge backgroundColor="neutral200" textColor="neutral700">
+                        Nesting Level: L{attributesMeta[selectedAttribute].depth}
+                      </Badge>
+                    ) : null}
+                    {selectedCol.draftAndPublish ? (
+                      <Badge backgroundColor="success100" textColor="success700">
+                        Draft &amp; Publish Enabled
+                      </Badge>
+                    ) : (
+                      <Badge backgroundColor="warning100" textColor="warning700">
+                        Direct Publish Only
+                      </Badge>
+                    )}
+                  </Flex>
+                </Flex>
+              </Box>
+            )}
+          </Box>
+
 
           {/* Execution Results Feedback */}
           {updateSummary && (

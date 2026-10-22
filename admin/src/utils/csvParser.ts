@@ -114,3 +114,52 @@ export function parseCsv(csvText: string): Array<Record<string, string>> {
 
   return records;
 }
+
+const LIFECYCLE_STATUS_WORDS = new Set([
+  'pending review',
+  'pending_review',
+  'pending approval',
+  'pending_approval',
+  'approved',
+  'rejected',
+  'draft',
+  'published',
+  'modified',
+  'supported',
+  'ignored',
+]);
+
+export function isValidDocId(val: any): boolean {
+  if (!val || typeof val !== 'string') return false;
+  const trimmed = val.trim();
+  if (!trimmed) return false;
+  if (LIFECYCLE_STATUS_WORDS.has(trimmed.toLowerCase())) return false;
+  if (/\s/.test(trimmed)) return false;
+  return /^[a-zA-Z0-9_-]+$/.test(trimmed);
+}
+
+export function extractDocId(row: Record<string, any>): string {
+  if (!row || typeof row !== 'object') return '';
+  const candidates = [
+    row.documentId,
+    row.document_id,
+    row['Document ID'],
+    row['Document Id'],
+    row['document_id'],
+    row.docId,
+    row['docId'],
+    row.id,
+    row.ID,
+    row.Id,
+  ];
+  for (const c of candidates) {
+    if (c !== undefined && c !== null) {
+      const str = String(c).trim();
+      if (isValidDocId(str)) {
+        return str;
+      }
+    }
+  }
+  return '';
+}
+

@@ -20,6 +20,7 @@ import {
   Checkbox,
 } from '@strapi/design-system';
 import { Plus, Trash, Check, ArrowClockwise, Search, Download } from '@strapi/icons';
+import { isAbortError } from '../utils/isAbortError';
 
 export interface ValidationRule {
   id: string;
@@ -97,6 +98,7 @@ export default function ValidationRulesTab() {
         setScanModalOpen(true);
       }
     } catch (err: any) {
+      if (isAbortError(err)) return;
       toggleNotification({
         type: 'danger',
         message: `Scan failed: ${err.message}`,
@@ -114,6 +116,7 @@ export default function ValidationRulesTab() {
         setRules(res.data.rules || []);
       }
     } catch (err: any) {
+      if (isAbortError(err)) return;
       toggleNotification({
         type: 'danger',
         message: `Failed to load rules: ${err.message}`,
@@ -232,6 +235,7 @@ export default function ValidationRulesTab() {
         fetchRules();
       }
     } catch (err: any) {
+      if (isAbortError(err)) return;
       toggleNotification({
         type: 'danger',
         message: `Failed to save rule: ${err.message}`,
@@ -256,6 +260,7 @@ export default function ValidationRulesTab() {
         });
       }
     } catch (err: any) {
+      if (isAbortError(err)) return;
       toggleNotification({
         type: 'danger',
         message: `Failed to update rule status: ${err.message}`,
@@ -276,6 +281,7 @@ export default function ValidationRulesTab() {
         });
       }
     } catch (err: any) {
+      if (isAbortError(err)) return;
       toggleNotification({
         type: 'danger',
         message: `Failed to delete rule: ${err.message}`,
