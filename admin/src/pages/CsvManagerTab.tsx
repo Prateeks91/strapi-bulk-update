@@ -562,6 +562,65 @@ export default function CsvManagerTab() {
                     )}
                   </Box>
                 )}
+
+                {importResult.stats.diffs && importResult.stats.diffs.length > 0 && (
+                  <Box marginTop={3} padding={3} background="neutral0" hasRadius style={{ border: '1px solid #dcdce4' }}>
+                    <Typography variant="sigma" textColor="neutral800" fontWeight="bold" display="block" marginBottom={2}>
+                      CHANGES APPLIED ({importResult.stats.diffs.length}):
+                    </Typography>
+                    <Box style={{ overflowX: 'auto' }}>
+                      <Table colCount={4} rowCount={importResult.stats.diffs.length + 1}>
+                        <Thead>
+                          <Tr>
+                            <Th><Typography variant="sigma">Entry / Document</Typography></Th>
+                            <Th><Typography variant="sigma">Attribute</Typography></Th>
+                            <Th><Typography variant="sigma">Previous Value</Typography></Th>
+                            <Th><Typography variant="sigma">Applied Value</Typography></Th>
+                          </Tr>
+                        </Thead>
+                        <Tbody>
+                          {importResult.stats.diffs.slice(0, 10).map((d: any, idx: number) => {
+                            const oldDisplay = d.oldValue !== null && d.oldValue !== undefined
+                              ? (typeof d.oldValue === 'object' ? JSON.stringify(d.oldValue) : String(d.oldValue))
+                              : '(empty)';
+                            const newDisplay = d.newValue !== null && d.newValue !== undefined
+                              ? (typeof d.newValue === 'object' ? JSON.stringify(d.newValue) : String(d.newValue))
+                              : '(empty)';
+
+                            return (
+                              <Tr key={idx}>
+                                <Td>
+                                  <Typography fontWeight="semiBold">{d.label || d.documentId}</Typography>
+                                  {d.documentId && (
+                                    <Typography variant="pi" textColor="neutral500" display="block">
+                                      {d.documentId}
+                                    </Typography>
+                                  )}
+                                </Td>
+                                <Td>
+                                  <Badge backgroundColor="secondary100" textColor="secondary700">
+                                    {d.attribute || 'field'}
+                                  </Badge>
+                                </Td>
+                                <Td>
+                                  <Typography textColor="danger600">{oldDisplay}</Typography>
+                                </Td>
+                                <Td>
+                                  <Typography textColor="success600" fontWeight="semiBold">{newDisplay}</Typography>
+                                </Td>
+                              </Tr>
+                            );
+                          })}
+                        </Tbody>
+                      </Table>
+                    </Box>
+                    {importResult.stats.diffs.length > 10 && (
+                      <Typography variant="pi" textColor="neutral600" style={{ display: 'block', marginTop: 6, fontStyle: 'italic' }}>
+                        ...and {importResult.stats.diffs.length - 10} more change{importResult.stats.diffs.length - 10 > 1 ? 's' : ''} recorded in Audit Trail &amp; Version History.
+                      </Typography>
+                    )}
+                  </Box>
+                )}
               </Alert>
             </Box>
           )}

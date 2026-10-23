@@ -1080,17 +1080,21 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           } catch {}
 
           stats.updated++;
-          stats.diffs.push({
-            uid,
-            collectionName: ct.info?.displayName || uid,
-            documentId: resolvedDocId,
-            label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
-            attribute: Object.keys(payload).join(', '),
-            oldValue: existing,
-            newValue: payload,
-            status: 'updated',
-            message: `Updated via CSV import (row ${rowNumber})`,
-          });
+          for (const attrKey of Object.keys(payload)) {
+            const oldVal = (existing as any)?.[attrKey] ?? null;
+            const newVal = payload[attrKey];
+            stats.diffs.push({
+              uid,
+              collectionName: ct.info?.displayName || uid,
+              documentId: resolvedDocId,
+              label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
+              attribute: attrKey,
+              oldValue: oldVal,
+              newValue: newVal,
+              status: 'updated',
+              message: `Updated "${attrKey}" via CSV import (row ${rowNumber})`,
+            });
+          }
         } else if (mode === 'create_or_override') {
           let existing: any = null;
           if (docId) {
@@ -1134,17 +1138,21 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             } catch {}
 
             stats.updated++;
-            stats.diffs.push({
-              uid,
-              collectionName: ct.info?.displayName || uid,
-              documentId: resolvedDocId,
-              label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
-              attribute: Object.keys(payload).join(', '),
-              oldValue: existing,
-              newValue: payload,
-              status: 'updated',
-              message: `Overridden via CSV import (row ${rowNumber})`,
-            });
+            for (const attrKey of Object.keys(payload)) {
+              const oldVal = (existing as any)?.[attrKey] ?? null;
+              const newVal = payload[attrKey];
+              stats.diffs.push({
+                uid,
+                collectionName: ct.info?.displayName || uid,
+                documentId: resolvedDocId,
+                label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
+                attribute: attrKey,
+                oldValue: oldVal,
+                newValue: newVal,
+                status: 'updated',
+                message: `Overridden "${attrKey}" via CSV import (row ${rowNumber})`,
+              });
+            }
             continue;
           }
 
@@ -1176,19 +1184,21 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           if (!docId) {
             stats.newWithoutDocId++;
           }
-          stats.diffs.push({
-            uid,
-            collectionName: ct.info?.displayName || uid,
-            documentId: newDocId,
-            label: created?.title || created?.name || `New Entry #${newDocId}`,
-            attribute: Object.keys(payload).join(', '),
-            oldValue: null,
-            newValue: payload,
-            status: 'updated',
-            message: docId
-              ? `Created via CSV import (row ${rowNumber})`
-              : `Created as new entry (no documentId provided in CSV - row ${rowNumber})`,
-          });
+          for (const attrKey of Object.keys(payload)) {
+            stats.diffs.push({
+              uid,
+              collectionName: ct.info?.displayName || uid,
+              documentId: newDocId,
+              label: created?.title || created?.name || `New Entry #${newDocId}`,
+              attribute: attrKey,
+              oldValue: null,
+              newValue: payload[attrKey],
+              status: 'created',
+              message: docId
+                ? `Created "${attrKey}" via CSV import (row ${rowNumber})`
+                : `Created "${attrKey}" as new entry (row ${rowNumber})`,
+            });
+          }
         } else {
           // Default: Smart Auto-Detect ('auto')
           let existing: any = null;
@@ -1233,17 +1243,21 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             } catch {}
 
             stats.updated++;
-            stats.diffs.push({
-              uid,
-              collectionName: ct.info?.displayName || uid,
-              documentId: resolvedDocId,
-              label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
-              attribute: Object.keys(payload).join(', '),
-              oldValue: existing,
-              newValue: payload,
-              status: 'updated',
-              message: `Updated existing entry via smart match (row ${rowNumber})`,
-            });
+            for (const attrKey of Object.keys(payload)) {
+              const oldVal = (existing as any)?.[attrKey] ?? null;
+              const newVal = payload[attrKey];
+              stats.diffs.push({
+                uid,
+                collectionName: ct.info?.displayName || uid,
+                documentId: resolvedDocId,
+                label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
+                attribute: attrKey,
+                oldValue: oldVal,
+                newValue: newVal,
+                status: 'updated',
+                message: `Updated "${attrKey}" via CSV import (row ${rowNumber})`,
+              });
+            }
             continue;
           }
 
@@ -1276,19 +1290,21 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           if (!docId) {
             stats.newWithoutDocId++;
           }
-          stats.diffs.push({
-            uid,
-            collectionName: ct.info?.displayName || uid,
-            documentId: newDocId,
-            label: created?.title || created?.name || `New Entry #${newDocId}`,
-            attribute: Object.keys(payload).join(', '),
-            oldValue: null,
-            newValue: payload,
-            status: 'updated',
-            message: docId
-              ? `Created as new entry (documentId "${docId}" not found in database - row ${rowNumber})`
-              : `Created as new entry (no documentId provided in CSV - row ${rowNumber})`,
-          });
+          for (const attrKey of Object.keys(payload)) {
+            stats.diffs.push({
+              uid,
+              collectionName: ct.info?.displayName || uid,
+              documentId: newDocId,
+              label: created?.title || created?.name || `New Entry #${newDocId}`,
+              attribute: attrKey,
+              oldValue: null,
+              newValue: payload[attrKey],
+              status: 'created',
+              message: docId
+                ? `Created "${attrKey}" as new entry (documentId "${docId}" not found in database - row ${rowNumber})`
+                : `Created "${attrKey}" as new entry (no documentId provided in CSV - row ${rowNumber})`,
+            });
+          }
         }
       } catch (err: any) {
         stats.errors.push({
@@ -1317,10 +1333,39 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             : Boolean(auditService.getAuditConfig?.().enabled ?? true);
 
           if (isEnabled) {
+            const collectionDisplayName = ct.info?.displayName || uid;
+            const updatedDiffs = stats.diffs.filter(
+              (d) => d.status === 'updated' || d.status === 'created'
+            );
+            const uniqueAttributes = Array.from(
+              new Set(updatedDiffs.map((d) => d.attribute))
+            ).filter(Boolean);
+            const attrListStr = uniqueAttributes.length > 0 ? uniqueAttributes.join(', ') : 'fields';
+
+            const batchAttribute = `CSV [${collectionDisplayName}]: ${attrListStr}`;
+
+            let batchValue = '';
+            if (updatedDiffs.length === 1) {
+              const d = updatedDiffs[0];
+              const newStr = d.newValue !== null && d.newValue !== undefined ? String(d.newValue) : '(empty)';
+              batchValue = `"${d.label}": ${d.attribute} → "${newStr}"`;
+            } else if (updatedDiffs.length > 1 && stats.updated === 1 && stats.created === 0) {
+              const d = updatedDiffs[0];
+              const changes = updatedDiffs
+                .map((ud) => `${ud.attribute}: "${ud.newValue ?? ''}"`)
+                .join(', ');
+              batchValue = `"${d.label}": ${changes}`;
+            } else {
+              const sampleVal = updatedDiffs[0]
+                ? ` (e.g. ${updatedDiffs[0].attribute}: "${updatedDiffs[0].newValue ?? ''}")`
+                : '';
+              batchValue = `${stats.updated} updated, ${stats.created} created in ${collectionDisplayName}${sampleVal}`;
+            }
+
             const batchSummary = {
               batchId,
-              attribute: 'CSV_IMPORT',
-              value: `Mode: ${mode} (${stats.created} created, ${stats.updated} updated)`,
+              attribute: batchAttribute,
+              value: batchValue,
               updatedCount: stats.updated + stats.created,
               skippedCount: stats.skipped,
               totalTargets: stats.total,

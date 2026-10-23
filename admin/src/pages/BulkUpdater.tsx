@@ -3682,19 +3682,47 @@ const BulkUpdater: React.FC = () => {
                               {rec.userEmail}
                             </Typography>
                           </Td>
-                          <Td style={{ minWidth: 160 }}>
-                            <Typography
-                              style={{
-                                display: 'inline-block',
-                                maxWidth: '100%',
-                                overflow: 'hidden',
-                                textOverflow: 'ellipsis',
-                                whiteSpace: 'nowrap',
-                              }}
-                              title={`${rec.attribute} → "${formatDisplayValue(rec.value)}"`}
-                            >
-                              <strong>{rec.attribute}</strong> &rarr; &ldquo;{formatDisplayValue(rec.value)}&rdquo;
-                            </Typography>
+                          <Td style={{ minWidth: 200 }}>
+                            {(() => {
+                              const isCsv = rec.attribute === 'CSV_IMPORT' || rec.attribute?.startsWith('CSV');
+                              let attrText = rec.attribute;
+                              let valText = formatDisplayValue(rec.value);
+
+                              if (rec.attribute === 'CSV_IMPORT' && rec.diffs && rec.diffs.length > 0) {
+                                const colName = rec.diffs[0]?.collectionName || 'Collection';
+                                const attrs = Array.from(new Set(rec.diffs.map((d: any) => d.attribute).filter(Boolean))).join(', ');
+                                attrText = `CSV [${colName}]: ${attrs || 'fields'}`;
+
+                                if (rec.value.startsWith('Mode:') && rec.diffs.length === 1) {
+                                  const d = rec.diffs[0];
+                                  valText = `"${d.label || d.documentId}": ${d.attribute || 'field'} → "${formatDisplayValue(d.newValue)}"`;
+                                } else if (rec.value.startsWith('Mode:')) {
+                                  valText = `${rec.diffs.length} attribute${rec.diffs.length > 1 ? 's' : ''} updated in ${colName}`;
+                                }
+                              }
+
+                              return (
+                                <Flex gap={2} alignItems="center" wrap="wrap">
+                                  {isCsv && (
+                                    <Badge backgroundColor="secondary100" textColor="secondary700">
+                                      CSV IMPORT
+                                    </Badge>
+                                  )}
+                                  <Typography
+                                    style={{
+                                      display: 'inline-block',
+                                      maxWidth: '100%',
+                                      overflow: 'hidden',
+                                      textOverflow: 'ellipsis',
+                                      whiteSpace: 'nowrap',
+                                    }}
+                                    title={`${attrText} → "${valText}"`}
+                                  >
+                                    <strong>{attrText.replace(/^CSV\s*\[?([^\]]+)\]?:\s*/, '$1: ')}</strong> &rarr; &ldquo;{valText}&rdquo;
+                                  </Typography>
+                                </Flex>
+                              );
+                            })()}
                           </Td>
                           <Td style={{ minWidth: 90, whiteSpace: 'nowrap' }}>
                             <Badge backgroundColor="success100" textColor="success700">
@@ -3777,11 +3805,12 @@ const BulkUpdater: React.FC = () => {
                                 <Typography variant="delta" fontWeight="bold" marginBottom={2}>
                                   Detailed Before/After Snapshots for Batch {rec.batchId}:
                                 </Typography>
-                                <Table colCount={4} rowCount={rec.diffs.length + 1}>
+                                <Table colCount={5} rowCount={rec.diffs.length + 1}>
                                   <Thead>
                                     <Tr>
                                       <Th><Typography variant="sigma">Collection</Typography></Th>
                                       <Th><Typography variant="sigma">Document / Entry</Typography></Th>
+                                      <Th><Typography variant="sigma">Attribute</Typography></Th>
                                       <Th><Typography variant="sigma">Previous Value</Typography></Th>
                                       <Th><Typography variant="sigma">Applied Value</Typography></Th>
                                     </Tr>
@@ -3791,8 +3820,13 @@ const BulkUpdater: React.FC = () => {
                                       <Tr key={dIdx}>
                                         <Td><Typography fontWeight="semiBold">{d.collectionName}</Typography></Td>
                                         <Td><Typography>{d.label}</Typography></Td>
+                                        <Td>
+                                          <Badge backgroundColor="secondary100" textColor="secondary700">
+                                            {d.attribute || 'field'}
+                                          </Badge>
+                                        </Td>
                                         <Td><Typography textColor="danger600">{formatDisplayValue(d.oldValue)}</Typography></Td>
-                                        <Td><Typography textColor="success600">{formatDisplayValue(d.newValue)}</Typography></Td>
+                                        <Td><Typography textColor="success600" fontWeight="semiBold">{formatDisplayValue(d.newValue)}</Typography></Td>
                                       </Tr>
                                     ))}
                                   </Tbody>
