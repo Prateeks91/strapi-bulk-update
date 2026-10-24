@@ -176,11 +176,112 @@ export function discoverComponentAttributes(
 }
 
 /**
- * Validates whether a dot-notation attribute corresponds to a valid deep component hierarchy
+ * Parses dynamic zone dot or bracket notation paths:
+ * e.g. "blocks.title", "blocks[shared.heading].title", or "blocks[0].title"
+ */
+export function parseDynamicZonePath(path: string): {
+  cleanPath: string;
+  rootKey: string;
+  subPath: string;
+  targetComponentUid?: string;
+  targetIndex?: number;
+} {
+  if (!path) return { cleanPath: '', rootKey: '', subPath: '' };
+  const bracketMatch = path.match(/^([^.[]+)\[([^\]]+)\]\.(.+)$/);
+  if (bracketMatch) {
+    const rootKey = bracketMatch[1];
+    const selector = bracketMatch[2];
+    const subPath = bracketMatch[3];
+    const cleanPath = `${rootKey}.${subPath}`;
+    if (/^\d+$/.test(selector)) {
+      return { cleanPath, rootKey, subPath, targetIndex: parseInt(selector, 10) };
+    }
+    return { cleanPath, rootKey, subPath, targetComponentUid: selector };
+  }
+
+  const parts = path.split('.');
+  return {
+    cleanPath: path,
+    rootKey: parts[0] || '',
+    subPath: parts.slice(1).join('.'),
+  };
+}
+
+/**
+ * Formats a component UID into a friendly readable label (e.g. "shared.featured-section" -> "Featured Section")
+ */
+export function formatComponentName(compUid?: string): string {
+  if (!compUid) return 'Component';
+  const name = compUid.includes('.') ? compUid.split('.')[1] : compUid;
+  return name
+    .split(/[-_]/)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+}
+
+export interface DynamicZoneItemMatch {
+  index: number;
+  componentUid?: string;
+  componentName?: string;
+  value: any;
+  path: string;
+}
+
+/**
+ * Extracts all matching instances of a nested property across dynamic zone components or repeatable arrays.
+ */
+export function getAllNestedValues(obj: any, path: string): DynamicZoneItemMatch[] {
+  if (!obj || !path) return [];
+  const parsed = parseDynamicZonePath(path);
+  const parts = parsed.cleanPath.split('.');
+  const [head, ...tail] = parts;
+
+  const rootTarget = obj[head];
+
+  // If rootTarget is an Array (Dynamic Zone or Repeatable Component)
+  if (Array.isArray(rootTarget)) {
+    const results: DynamicZoneItemMatch[] = [];
+    rootTarget.forEach((item, idx) => {
+      if (!item || typeof item !== 'object') return;
+      if (parsed.targetIndex !== undefined && idx !== parsed.targetIndex) return;
+      if (parsed.targetComponentUid && item.__component !== parsed.targetComponentUid) return;
+
+      const subVal = tail.length > 0 ? getDeepProperty(item, tail.join('.')) : item;
+      if (subVal !== undefined) {
+        results.push({
+          index: idx,
+          componentUid: item.__component,
+          componentName: formatComponentName(item.__component),
+          value: subVal,
+          path: `${head}[#${idx}${item.__component ? ` ${formatComponentName(item.__component)}` : ''}].${tail.join('.')}`,
+        });
+      }
+    });
+    return results;
+  }
+
+  // Not an array, standard object resolution
+  const singleVal = getDeepProperty(obj, parsed.cleanPath);
+  if (singleVal !== undefined) {
+    return [
+      {
+        index: 0,
+        value: singleVal,
+        path: parsed.cleanPath,
+      },
+    ];
+  }
+
+  return [];
+}
+
+/**
+ * Validates whether an attribute corresponds to a valid deep component hierarchy
  */
 export function isDeepComponentField(contentType: any, allComponents: Record<string, any>, attribute: string): boolean {
-  if (!attribute || !attribute.includes('.')) return false;
-  const parts = attribute.split('.');
+  if (!attribute || (!attribute.includes('.') && !attribute.includes('['))) return false;
+  const parsed = parseDynamicZonePath(attribute);
+  const parts = parsed.cleanPath.split('.');
 
   function checkPath(currentSchema: any, pathParts: string[]): boolean {
     if (pathParts.length === 0) return true;
@@ -200,6 +301,10 @@ export function isDeepComponentField(contentType: any, allComponents: Record<str
 
     if (attrDef.type === 'dynamiczone') {
       const compUids = Array.isArray(attrDef.components) ? attrDef.components : [];
+      if (parsed.targetComponentUid) {
+        const comp = allComponents[parsed.targetComponentUid];
+        return comp ? checkPath(comp, tail) : false;
+      }
       return compUids.some((compUid: string) => {
         const comp = allComponents[compUid];
         return checkPath(comp, tail);
@@ -213,12 +318,13 @@ export function isDeepComponentField(contentType: any, allComponents: Record<str
 }
 
 /**
- * Retrieves the schema definition of a leaf attribute from a deep dot-notation path
+ * Retrieves the schema definition of a leaf attribute from a deep dot-notation or bracket path
  */
 export function getLeafAttributeSchema(contentType: any, allComponents: Record<string, any>, attribute: string): any {
   if (!attribute) return null;
-  if (!attribute.includes('.')) return contentType?.attributes?.[attribute] || null;
-  const parts = attribute.split('.');
+  const parsed = parseDynamicZonePath(attribute);
+  if (!parsed.cleanPath.includes('.')) return contentType?.attributes?.[parsed.cleanPath] || null;
+  const parts = parsed.cleanPath.split('.');
 
   function resolveLeaf(currentSchema: any, pathParts: string[]): any {
     if (!currentSchema || !currentSchema.attributes) return null;
@@ -236,6 +342,9 @@ export function getLeafAttributeSchema(contentType: any, allComponents: Record<s
 
     if (attrDef.type === 'dynamiczone') {
       const compUids = Array.isArray(attrDef.components) ? attrDef.components : [];
+      if (parsed.targetComponentUid) {
+        return resolveLeaf(allComponents[parsed.targetComponentUid], tail);
+      }
       for (const compUid of compUids) {
         const found = resolveLeaf(allComponents[compUid], tail);
         if (found) return found;
@@ -250,9 +359,17 @@ export function getLeafAttributeSchema(contentType: any, allComponents: Record<s
 
 /**
  * Immutably sets a nested property at an arbitrary depth while preserving all sibling properties.
- * Fully supports nested dynamic zones (arrays of components) and repeatable components.
+ * Fully supports selective targeting of specific dynamic zone indices or component types.
  */
-export function setDeepProperty(obj: any, pathParts: string[], value: any): any {
+export function setDeepProperty(
+  obj: any,
+  pathParts: string[],
+  value: any,
+  options?: {
+    targetIndexes?: number[];
+    targetComponentUid?: string;
+  }
+): any {
   if (pathParts.length === 0) return value;
   const [head, ...tail] = pathParts;
 
@@ -262,18 +379,27 @@ export function setDeepProperty(obj: any, pathParts: string[], value: any): any 
     if (/^\d+$/.test(head)) {
       const idx = parseInt(head, 10);
       const copy = [...obj];
-      copy[idx] = setDeepProperty(copy[idx] || {}, tail, value);
+      copy[idx] = setDeepProperty(copy[idx] || {}, tail, value, options);
       return copy;
     }
 
     // Otherwise, head is a property name inside the array items!
-    // Update every item in the array that has (or can accept) this property
-    return obj.map((item) => {
+    // Update items according to options.targetIndexes / options.targetComponentUid
+    return obj.map((item, idx) => {
       if (!item || typeof item !== 'object') return item;
+
+      if (options?.targetIndexes && options.targetIndexes.length > 0) {
+        if (!options.targetIndexes.includes(idx)) return item;
+      }
+
+      if (options?.targetComponentUid) {
+        if (item.__component !== options.targetComponentUid) return item;
+      }
+
       if (head in item || (tail.length > 0 && typeof item[head] === 'object')) {
         return {
           ...item,
-          [head]: setDeepProperty(item[head], tail, value),
+          [head]: setDeepProperty(item[head], tail, value, options),
         };
       }
       return item;
@@ -287,20 +413,21 @@ export function setDeepProperty(obj: any, pathParts: string[], value: any): any 
   } else {
     const subTarget = current[head];
     if (Array.isArray(subTarget)) {
-      current[head] = setDeepProperty(subTarget, tail, value);
+      current[head] = setDeepProperty(subTarget, tail, value, options);
     } else {
-      current[head] = setDeepProperty(subTarget || {}, tail, value);
+      current[head] = setDeepProperty(subTarget || {}, tail, value, options);
     }
   }
   return current;
 }
 
 /**
- * Safely resolves a nested dot-notation property (e.g. "a.b.c.d") across objects and dynamic zone arrays
+ * Safely resolves a nested dot-notation property (e.g. "a.b.c.d" or bracket notation) across objects and dynamic zone arrays
  */
 export function getDeepProperty(obj: any, path: string): any {
   if (!obj || !path) return undefined;
-  const parts = path.split('.');
+  const parsed = parseDynamicZonePath(path);
+  const parts = parsed.cleanPath.split('.');
 
   function extract(current: any, remainingParts: string[]): any {
     if (current === undefined || current === null) return undefined;
@@ -312,7 +439,10 @@ export function getDeepProperty(obj: any, path: string): any {
       if (/^\d+$/.test(head)) {
         return extract(current[parseInt(head, 10)], tail);
       }
-      for (const item of current) {
+      for (let idx = 0; idx < current.length; idx++) {
+        const item = current[idx];
+        if (parsed.targetIndex !== undefined && idx !== parsed.targetIndex) continue;
+        if (parsed.targetComponentUid && item?.__component !== parsed.targetComponentUid) continue;
         const found = extract(item?.[head], tail);
         if (found !== undefined && found !== null) return found;
       }
@@ -575,7 +705,7 @@ async function executeBatchInternal(
   }: {
     attribute: string;
     value: string;
-    selectedEntries?: Array<{ uid: string; documentId: string }>;
+    selectedEntries?: Array<{ uid: string; documentId: string; dynamicZoneIndexes?: number[]; targetComponentUid?: string }>;
     selectedCollections?: string[];
     isRegex?: boolean;
     regexPattern?: string;
@@ -588,9 +718,7 @@ async function executeBatchInternal(
     throw new Error('Attribute name is required.');
   }
 
-
-
-  const targetsMap = new Map<string, { uid: string; documentId: string }>();
+  const targetsMap = new Map<string, { uid: string; documentId: string; dynamicZoneIndexes?: number[]; targetComponentUid?: string }>();
 
   // 1. Add entire collections if selected
   for (const colUid of selectedCollections) {
@@ -606,7 +734,12 @@ async function executeBatchInternal(
   for (const item of selectedEntries) {
     if (!item.uid || !item.documentId) continue;
     const key = `${item.uid}@@@${item.documentId}`;
-    targetsMap.set(key, { uid: item.uid, documentId: item.documentId });
+    targetsMap.set(key, {
+      uid: item.uid,
+      documentId: item.documentId,
+      dynamicZoneIndexes: item.dynamicZoneIndexes,
+      targetComponentUid: item.targetComponentUid,
+    });
   }
 
   if (targetsMap.size === 0) {
@@ -682,10 +815,13 @@ async function executeBatchInternal(
           currentEntry?.email ||
           `Entry #${target.documentId}`;
 
-        const isNested = attribute.includes('.');
+        const parsed = parseDynamicZonePath(attribute);
+        const isNested = attribute.includes('.') || attribute.includes('[');
         const isComponentNested = isNested && isDeepComponentField(contentType, strapi.components, attribute);
-        const parts = isNested ? attribute.split('.') : [];
-        const rootKey = isNested ? parts[0] : '';
+        const parts = isNested ? parsed.cleanPath.split('.') : [];
+        const rootKey = parsed.rootKey;
+        const targetComponentUid = target.targetComponentUid || parsed.targetComponentUid;
+        const targetIndexes = target.dynamicZoneIndexes;
 
         const attrDef = contentType?.attributes?.[attribute];
         const hasAttribute = Boolean(attrDef) || isComponentNested;
@@ -701,14 +837,31 @@ async function executeBatchInternal(
             const currentEntryWithPopulate: any = await strapi.documents(target.uid as any).findOne(findOneArgs);
             const isRootDz = contentType?.attributes?.[rootKey]?.type === 'dynamiczone';
             const existingRoot = currentEntryWithPopulate?.[rootKey] || (isRootDz ? [] : {});
-            const currentVal = getDeepProperty(existingRoot, parts.slice(1).join('.'));
+
+            let affectedMatches: DynamicZoneItemMatch[] = [];
+            if (isRootDz && Array.isArray(existingRoot)) {
+              affectedMatches = getAllNestedValues({ [rootKey]: existingRoot }, attribute);
+              if (targetIndexes && targetIndexes.length > 0) {
+                affectedMatches = affectedMatches.filter((m) => targetIndexes.includes(m.index));
+              }
+              if (targetComponentUid) {
+                affectedMatches = affectedMatches.filter((m) => m.componentUid === targetComponentUid);
+              }
+            }
+
+            const currentVal = isRootDz
+              ? (affectedMatches.length > 0 ? affectedMatches.map((m) => m.value).join(', ') : getDeepProperty(existingRoot, parts.slice(1).join('.')))
+              : getDeepProperty(existingRoot, parts.slice(1).join('.'));
 
             let newValue = value;
             if (regexObj && typeof currentVal === 'string') {
               newValue = currentVal.replace(regexObj, value);
             }
 
-            const updatedRoot = setDeepProperty(existingRoot, parts.slice(1), newValue);
+            const updatedRoot = setDeepProperty(existingRoot, parts.slice(1), newValue, {
+              targetIndexes,
+              targetComponentUid,
+            });
 
             await strapi.documents(target.uid as any).update({
               documentId: target.documentId,
@@ -738,6 +891,17 @@ async function executeBatchInternal(
               statusOverride: (publishOnApproval && isDraftAndPublishComp) ? 'published' : undefined,
             });
 
+            const dzDiffs = isRootDz && affectedMatches.length > 0
+              ? affectedMatches.map((m) => ({
+                  index: m.index,
+                  componentUid: m.componentUid,
+                  componentName: m.componentName,
+                  attribute: `${rootKey}[#${m.index} ${m.componentName}].${parts.slice(1).join('.')}`,
+                  oldValue: m.value,
+                  newValue: regexObj && typeof m.value === 'string' ? m.value.replace(regexObj, value) : value,
+                }))
+              : [];
+
             return {
               uid: target.uid,
               collectionName: displayName,
@@ -747,7 +911,10 @@ async function executeBatchInternal(
               oldValue: currentVal ?? null,
               newValue,
               status: 'updated' as const,
-              message: `Successfully updated nested field ${attribute}`,
+              message: isRootDz
+                ? `Successfully updated ${affectedMatches.length} dynamic zone item(s) in ${attribute}`
+                : `Successfully updated nested field ${attribute}`,
+              dynamicZoneDiffs: dzDiffs,
             };
           }
 
@@ -960,6 +1127,27 @@ async function executeBatchInternal(
     isLive: r.status === 'updated',
   }));
 
+  const flattenedDiffs: any[] = [];
+  for (const r of results) {
+    if (r.dynamicZoneDiffs && r.dynamicZoneDiffs.length > 0) {
+      for (const dz of r.dynamicZoneDiffs) {
+        flattenedDiffs.push({
+          uid: r.uid,
+          collectionName: r.collectionName,
+          documentId: r.documentId,
+          label: `${r.label} [Block #${dz.index} (${dz.componentName})]`,
+          attribute: dz.attribute,
+          oldValue: dz.oldValue,
+          newValue: dz.newValue,
+          status: 'updated',
+          message: `Updated ${dz.attribute}`,
+        });
+      }
+    } else {
+      flattenedDiffs.push(r);
+    }
+  }
+
   const batchSummary = {
     batchId,
     attribute,
@@ -973,7 +1161,7 @@ async function executeBatchInternal(
   // Stateless audit recording via consumer's declared audit schema
   await strapi.plugin('bulk-updater').service('audit').recordBatch(
     batchSummary,
-    results,
+    flattenedDiffs,
     currentUser
   );
 
@@ -1310,6 +1498,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
               const dzDef = rawAttrs[attrKey];
               const dzComponents = Array.isArray(dzDef.components) ? dzDef.components : [];
               for (const compUid of dzComponents) {
+                // Generic path across all components (e.g. blocks.title)
                 const compAttrs = discoverComponentAttributes(
                   strapi,
                   compUid,
@@ -1323,6 +1512,21 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
                   colAttributesMeta
                 );
                 nestedComponentAttrs.push(...compAttrs);
+
+                // Component-scoped path (e.g. blocks[shared.heading].title)
+                const scopedAttrs = discoverComponentAttributes(
+                  strapi,
+                  compUid,
+                  `${attrKey}[${compUid}]`,
+                  1,
+                  5,
+                  systemFields,
+                  allContentTypes,
+                  relationsByAttr,
+                  allRelationsMeta,
+                  colAttributesMeta
+                );
+                nestedComponentAttrs.push(...scopedAttrs);
               }
               return false;
             }
@@ -1582,14 +1786,21 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       const attrs = contentType.attributes || {};
       let colHasAttribute = false;
       let isNestedAttr = false;
+      let isRootDz = false;
       let parts: string[] = [];
 
       if (targetFilterAttr) {
-        if (targetFilterAttr.includes('.')) {
+        const parsed = parseDynamicZonePath(targetFilterAttr);
+        if (parsed.rootKey && contentType.attributes?.[parsed.rootKey]?.type === 'dynamiczone') {
+          isRootDz = true;
+          colHasAttribute = true;
+          isNestedAttr = true;
+          parts = parsed.cleanPath.split('.');
+        } else if (targetFilterAttr.includes('.') || targetFilterAttr.includes('[')) {
           isNestedAttr = isDeepComponentField(contentType, strapi.components, targetFilterAttr);
           if (isNestedAttr) {
             colHasAttribute = true;
-            parts = targetFilterAttr.split('.');
+            parts = parsed.cleanPath.split('.');
           }
         } else if (attrs[targetFilterAttr]) {
           colHasAttribute = true;
@@ -1656,8 +1867,13 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
         if (condition !== undefined) {
           if (isNestedAttr) {
-            const deepFilter = buildDeepFilter(parts, condition);
-            Object.assign(filters, deepFilter);
+            if (isRootDz) {
+              // Dynamic zones cannot be filtered via database pushdown in Strapi 5 (causes "Invalid key <zone>").
+              // Evaluated in-memory across all components after fetching entries.
+            } else {
+              const deepFilter = buildDeepFilter(parts, condition);
+              Object.assign(filters, deepFilter);
+            }
           } else {
             if (normOp === 'empty' && isStringLike) {
               filters.$or = [
@@ -1723,7 +1939,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           },
         };
       } else {
-
         let sortClause: any = {};
         if (sortField && sortField.includes('.')) {
           const sortParts = sortField.split('.');
@@ -1738,42 +1953,100 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           sortClause['createdAt'] = 'desc';
         }
 
-        const findManyArgs: any = {
-          start,
-          limit,
-          filters: Object.keys(filters).length > 0 ? filters : undefined,
-          sort: sortClause,
-        };
-        if (populateOption) {
-          findManyArgs.populate = populateOption;
-        }
-
-        const [entries, totalEntries] = await Promise.all([
-          strapi.documents(uid as any).findMany(findManyArgs),
-          strapi.documents(uid as any).count({
+        if (isRootDz && normOp && normOp !== 'none') {
+          // Dynamic zone filter active: fetch candidates safely and filter in-memory across all components
+          const findManyArgs: any = {
+            limit: 500,
             filters: Object.keys(filters).length > 0 ? filters : undefined,
-          }),
-        ]);
+            sort: sortClause,
+          };
+          if (populateOption) {
+            findManyArgs.populate = populateOption;
+          }
 
-        const totalPages = Math.ceil(totalEntries / limit);
+          const rawEntries = await strapi.documents(uid as any).findMany(findManyArgs);
+          const qVal = (filterQuery || '').trim().toLowerCase();
 
-        result = {
-          uid,
-          displayName: contentType.info?.displayName || uid,
-          isSingleType: false,
-          draftAndPublish: Boolean(contentType.options?.draftAndPublish),
-          entries: (entries || []).map((entry: any) => ({
-            id: entry.id,
-            documentId: entry.documentId,
-            ...entry,
-          })),
-          pagination: {
-            page: currentPage,
-            pageSize: limit,
-            total: totalEntries,
-            pageCount: totalPages,
-          },
-        };
+          const passesDzFilter = (entry: any) => {
+            const matches = getAllNestedValues(entry, targetFilterAttr);
+            if (normOp === 'empty') {
+              return matches.length === 0 || matches.every((m) => m.value === undefined || m.value === null || String(m.value).trim() === '');
+            }
+            if (normOp === 'notempty') {
+              return matches.some((m) => m.value !== undefined && m.value !== null && String(m.value).trim() !== '');
+            }
+            return matches.some((m) => {
+              if (m.value === undefined || m.value === null) return false;
+              const valStr = String(m.value).toLowerCase();
+              switch (normOp) {
+                case 'equals': return valStr === qVal;
+                case 'notequals': return valStr !== qVal;
+                case 'contains': return valStr.includes(qVal);
+                case 'notcontains': return !valStr.includes(qVal);
+                case 'startswith': return valStr.startsWith(qVal);
+                case 'endswith': return valStr.endsWith(qVal);
+                default: return true;
+              }
+            });
+          };
+
+          const matchedEntries = (rawEntries || []).filter(passesDzFilter);
+          const totalEntries = matchedEntries.length;
+          const paginatedEntries = matchedEntries.slice(start, start + limit);
+
+          result = {
+            uid,
+            displayName: contentType.info?.displayName || uid,
+            isSingleType: false,
+            draftAndPublish: Boolean(contentType.options?.draftAndPublish),
+            entries: paginatedEntries.map((entry: any) => ({
+              id: entry.id,
+              documentId: entry.documentId,
+              ...entry,
+            })),
+            pagination: {
+              page: currentPage,
+              pageSize: limit,
+              total: totalEntries,
+              pageCount: Math.ceil(totalEntries / limit) || 1,
+            },
+          };
+        } else {
+          const findManyArgs: any = {
+            start,
+            limit,
+            filters: Object.keys(filters).length > 0 ? filters : undefined,
+            sort: sortClause,
+          };
+          if (populateOption) {
+            findManyArgs.populate = populateOption;
+          }
+
+          const [entries, totalEntries] = await Promise.all([
+            strapi.documents(uid as any).findMany(findManyArgs),
+            strapi.documents(uid as any).count({
+              filters: Object.keys(filters).length > 0 ? filters : undefined,
+            }),
+          ]);
+
+          result = {
+            uid,
+            displayName: contentType.info?.displayName || uid,
+            isSingleType: false,
+            draftAndPublish: Boolean(contentType.options?.draftAndPublish),
+            entries: (entries || []).map((entry: any) => ({
+              id: entry.id,
+              documentId: entry.documentId,
+              ...entry,
+            })),
+            pagination: {
+              page: currentPage,
+              pageSize: limit,
+              total: totalEntries,
+              pageCount: Math.ceil(totalEntries / limit) || 1,
+            },
+          };
+        }
       }
 
       // Store in queryCache with bounding limit

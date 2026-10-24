@@ -152,12 +152,112 @@ export interface ColumnDef {
 }
 
 /**
- * Safely resolves a nested dot-notation property (e.g. "defaultSeo.metaDescription" or "content.titleHeadingStyle.titleStyle")
- * across both objects and dynamic zone / repeatable component arrays.
+ * Parses dynamic zone dot or bracket notation paths:
+ * e.g. "blocks.title", "blocks[shared.heading].title", or "blocks[0].title"
+ */
+export function parseDynamicZonePath(path: string): {
+  cleanPath: string;
+  rootKey: string;
+  subPath: string;
+  targetComponentUid?: string;
+  targetIndex?: number;
+} {
+  if (!path) return { cleanPath: '', rootKey: '', subPath: '' };
+  const bracketMatch = path.match(/^([^.[]+)\[([^\]]+)\]\.(.+)$/);
+  if (bracketMatch) {
+    const rootKey = bracketMatch[1];
+    const selector = bracketMatch[2];
+    const subPath = bracketMatch[3];
+    const cleanPath = `${rootKey}.${subPath}`;
+    if (/^\d+$/.test(selector)) {
+      return { cleanPath, rootKey, subPath, targetIndex: parseInt(selector, 10) };
+    }
+    return { cleanPath, rootKey, subPath, targetComponentUid: selector };
+  }
+
+  const parts = path.split('.');
+  return {
+    cleanPath: path,
+    rootKey: parts[0] || '',
+    subPath: parts.slice(1).join('.'),
+  };
+}
+
+/**
+ * Formats a component UID into a friendly readable label (e.g. "shared.featured-section" -> "Featured Section")
+ */
+export function formatComponentName(compUid?: string): string {
+  if (!compUid) return 'Component';
+  const name = compUid.includes('.') ? compUid.split('.')[1] : compUid;
+  return name
+    .split(/[-_]/)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+}
+
+export interface DynamicZoneItemMatch {
+  index: number;
+  componentUid?: string;
+  componentName?: string;
+  value: any;
+  path: string;
+}
+
+/**
+ * Extracts all matching instances of a nested property across dynamic zone components or repeatable arrays.
+ */
+export function getAllNestedValues(obj: any, path: string): DynamicZoneItemMatch[] {
+  if (!obj || !path) return [];
+  const parsed = parseDynamicZonePath(path);
+  const parts = parsed.cleanPath.split('.');
+  const [head, ...tail] = parts;
+
+  const rootTarget = obj[head];
+
+  // If rootTarget is an Array (Dynamic Zone or Repeatable Component)
+  if (Array.isArray(rootTarget)) {
+    const results: DynamicZoneItemMatch[] = [];
+    rootTarget.forEach((item, idx) => {
+      if (!item || typeof item !== 'object') return;
+      if (parsed.targetIndex !== undefined && idx !== parsed.targetIndex) return;
+      if (parsed.targetComponentUid && item.__component !== parsed.targetComponentUid) return;
+
+      const subVal = tail.length > 0 ? getNestedValue(item, tail.join('.')) : item;
+      if (subVal !== undefined) {
+        results.push({
+          index: idx,
+          componentUid: item.__component,
+          componentName: formatComponentName(item.__component),
+          value: subVal,
+          path: `${head}[#${idx}${item.__component ? ` ${formatComponentName(item.__component)}` : ''}].${tail.join('.')}`,
+        });
+      }
+    });
+    return results;
+  }
+
+  // Not an array, standard object resolution
+  const singleVal = getNestedValue(obj, parsed.cleanPath);
+  if (singleVal !== undefined) {
+    return [
+      {
+        index: 0,
+        value: singleVal,
+        path: parsed.cleanPath,
+      },
+    ];
+  }
+
+  return [];
+}
+
+/**
+ * Safely resolves a nested dot-notation property across objects and dynamic zone / repeatable component arrays.
  */
 export function getNestedValue(obj: any, path: string): any {
   if (!obj || !path) return undefined;
-  const parts = path.split('.');
+  const parsed = parseDynamicZonePath(path);
+  const parts = parsed.cleanPath.split('.');
 
   function extract(current: any, remainingParts: string[]): any {
     if (current === undefined || current === null) return undefined;
@@ -169,7 +269,10 @@ export function getNestedValue(obj: any, path: string): any {
       if (/^\d+$/.test(head)) {
         return extract(current[parseInt(head, 10)], tail);
       }
-      for (const item of current) {
+      for (let idx = 0; idx < current.length; idx++) {
+        const item = current[idx];
+        if (parsed.targetIndex !== undefined && idx !== parsed.targetIndex) continue;
+        if (parsed.targetComponentUid && item?.__component !== parsed.targetComponentUid) continue;
         const found = extract(item?.[head], tail);
         if (found !== undefined && found !== null) return found;
       }
@@ -212,9 +315,19 @@ export function getAvailableColumnsForCollection(
     if (attr === 'name' || attr === 'title' || attr === selectedAttribute || (searchAttribute && attr === searchAttribute)) {
       return;
     }
-    const formattedLabel = attr.includes('.')
-      ? attr.split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ')
-      : attr.charAt(0).toUpperCase() + attr.slice(1);
+    let formattedLabel = attr;
+    const bracketMatch = attr.match(/^([^.[]+)\[([^\]]+)\]\.(.+)$/);
+    if (bracketMatch) {
+      const root = bracketMatch[1].charAt(0).toUpperCase() + bracketMatch[1].slice(1);
+      const comp = formatComponentName(bracketMatch[2]);
+      const sub = bracketMatch[3].split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
+      formattedLabel = `${root} [${comp}] > ${sub}`;
+    } else if (attr.includes('.')) {
+      formattedLabel = attr.split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
+    } else {
+      formattedLabel = attr.charAt(0).toUpperCase() + attr.slice(1);
+    }
+
     cols.push({
       key: `attr_${attr}`,
       label: formattedLabel,
@@ -225,9 +338,17 @@ export function getAvailableColumnsForCollection(
 
   // Dedicated search attribute column if searchAttribute differs from selectedAttribute
   if (searchAttribute && searchAttribute !== selectedAttribute) {
-    const formattedSearchLabel = searchAttribute.includes('.')
-      ? searchAttribute.split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ')
-      : searchAttribute;
+    let formattedSearchLabel = searchAttribute;
+    const bracketMatch = searchAttribute.match(/^([^.[]+)\[([^\]]+)\]\.(.+)$/);
+    if (bracketMatch) {
+      const root = bracketMatch[1].charAt(0).toUpperCase() + bracketMatch[1].slice(1);
+      const comp = formatComponentName(bracketMatch[2]);
+      const sub = bracketMatch[3].split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
+      formattedSearchLabel = `${root} [${comp}] > ${sub}`;
+    } else if (searchAttribute.includes('.')) {
+      formattedSearchLabel = searchAttribute.split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
+    }
+
     cols.push({
       key: 'search_attr',
       label: `Search: "${formattedSearchLabel}"`,
@@ -238,9 +359,20 @@ export function getAvailableColumnsForCollection(
 
   // Target attribute column (only if an update attribute has been selected)
   if (selectedAttribute && selectedAttribute.trim()) {
+    let formattedTargetLabel = selectedAttribute;
+    const bracketMatch = selectedAttribute.match(/^([^.[]+)\[([^\]]+)\]\.(.+)$/);
+    if (bracketMatch) {
+      const root = bracketMatch[1].charAt(0).toUpperCase() + bracketMatch[1].slice(1);
+      const comp = formatComponentName(bracketMatch[2]);
+      const sub = bracketMatch[3].split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
+      formattedTargetLabel = `${root} [${comp}] > ${sub}`;
+    } else if (selectedAttribute.includes('.')) {
+      formattedTargetLabel = selectedAttribute.split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
+    }
+
     const targetLabel = searchAttribute && searchAttribute !== selectedAttribute
-      ? `Update Target: "${selectedAttribute}"`
-      : `Current "${selectedAttribute}"`;
+      ? `Update Target: "${formattedTargetLabel}"`
+      : `Current "${formattedTargetLabel}"`;
 
     cols.push({
       key: 'target_attr',
@@ -437,7 +569,10 @@ function renderCellContent(
   hasAttr: boolean,
   isSelected: boolean,
   onToggleSelect: () => void,
-  pendingBatches: PendingBatch[] = []
+  pendingBatches: PendingBatch[] = [],
+  isDzExpanded = false,
+  onToggleExpandDz?: () => void,
+  filterQuery = ''
 ): React.ReactNode {
   switch (colDef.key) {
     case 'select':
@@ -450,6 +585,11 @@ function renderCellContent(
 
     case 'identifier': {
       const mainText = entry.name || entry.title || `Entry #${entry.id || entry.documentId}`;
+      const dzField = Object.keys(entry).find(
+        (k) => Array.isArray(entry[k]) && entry[k].length > 0 && entry[k].some((item: any) => item && item.__component)
+      );
+      const dzItemsCount = dzField ? entry[dzField].length : 0;
+
       return (
         <Box>
           <Typography fontWeight="semiBold">{mainText}</Typography>
@@ -458,50 +598,165 @@ function renderCellContent(
               {entry.email}
             </Typography>
           )}
+          {dzItemsCount > 0 && (
+            <Box marginTop={1}>
+              <Button
+                variant="ghost"
+                size="S"
+                onClick={onToggleExpandDz}
+                style={{
+                  padding: '2px 6px',
+                  height: 'auto',
+                  fontSize: '0.72rem',
+                  color: isDzExpanded ? '#4945ff' : '#666687',
+                  backgroundColor: isDzExpanded ? 'rgba(73, 69, 255, 0.08)' : 'rgba(0, 0, 0, 0.04)',
+                  borderRadius: 4,
+                }}
+              >
+                {isDzExpanded
+                  ? `▲ Hide ${dzField} (${dzItemsCount} blocks)`
+                  : `▼ View ${dzField} (${dzItemsCount} blocks)`}
+              </Button>
+            </Box>
+          )}
         </Box>
       );
     }
 
     case 'search_attr': {
-      const val = getNestedValue(entry, searchAttribute);
-      const displayStr = formatDisplayValue(val);
-      const isUnset = displayStr === '(empty / not set)' || displayStr === '(empty / unlinked)';
+      const matches = getAllNestedValues(entry, searchAttribute);
+      if (matches.length === 0) {
+        return (
+          <Typography textColor="neutral500" style={{ fontStyle: 'italic' }}>
+            (empty / not set)
+          </Typography>
+        );
+      }
+      if (matches.length === 1 && !matches[0].componentUid) {
+        const displayStr = formatDisplayValue(matches[0].value);
+        const isUnset = displayStr === '(empty / not set)' || displayStr === '(empty / unlinked)';
+        return (
+          <Typography
+            textColor={isUnset ? 'neutral500' : 'primary700'}
+            fontWeight="semiBold"
+            style={{
+              fontStyle: isUnset ? 'italic' : 'normal',
+              display: 'inline-block',
+              maxWidth: 260,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {displayStr}
+          </Typography>
+        );
+      }
+
+      const qLower = (filterQuery || '').trim().toLowerCase();
       return (
-        <Typography
-          textColor={isUnset ? 'neutral500' : 'primary700'}
-          fontWeight="semiBold"
-          style={{
-            fontStyle: isUnset ? 'italic' : 'normal',
-            display: 'inline-block',
-            maxWidth: 260,
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-          }}
-        >
-          {displayStr}
-        </Typography>
+        <Flex direction="column" gap={1} alignItems="flex-start" style={{ maxWidth: 320 }}>
+          {matches.map((m) => {
+            const displayStr = formatDisplayValue(m.value);
+            const isMatchItem = qLower && displayStr.toLowerCase().includes(qLower);
+            return (
+              <Flex
+                key={m.index}
+                gap={1}
+                alignItems="center"
+                style={{
+                  backgroundColor: isMatchItem ? 'rgba(46, 213, 115, 0.15)' : 'rgba(0, 0, 0, 0.03)',
+                  padding: '2px 6px',
+                  borderRadius: 4,
+                  border: isMatchItem ? '1px solid #2ed573' : '1px solid transparent',
+                }}
+              >
+                <Badge size="S" backgroundColor={isMatchItem ? 'success100' : 'primary100'} textColor={isMatchItem ? 'success700' : 'primary700'}>
+                  #{m.index} {m.componentName}
+                </Badge>
+                <Typography
+                  variant="pi"
+                  fontWeight={isMatchItem ? 'bold' : 'normal'}
+                  textColor={isMatchItem ? 'success700' : 'neutral800'}
+                  style={{
+                    maxWidth: 200,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {displayStr}
+                </Typography>
+              </Flex>
+            );
+          })}
+        </Flex>
       );
     }
 
     case 'target_attr': {
-      const val = getNestedValue(entry, selectedAttribute);
-      const displayStr = formatDisplayValue(val);
-      const isUnset = displayStr === '(empty / not set)' || displayStr === '(empty / unlinked)';
+      const matches = getAllNestedValues(entry, selectedAttribute);
+      if (matches.length === 0) {
+        return (
+          <Typography textColor="neutral500" style={{ fontStyle: 'italic' }}>
+            (empty / not set)
+          </Typography>
+        );
+      }
+      if (matches.length === 1 && !matches[0].componentUid) {
+        const displayStr = formatDisplayValue(matches[0].value);
+        const isUnset = displayStr === '(empty / not set)' || displayStr === '(empty / unlinked)';
+        return (
+          <Typography
+            textColor={isUnset ? 'neutral500' : 'neutral800'}
+            style={{
+              fontStyle: isUnset ? 'italic' : 'normal',
+              display: 'inline-block',
+              maxWidth: 260,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {displayStr}
+          </Typography>
+        );
+      }
+
       return (
-        <Typography
-          textColor={isUnset ? 'neutral500' : 'neutral800'}
-          style={{
-            fontStyle: isUnset ? 'italic' : 'normal',
-            display: 'inline-block',
-            maxWidth: 260,
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-          }}
-        >
-          {displayStr}
-        </Typography>
+        <Flex direction="column" gap={1} alignItems="flex-start" style={{ maxWidth: 320 }}>
+          {matches.map((m) => {
+            const displayStr = formatDisplayValue(m.value);
+            return (
+              <Flex
+                key={m.index}
+                gap={1}
+                alignItems="center"
+                style={{
+                  backgroundColor: 'rgba(0, 0, 0, 0.03)',
+                  padding: '2px 6px',
+                  borderRadius: 4,
+                }}
+              >
+                <Badge size="S" backgroundColor="neutral200" textColor="neutral800">
+                  #{m.index} {m.componentName}
+                </Badge>
+                <Typography
+                  variant="pi"
+                  textColor="neutral800"
+                  style={{
+                    maxWidth: 200,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {displayStr}
+                </Typography>
+              </Flex>
+            );
+          })}
+        </Flex>
       );
     }
 
@@ -628,6 +883,8 @@ const BulkUpdater: React.FC = () => {
   const [selectedAttribute, setSelectedAttribute] = useState<string>(getInitialAttribute);
   const [attributeValue, setAttributeValue] = useState<string>('');
   const [selectedEntries, setSelectedEntries] = useState<Record<string, boolean>>({});
+  const [expandedDzEntries, setExpandedDzEntries] = useState<Record<string, boolean>>({});
+  const [selectedDzBlocks, setSelectedDzBlocks] = useState<Record<string, number[]>>({});
 
   // Relation State
   const [relationsMeta, setRelationsMeta] = useState<Record<string, RelationMeta>>({});
@@ -1324,20 +1581,55 @@ const BulkUpdater: React.FC = () => {
   // Toggle single entry
   const toggleEntry = (uid: string, documentId: string) => {
     const key = `${uid}${KEY_SEP}${documentId}`;
+    const nextVal = !selectedEntries[key];
     setSelectedEntries((prev) => ({
       ...prev,
-      [key]: !prev[key],
+      [key]: nextVal,
     }));
+    if (!nextVal) {
+      setSelectedDzBlocks((prev) => {
+        const copy = { ...prev };
+        delete copy[key];
+        return copy;
+      });
+    }
   };
 
-  // Value filter evaluation
+  // Toggle individual dynamic zone block selection for an entry
+  const toggleDzBlock = (uid: string, documentId: string, blockIndex: number, allApplicableIndexes: number[]) => {
+    const key = `${uid}${KEY_SEP}${documentId}`;
+    setSelectedDzBlocks((prev) => {
+      const currentSelected = prev[key] !== undefined ? prev[key] : [...allApplicableIndexes];
+      let nextSelected: number[];
+      if (currentSelected.includes(blockIndex)) {
+        nextSelected = currentSelected.filter((idx) => idx !== blockIndex);
+      } else {
+        nextSelected = [...currentSelected, blockIndex];
+      }
+
+      if (nextSelected.length > 0) {
+        setSelectedEntries((e) => ({ ...e, [key]: true }));
+      } else {
+        setSelectedEntries((e) => ({ ...e, [key]: false }));
+      }
+
+      return {
+        ...prev,
+        [key]: nextSelected,
+      };
+    });
+  };
+
+  // Value filter evaluation across all dynamic zone / component matches
   const entryMatchesFilter = (entry: Entry, attr: string): boolean => {
-    // If regex search pattern is provided, verify against the search attribute value
+    const matches = getAllNestedValues(entry, attr);
+
+    // If regex search pattern is provided, verify against the search attribute values
     if (useRegex && regexPattern.trim()) {
       try {
         const regex = new RegExp(regexPattern, 'i');
-        const targetSearchVal = formatDisplayValue(getNestedValue(entry, attr));
-        if (!regex.test(targetSearchVal)) {
+        const anyRegexMatch = matches.some((m) => regex.test(formatDisplayValue(m.value)));
+        if (!anyRegexMatch) {
           return false;
         }
       } catch {
@@ -1346,30 +1638,41 @@ const BulkUpdater: React.FC = () => {
     }
 
     if (filterOperator === 'none') return true;
-    const val = getNestedValue(entry, attr);
-    const displayStr = formatDisplayValue(val);
-    const isValEmpty =
-      val === undefined ||
-      val === null ||
-      displayStr.trim() === '' ||
-      displayStr.trim().toLowerCase() === '(not set)' ||
-      displayStr.trim().toLowerCase() === '(empty / not set)' ||
-      displayStr.trim().toLowerCase() === '(empty / unlinked)';
 
-    switch (filterOperator) {
-      case 'empty':
-        return isValEmpty;
-      case 'not_empty':
-        return !isValEmpty;
-      case 'equals':
-        return !isValEmpty && displayStr.trim().toLowerCase() === filterQuery.trim().toLowerCase();
-      case 'contains':
-        return !isValEmpty && displayStr.toLowerCase().includes(filterQuery.trim().toLowerCase());
-      case 'starts_with':
-        return !isValEmpty && displayStr.trim().toLowerCase().startsWith(filterQuery.trim().toLowerCase());
-      default:
-        return true;
+    if (matches.length === 0) {
+      return filterOperator === 'empty';
     }
+
+    const checkMatch = (val: any) => {
+      const displayStr = formatDisplayValue(val);
+      const isValEmpty =
+        val === undefined ||
+        val === null ||
+        displayStr.trim() === '' ||
+        displayStr.trim().toLowerCase() === '(not set)' ||
+        displayStr.trim().toLowerCase() === '(empty / not set)' ||
+        displayStr.trim().toLowerCase() === '(empty / unlinked)';
+
+      switch (filterOperator) {
+        case 'empty':
+          return isValEmpty;
+        case 'not_empty':
+          return !isValEmpty;
+        case 'equals':
+          return !isValEmpty && displayStr.trim().toLowerCase() === filterQuery.trim().toLowerCase();
+        case 'contains':
+          return !isValEmpty && displayStr.toLowerCase().includes(filterQuery.trim().toLowerCase());
+        case 'starts_with':
+          return !isValEmpty && displayStr.trim().toLowerCase().startsWith(filterQuery.trim().toLowerCase());
+        default:
+          return true;
+      }
+    };
+
+    if (filterOperator === 'empty') {
+      return matches.every((m) => checkMatch(m.value));
+    }
+    return matches.some((m) => checkMatch(m.value));
   };
 
   const getVisibleEntries = (col: CollectionModel) => {
@@ -1574,12 +1877,16 @@ const BulkUpdater: React.FC = () => {
     executionMode: 'immediate' | 'queue_offpeak' | 'maker_checker',
     forceImmediate = false
   ) => {
-    const targets: Array<{ uid: string; documentId: string }> = [];
+    const targets: Array<{ uid: string; documentId: string; dynamicZoneIndexes?: number[] }> = [];
     Object.keys(selectedEntries).forEach((key) => {
       if (selectedEntries[key]) {
         const parts = key.split(KEY_SEP);
         if (parts.length === 2) {
-          targets.push({ uid: parts[0], documentId: parts[1] });
+          const targetObj: any = { uid: parts[0], documentId: parts[1] };
+          if (selectedDzBlocks[key] && selectedDzBlocks[key].length > 0) {
+            targetObj.dynamicZoneIndexes = selectedDzBlocks[key];
+          }
+          targets.push(targetObj);
         }
       }
     });
@@ -1629,6 +1936,7 @@ const BulkUpdater: React.FC = () => {
 
       if (res.data && res.data.success) {
         setSelectedEntries({});
+        setSelectedDzBlocks({});
         const finalBatchId = res.data.batchId;
         setDashboardBatchId(finalBatchId);
 
@@ -2955,40 +3263,161 @@ const BulkUpdater: React.FC = () => {
                               const key = `${col.uid}${KEY_SEP}${entry.documentId}`;
                               const isSelected = Boolean(selectedEntries[key]);
                               const isMatch = isFilterActive;
+                              const isDzExpanded = Boolean(expandedDzEntries[key]);
+                              const onToggleExpandDz = () =>
+                                setExpandedDzEntries((prev) => ({
+                                  ...prev,
+                                  [key]: !prev[key],
+                                }));
+
+                              const dzFields = Object.keys(entry).filter(
+                                (k) => Array.isArray(entry[k]) && entry[k].length > 0 && entry[k].some((item: any) => item && item.__component)
+                              );
 
                               return (
-                                <Tr
-                                  key={key}
-                                  style={{
-                                    backgroundColor: isSelected
-                                      ? 'rgba(73, 69, 255, 0.14)'
-                                      : isMatch
-                                      ? 'rgba(46, 213, 115, 0.08)'
-                                      : undefined,
-                                    boxShadow: isSelected
-                                      ? 'inset 3px 0 0 0 #4945ff'
-                                      : isMatch
-                                      ? 'inset 3px 0 0 0 #2ed573'
-                                      : undefined,
-                                  }}
-                                >
-                                  {activeColumns.map((colDef) => (
-                                    <Td key={colDef.key}>
-                                      {renderCellContent(
-                                        colDef,
-                                        entry,
-                                        col,
-                                        selectedAttribute,
-                                        searchAttribute,
-                                        isMatch,
-                                        hasAttr,
-                                        isSelected,
-                                        () => toggleEntry(col.uid, entry.documentId),
-                                        pendingBatches
-                                      )}
-                                    </Td>
-                                  ))}
-                                </Tr>
+                                <React.Fragment key={key}>
+                                  <Tr
+                                    style={{
+                                      backgroundColor: isSelected
+                                        ? 'rgba(73, 69, 255, 0.14)'
+                                        : isMatch
+                                        ? 'rgba(46, 213, 115, 0.08)'
+                                        : undefined,
+                                      boxShadow: isSelected
+                                        ? 'inset 3px 0 0 0 #4945ff'
+                                        : isMatch
+                                        ? 'inset 3px 0 0 0 #2ed573'
+                                        : undefined,
+                                    }}
+                                  >
+                                    {activeColumns.map((colDef) => (
+                                      <Td key={colDef.key}>
+                                        {renderCellContent(
+                                          colDef,
+                                          entry,
+                                          col,
+                                          selectedAttribute,
+                                          searchAttribute,
+                                          isMatch,
+                                          hasAttr,
+                                          isSelected,
+                                          () => toggleEntry(col.uid, entry.documentId),
+                                          pendingBatches,
+                                          isDzExpanded,
+                                          onToggleExpandDz,
+                                          filterQuery
+                                        )}
+                                      </Td>
+                                    ))}
+                                  </Tr>
+
+                                  {/* Dynamic Zone Expandable Drawer Sub-Table */}
+                                  {isDzExpanded && dzFields.map((dzKey) => {
+                                    const blocks = entry[dzKey] || [];
+                                    const targetParsed = parseDynamicZonePath(selectedAttribute);
+                                    const allApplicableIndexes = blocks
+                                      .map((_: any, i: number) => i)
+                                      .filter((i: number) => {
+                                        if (!targetParsed.subPath) return true;
+                                        return getNestedValue(blocks[i], targetParsed.subPath) !== undefined;
+                                      });
+
+                                    return (
+                                      <Tr key={`${key}-dz-${dzKey}`}>
+                                        <Td colSpan={activeColumns.length} style={{ padding: '12px 16px', backgroundColor: 'rgba(73, 69, 255, 0.02)', borderBottom: '2px solid rgba(73, 69, 255, 0.15)' }}>
+                                          <Box
+                                            padding={3}
+                                            background="neutral0"
+                                            hasRadius
+                                            style={{ border: '1px solid rgba(73, 69, 255, 0.25)', boxShadow: '0 2px 8px rgba(0,0,0,0.05)' }}
+                                          >
+                                            <Flex justifyContent="space-between" alignItems="center" marginBottom={2}>
+                                              <Flex gap={2} alignItems="center">
+                                                <Typography variant="sigma" textColor="primary700">
+                                                  DYNAMIC ZONE: &quot;{dzKey}&quot; ({blocks.length} blocks)
+                                                </Typography>
+                                                <Badge backgroundColor="primary100" textColor="primary700">
+                                                  Selective Block Targeting
+                                                </Badge>
+                                              </Flex>
+                                              <Typography variant="pi" textColor="neutral500">
+                                                Selectively choose which blocks to update for this entry
+                                              </Typography>
+                                            </Flex>
+
+                                            <Table colCount={5} rowCount={blocks.length + 1} style={{ width: '100%', background: '#fff' }}>
+                                              <Thead>
+                                                <Tr>
+                                                  <Th style={{ width: 64 }}><Typography variant="sigma">Update?</Typography></Th>
+                                                  <Th style={{ width: 60 }}><Typography variant="sigma">Pos</Typography></Th>
+                                                  <Th style={{ width: 220 }}><Typography variant="sigma">Component</Typography></Th>
+                                                  <Th><Typography variant="sigma">Target Field Value ({selectedAttribute || 'selected'})</Typography></Th>
+                                                  <Th><Typography variant="sigma">Block Summary</Typography></Th>
+                                                </Tr>
+                                              </Thead>
+                                              <Tbody>
+                                                {blocks.map((block: any, bIdx: number) => {
+                                                  const compUid = block.__component;
+                                                  const compLabel = formatComponentName(compUid);
+                                                  const blockVal = targetParsed.subPath ? getNestedValue(block, targetParsed.subPath) : undefined;
+                                                  const hasTargetAttr = blockVal !== undefined;
+
+                                                  const isBlockChecked = hasTargetAttr && isSelected && (selectedDzBlocks[key] !== undefined ? selectedDzBlocks[key].includes(bIdx) : true);
+
+                                                  return (
+                                                    <Tr
+                                                      key={bIdx}
+                                                      style={{
+                                                        backgroundColor: isBlockChecked ? 'rgba(73, 69, 255, 0.08)' : undefined,
+                                                      }}
+                                                    >
+                                                      <Td>
+                                                        <Checkbox
+                                                          checked={isBlockChecked}
+                                                          disabled={!hasTargetAttr}
+                                                          onCheckedChange={() => {
+                                                            toggleDzBlock(col.uid, entry.documentId, bIdx, allApplicableIndexes);
+                                                          }}
+                                                        />
+                                                      </Td>
+                                                      <Td>
+                                                        <Typography variant="pi" fontWeight="bold">#{bIdx}</Typography>
+                                                      </Td>
+                                                      <Td>
+                                                        <Badge backgroundColor="neutral150" textColor="neutral800">
+                                                          {compLabel}
+                                                        </Badge>
+                                                        <Typography variant="pi" textColor="neutral500" display="block" style={{ fontSize: '0.68rem', marginTop: 2 }}>
+                                                          {compUid}
+                                                        </Typography>
+                                                      </Td>
+                                                      <Td>
+                                                        {hasTargetAttr ? (
+                                                          <Typography variant="omega" fontWeight="semiBold" textColor="primary700">
+                                                            {formatDisplayValue(blockVal)}
+                                                          </Typography>
+                                                        ) : (
+                                                          <Badge backgroundColor="neutral100" textColor="neutral500">
+                                                            Does not contain attribute
+                                                          </Badge>
+                                                        )}
+                                                      </Td>
+                                                      <Td>
+                                                        <Typography variant="pi" textColor="neutral600" style={{ maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                          {block.title || block.name || block.heading || block.body || Object.keys(block).filter((k: string) => !k.startsWith('_') && k !== 'id').slice(0, 3).map((k: string) => `${k}: ${formatDisplayValue(block[k])}`).join(', ') || '-'}
+                                                        </Typography>
+                                                      </Td>
+                                                    </Tr>
+                                                  );
+                                                })}
+                                              </Tbody>
+                                            </Table>
+                                          </Box>
+                                        </Td>
+                                      </Tr>
+                                    );
+                                  })}
+                                </React.Fragment>
                               );
                             })
                           )}
