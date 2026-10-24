@@ -414,6 +414,676 @@ function getNestedExportValue(entry: any, path: string): any {
   return current;
 }
 
+
+export interface ProcessRowsStats {
+  total: number;
+  created: number;
+  updated: number;
+  skipped: number;
+  newWithoutDocId: number;
+  errors: Array<{ row: number; error: string; documentId?: string }>;
+  diffs: Array<any>;
+}
+
+interface CsvImportSession {
+  batchId: string;
+  uid: string;
+  createdAt: number;
+  total: number;
+  created: number;
+  updated: number;
+  skipped: number;
+  newWithoutDocId: number;
+  errors: Array<{ row: number; error: string; documentId?: string }>;
+  diffs: Array<any>;
+}
+
+const csvImportSessions = new Map<string, CsvImportSession>();
+
+function cleanupStaleSessions() {
+  const oneHourAgo = Date.now() - 3600000;
+  for (const [id, session] of csvImportSessions.entries()) {
+    if (session.createdAt < oneHourAgo) {
+      csvImportSessions.delete(id);
+    }
+  }
+}
+
+const SYSTEM_FIELD_KEYS = new Set([
+  'documentid',
+  'document_id',
+  'docid',
+  'id',
+  'createdat',
+  'updatedat',
+  'publishedat',
+  'createdby',
+  'updatedby',
+  'localizations',
+  'locale',
+  'status',
+]);
+
+async function findExistingDocument(
+  strapi: Core.Strapi,
+  uid: string,
+  targetDocId: string,
+  docLocale?: string
+): Promise<any> {
+  if (!targetDocId) return null;
+  try {
+    const queryArgs: any = { documentId: targetDocId };
+    if (docLocale) queryArgs.locale = docLocale;
+    const found = await (strapi.documents(uid as any) as any).findOne(queryArgs);
+    if (found) return found;
+  } catch {
+    // Strapi 5 throws NotFoundError if documentId does not exist
+  }
+
+  if (/^\d+$/.test(targetDocId)) {
+    try {
+      const queryArgs: any = {
+        filters: { id: parseInt(targetDocId, 10) },
+        limit: 1,
+      };
+      if (docLocale) queryArgs.locale = docLocale;
+      const list = await (strapi.documents(uid as any) as any).findMany(queryArgs);
+      if (list && list.length > 0) return list[0];
+    } catch {
+      // Ignore
+    }
+  }
+
+  return null;
+}
+
+export async function processCsvRows(
+  strapi: Core.Strapi,
+  ct: any,
+  uid: string,
+  rows: Array<Record<string, string>>,
+  startRowNumber: number,
+  options: {
+    mode?: 'auto' | 'update' | 'create_or_override';
+    publish?: boolean;
+    user?: any;
+  }
+): Promise<ProcessRowsStats> {
+  const attrs = ct.attributes || {};
+  const { mode = 'auto', publish = true, user } = options;
+
+  const stats: ProcessRowsStats = {
+    total: rows.length,
+    created: 0,
+    updated: 0,
+    skipped: 0,
+    newWithoutDocId: 0,
+    errors: [],
+    diffs: [],
+  };
+
+  for (let i = 0; i < rows.length; i++) {
+    const rowNumber = startRowNumber + i;
+    const row = rows[i];
+
+    let docId = extractDocId(row);
+    const rowLocale = extractLocale(row);
+
+    // If singleType and no documentId provided in row, auto-detect existing single document
+    if (ct.kind === 'singleType' && !docId) {
+      try {
+        const findSingleArgs: any = {};
+        if (rowLocale) findSingleArgs.locale = rowLocale;
+        const singleDoc = await (strapi.documents(uid as any) as any).findFirst(findSingleArgs);
+        if (singleDoc?.documentId) {
+          docId = singleDoc.documentId;
+        }
+      } catch {}
+    }
+
+    const payload: Record<string, any> = {};
+
+    // Transform and cast row columns to schema field types
+    for (const [key, rawVal] of Object.entries(row)) {
+      const normalizedKey = key.toLowerCase().replace(/[\s_-]/g, '');
+      if (SYSTEM_FIELD_KEYS.has(normalizedKey)) continue;
+
+      if (key.includes('.')) {
+        const [parent, child] = key.split('.');
+        const parentDef = attrs[parent];
+        if (parentDef?.type === 'component' && !parentDef.repeatable && parentDef.component) {
+          const comp = strapi.components[parentDef.component];
+          const childDef = comp?.attributes?.[child];
+          if (childDef) {
+            if (!payload[parent]) payload[parent] = {};
+            let val: any = rawVal;
+            if (rawVal === '' || rawVal === null || rawVal === undefined) {
+              val = null;
+            } else if (childDef.type === 'integer' || childDef.type === 'biginteger') {
+              const parsedInt = parseInt(rawVal, 10);
+              val = isNaN(parsedInt) ? null : parsedInt;
+            } else if (childDef.type === 'float' || childDef.type === 'decimal') {
+              const parsedFloat = parseFloat(rawVal);
+              val = isNaN(parsedFloat) ? null : parsedFloat;
+            } else if (childDef.type === 'boolean') {
+              val = rawVal.toLowerCase() === 'true' || rawVal === '1';
+            } else if (childDef.type === 'json') {
+              try {
+                val = JSON.parse(rawVal);
+              } catch {
+                val = rawVal;
+              }
+            }
+            payload[parent][child] = val;
+          }
+        }
+        continue;
+      }
+
+      let attrDef = attrs[key];
+      if (!attrDef) {
+        const matchKey = Object.keys(attrs).find(
+          (k) => k.toLowerCase() === key.toLowerCase() || k.toLowerCase() === key.toLowerCase().replace(/\s+/g, '')
+        );
+        if (matchKey) {
+          attrDef = attrs[matchKey];
+        }
+      }
+      if (!attrDef) continue; // Skip unknown columns
+
+      if (rawVal === '' || rawVal === null || rawVal === undefined) {
+        // Do not overwrite dynamiczone or repeatable component with null unless explicitly desired
+        if (attrDef.type !== 'dynamiczone' && !(attrDef.type === 'component' && attrDef.repeatable)) {
+          payload[key] = null;
+        }
+        continue;
+      }
+
+      switch (attrDef.type) {
+        case 'integer':
+        case 'biginteger': {
+          const parsedInt = parseInt(rawVal, 10);
+          payload[key] = isNaN(parsedInt) ? null : parsedInt;
+          break;
+        }
+        case 'float':
+        case 'decimal': {
+          const parsedFloat = parseFloat(rawVal);
+          payload[key] = isNaN(parsedFloat) ? null : parsedFloat;
+          break;
+        }
+        case 'boolean':
+          payload[key] = rawVal.toLowerCase() === 'true' || rawVal === '1';
+          break;
+        case 'json':
+          try {
+            payload[key] = JSON.parse(rawVal);
+          } catch {
+            payload[key] = rawVal;
+          }
+          break;
+        case 'dynamiczone': {
+          try {
+            const parsed = JSON.parse(rawVal);
+            if (
+              Array.isArray(parsed) &&
+              parsed.every((item) => item && typeof item === 'object' && typeof item.__component === 'string')
+            ) {
+              payload[key] = parsed;
+            }
+          } catch {
+            // Summary text or unparseable format from export: omit
+          }
+          break;
+        }
+        case 'component': {
+          if (attrDef.repeatable) {
+            try {
+              const parsed = JSON.parse(rawVal);
+              if (Array.isArray(parsed) && parsed.every((item) => item && typeof item === 'object')) {
+                payload[key] = parsed;
+              }
+            } catch {}
+          } else {
+            try {
+              const parsed = JSON.parse(rawVal);
+              if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+                payload[key] = parsed;
+              }
+            } catch {}
+          }
+          break;
+        }
+        case 'relation': {
+          try {
+            const parsed = JSON.parse(rawVal);
+            if (Array.isArray(parsed) || (typeof parsed === 'object' && parsed !== null)) {
+              payload[key] = parsed;
+              break;
+            }
+          } catch {}
+
+          if (isValidDocId(rawVal)) {
+            payload[key] = rawVal;
+          } else if (rawVal.includes(';') || rawVal.includes(',')) {
+            const parts = rawVal.split(/[;,]/).map((s) => s.trim()).filter(Boolean);
+            if (parts.length > 0 && parts.every((p) => isValidDocId(p))) {
+              payload[key] = parts;
+            }
+          }
+          break;
+        }
+        case 'media': {
+          if (/^\d+$/.test(rawVal.trim())) {
+            payload[key] = parseInt(rawVal.trim(), 10);
+          } else {
+            try {
+              const parsed = JSON.parse(rawVal);
+              if (typeof parsed === 'number' || typeof parsed === 'object') {
+                payload[key] = parsed;
+              }
+            } catch {}
+          }
+          break;
+        }
+        default:
+          payload[key] = rawVal;
+      }
+    }
+
+    try {
+      if (mode === 'update') {
+        if (!docId) {
+          stats.skipped++;
+          stats.errors.push({
+            row: rowNumber,
+            error: 'Missing or invalid documentId for Update mode. (Tip: Use Smart Auto-Detect mode to auto-add entries without document IDs).',
+          });
+          continue;
+        }
+
+        const existing = await findExistingDocument(strapi, uid, docId, rowLocale);
+
+        if (!existing) {
+          stats.skipped++;
+          stats.errors.push({
+            row: rowNumber,
+            documentId: docId,
+            error: `Document with ID "${docId}" not found in database.`,
+          });
+          continue;
+        }
+
+        const resolvedDocId = existing.documentId || docId;
+        const mergedPayload = { ...payload };
+        for (const key of Object.keys(payload)) {
+          if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
+            mergedPayload[key] = { ...((existing as any)[key] || {}), ...payload[key] };
+          }
+        }
+
+        if (Object.keys(mergedPayload).length === 0) {
+          stats.skipped++;
+          stats.diffs.push({
+            uid,
+            collectionName: ct.info?.displayName || uid,
+            documentId: resolvedDocId,
+            label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
+            attribute: '',
+            oldValue: existing,
+            newValue: {},
+            status: 'skipped',
+            message: `Skipped (no editable attributes in row ${rowNumber})`,
+          });
+          continue;
+        }
+
+        const updateArgs: any = {
+          documentId: resolvedDocId,
+          data: mergedPayload,
+        };
+        if (rowLocale) updateArgs.locale = rowLocale;
+
+        await (strapi.documents(uid as any) as any).update(updateArgs);
+
+        if (publish && ct.options?.draftAndPublish) {
+          try {
+            const pubArgs: any = { documentId: resolvedDocId };
+            if (rowLocale) pubArgs.locale = rowLocale;
+            await (strapi.documents(uid as any) as any).publish(pubArgs);
+          } catch (pubErr) {
+            strapi.log.warn(`[bulk-updater] Auto-publish failed for ${resolvedDocId}:`, pubErr);
+          }
+        }
+
+        try {
+          await recordContentHistoryVersion(strapi, {
+            uid,
+            documentId: resolvedDocId,
+            userId: user?.id,
+            statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
+          });
+        } catch {}
+
+        stats.updated++;
+        for (const attrKey of Object.keys(payload)) {
+          const oldVal = (existing as any)?.[attrKey] ?? null;
+          const newVal = payload[attrKey];
+          stats.diffs.push({
+            uid,
+            collectionName: ct.info?.displayName || uid,
+            documentId: resolvedDocId,
+            label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
+            attribute: attrKey,
+            oldValue: oldVal,
+            newValue: newVal,
+            status: 'updated',
+            message: `Updated "${attrKey}" via CSV import (row ${rowNumber})`,
+          });
+        }
+      } else if (mode === 'create_or_override') {
+        let existing: any = null;
+        if (docId) {
+          existing = await findExistingDocument(strapi, uid, docId, rowLocale);
+        }
+
+        if (existing) {
+          const resolvedDocId = existing.documentId || docId;
+          const mergedPayload = { ...payload };
+          for (const key of Object.keys(payload)) {
+            if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
+              mergedPayload[key] = { ...((existing as any)[key] || {}), ...payload[key] };
+            }
+          }
+
+          const updateArgs: any = {
+            documentId: resolvedDocId,
+            data: mergedPayload,
+          };
+          if (rowLocale) updateArgs.locale = rowLocale;
+
+          await (strapi.documents(uid as any) as any).update(updateArgs);
+
+          if (publish && ct.options?.draftAndPublish) {
+            try {
+              const pubArgs: any = { documentId: resolvedDocId };
+              if (rowLocale) pubArgs.locale = rowLocale;
+              await (strapi.documents(uid as any) as any).publish(pubArgs);
+            } catch (pubErr) {
+              strapi.log.warn(`[bulk-updater] Auto-publish failed for ${resolvedDocId}:`, pubErr);
+            }
+          }
+
+          try {
+            await recordContentHistoryVersion(strapi, {
+              uid,
+              documentId: resolvedDocId,
+              userId: user?.id,
+              statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
+            });
+          } catch {}
+
+          stats.updated++;
+          for (const attrKey of Object.keys(payload)) {
+            const oldVal = (existing as any)?.[attrKey] ?? null;
+            const newVal = payload[attrKey];
+            stats.diffs.push({
+              uid,
+              collectionName: ct.info?.displayName || uid,
+              documentId: resolvedDocId,
+              label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
+              attribute: attrKey,
+              oldValue: oldVal,
+              newValue: newVal,
+              status: 'updated',
+              message: `Overridden "${attrKey}" via CSV import (row ${rowNumber})`,
+            });
+          }
+          continue;
+        }
+
+        const createArgs: any = { data: payload };
+        if (rowLocale) createArgs.locale = rowLocale;
+        const created: any = await strapi.documents(uid as any).create(createArgs);
+
+        const newDocId = created?.documentId || docId;
+        if (publish && ct.options?.draftAndPublish && newDocId) {
+          try {
+            const pubArgs: any = { documentId: newDocId };
+            if (rowLocale) pubArgs.locale = rowLocale;
+            await (strapi.documents(uid as any) as any).publish(pubArgs);
+          } catch (pubErr) {
+            strapi.log.warn(`[bulk-updater] Auto-publish failed for ${newDocId}:`, pubErr);
+          }
+        }
+
+        try {
+          await recordContentHistoryVersion(strapi, {
+            uid,
+            documentId: newDocId,
+            userId: user?.id,
+            statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
+          });
+        } catch {}
+
+        stats.created++;
+        if (!docId) {
+          stats.newWithoutDocId++;
+        }
+        for (const attrKey of Object.keys(payload)) {
+          stats.diffs.push({
+            uid,
+            collectionName: ct.info?.displayName || uid,
+            documentId: newDocId,
+            label: created?.title || created?.name || `New Entry #${newDocId}`,
+            attribute: attrKey,
+            oldValue: null,
+            newValue: payload[attrKey],
+            status: 'created',
+            message: docId
+              ? `Created "${attrKey}" via CSV import (row ${rowNumber})`
+              : `Created "${attrKey}" as new entry (row ${rowNumber})`,
+          });
+        }
+      } else {
+        // Default: Smart Auto-Detect ('auto')
+        let existing: any = null;
+        if (docId) {
+          existing = await findExistingDocument(strapi, uid, docId, rowLocale);
+        }
+
+        if (existing) {
+          const resolvedDocId = existing.documentId || docId;
+          const mergedPayload = { ...payload };
+          for (const key of Object.keys(payload)) {
+            if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
+              mergedPayload[key] = { ...((existing as any)[key] || {}), ...payload[key] };
+            }
+          }
+
+          const updateArgs: any = {
+            documentId: resolvedDocId,
+            data: mergedPayload,
+          };
+          if (rowLocale) updateArgs.locale = rowLocale;
+
+          await (strapi.documents(uid as any) as any).update(updateArgs);
+
+          if (publish && ct.options?.draftAndPublish) {
+            try {
+              const pubArgs: any = { documentId: resolvedDocId };
+              if (rowLocale) pubArgs.locale = rowLocale;
+              await (strapi.documents(uid as any) as any).publish(pubArgs);
+            } catch (pubErr) {
+              strapi.log.warn(`[bulk-updater] Auto-publish failed for ${resolvedDocId}:`, pubErr);
+            }
+          }
+
+          try {
+            await recordContentHistoryVersion(strapi, {
+              uid,
+              documentId: resolvedDocId,
+              userId: user?.id,
+              statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
+            });
+          } catch {}
+
+          stats.updated++;
+          for (const attrKey of Object.keys(payload)) {
+            const oldVal = (existing as any)?.[attrKey] ?? null;
+            const newVal = payload[attrKey];
+            stats.diffs.push({
+              uid,
+              collectionName: ct.info?.displayName || uid,
+              documentId: resolvedDocId,
+              label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
+              attribute: attrKey,
+              oldValue: oldVal,
+              newValue: newVal,
+              status: 'updated',
+              message: `Updated "${attrKey}" via CSV import (row ${rowNumber})`,
+            });
+          }
+          continue;
+        }
+
+        // Missing docId OR provided docId does not exist in DB -> create new
+        const createArgs: any = { data: payload };
+        if (rowLocale) createArgs.locale = rowLocale;
+        const created: any = await strapi.documents(uid as any).create(createArgs);
+
+        const newDocId = created?.documentId || docId;
+        if (publish && ct.options?.draftAndPublish && newDocId) {
+          try {
+            const pubArgs: any = { documentId: newDocId };
+            if (rowLocale) pubArgs.locale = rowLocale;
+            await (strapi.documents(uid as any) as any).publish(pubArgs);
+          } catch (pubErr) {
+            strapi.log.warn(`[bulk-updater] Auto-publish failed for ${newDocId}:`, pubErr);
+          }
+        }
+
+        try {
+          await recordContentHistoryVersion(strapi, {
+            uid,
+            documentId: newDocId,
+            userId: user?.id,
+            statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
+          });
+        } catch {}
+
+        stats.created++;
+        if (!docId) {
+          stats.newWithoutDocId++;
+        }
+        for (const attrKey of Object.keys(payload)) {
+          stats.diffs.push({
+            uid,
+            collectionName: ct.info?.displayName || uid,
+            documentId: newDocId,
+            label: created?.title || created?.name || `New Entry #${newDocId}`,
+            attribute: attrKey,
+            oldValue: null,
+            newValue: payload[attrKey],
+            status: 'created',
+            message: docId
+              ? `Created "${attrKey}" as new entry (documentId "${docId}" not found in database - row ${rowNumber})`
+              : `Created "${attrKey}" as new entry (no documentId provided in CSV - row ${rowNumber})`,
+          });
+        }
+      }
+    } catch (err: any) {
+      stats.errors.push({
+        row: rowNumber,
+        documentId: docId || undefined,
+        error: extractDetailedErrorMessage(err),
+      });
+    }
+  }
+
+  return stats;
+}
+
+async function recordCsvAuditLog(
+  strapi: Core.Strapi,
+  ct: any,
+  uid: string,
+  batchId: string,
+  stats: { total: number; created: number; updated: number; skipped: number; diffs: Array<any> },
+  user?: any
+) {
+  if (stats.updated === 0 && stats.created === 0) return;
+
+  try {
+    const auditService = strapi.plugin('bulk-updater').service('audit');
+    if (!auditService) return;
+
+    const isEnabled = typeof auditService.isAuditEnabled === 'function'
+      ? auditService.isAuditEnabled()
+      : Boolean(auditService.getAuditConfig?.().enabled ?? true);
+
+    if (!isEnabled) return;
+
+    const userEmail = user?.email || 'admin@strapi.io';
+    const userName = user ? `${user.firstname || ''} ${user.lastname || ''}`.trim() : 'CSV Importer';
+    const collectionDisplayName = ct.info?.displayName || uid;
+    const updatedDiffs = stats.diffs.filter(
+      (d) => d.status === 'updated' || d.status === 'created'
+    );
+    const uniqueAttributes = Array.from(
+      new Set(updatedDiffs.map((d) => d.attribute))
+    ).filter(Boolean);
+    const attrListStr = uniqueAttributes.length > 0 ? uniqueAttributes.join(', ') : 'fields';
+
+    const batchAttribute = `CSV [${collectionDisplayName}]: ${attrListStr}`;
+
+    let batchValue = '';
+    if (updatedDiffs.length === 1) {
+      const d = updatedDiffs[0];
+      const newStr = d.newValue !== null && d.newValue !== undefined ? String(d.newValue) : '(empty)';
+      batchValue = `"${d.label}": ${d.attribute} → "${newStr}"`;
+    } else if (updatedDiffs.length > 1 && stats.updated === 1 && stats.created === 0) {
+      const d = updatedDiffs[0];
+      const changes = updatedDiffs
+        .map((ud) => `${ud.attribute}: "${ud.newValue ?? ''}"`)
+        .join(', ');
+      batchValue = `"${d.label}": ${changes}`;
+    } else {
+      const sampleVal = updatedDiffs[0]
+        ? ` (e.g. ${updatedDiffs[0].attribute}: "${updatedDiffs[0].newValue ?? ''}")`
+        : '';
+      batchValue = `${stats.updated} updated, ${stats.created} created in ${collectionDisplayName}${sampleVal}`;
+    }
+
+    const batchSummary = {
+      batchId,
+      attribute: batchAttribute,
+      value: batchValue,
+      updatedCount: stats.updated + stats.created,
+      skippedCount: stats.skipped,
+      totalTargets: stats.total,
+    };
+
+    const userObj = {
+      email: userEmail || 'admin@strapi.io',
+      firstname: userName || 'Admin',
+    };
+
+    if (typeof auditService.recordBatch === 'function') {
+      await auditService.recordBatch(batchSummary, stats.diffs, userObj);
+    } else if (typeof auditService.logOperation === 'function') {
+      await auditService.logOperation({
+        ...batchSummary,
+        userEmail,
+        userName,
+        diffs: stats.diffs,
+      });
+    }
+  } catch (auditErr) {
+    strapi.log.warn('[bulk-updater] Failed logging CSV import audit:', auditErr);
+  }
+}
+
 export default ({ strapi }: { strapi: Core.Strapi }) => ({
   /**
    * Generates a sample template CSV with schema attribute headers and sample values
@@ -576,38 +1246,66 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     // 3. Build deep populate tree so nested components and relations are retrieved
     const deepPopulate = buildDeepPopulate(ct.attributes || {}, allComponents);
 
-    // 4. Retrieve entries (handling singleType vs collectionType)
-    let entries: any[] = [];
+    // 4. Retrieve entries and generate RFC-4180 CRLF rows with UTF-8 BOM
+    const lines: string[] = [];
+    lines.push(fields.map((f) => escapeCsvValue(f.key)).join(','));
+
+    let totalExported = 0;
+    const maxLimit = options.limit && options.limit > 0 ? options.limit : Infinity;
+    const CHUNK_SIZE = 1000;
+
     if (ct.kind === 'singleType') {
       const findFirstArgs: any = {};
       if (deepPopulate) {
         findFirstArgs.populate = deepPopulate;
       }
       const doc = await (strapi.documents(uid as any) as any).findFirst(findFirstArgs);
-      entries = doc ? [doc] : [];
-    } else {
-      const findManyArgs: any = {
-        filters: Object.keys(filters).length > 0 ? filters : undefined,
-        limit: options.limit || 5000,
-        sort: { createdAt: 'desc' },
-      };
-      if (deepPopulate) {
-        findManyArgs.populate = deepPopulate;
+      if (doc) {
+        const rowValues = fields.map((f) => escapeCsvValue(getNestedExportValue(doc, f.key)));
+        lines.push(rowValues.join(','));
+        totalExported = 1;
       }
-      entries = await (strapi.documents(uid as any) as any).findMany(findManyArgs);
-    }
+    } else {
+      let currentPage = 1;
+      let hasMore = true;
 
-    // 5. Generate RFC-4180 CRLF rows with UTF-8 BOM
-    const lines: string[] = [];
-    // Header line using field keys
-    lines.push(fields.map((f) => escapeCsvValue(f.key)).join(','));
+      while (hasMore && totalExported < maxLimit) {
+        const remaining = maxLimit - totalExported;
+        const currentBatchLimit = Math.min(CHUNK_SIZE, remaining);
 
-    for (const entry of (entries || []) as any[]) {
-      const rowValues = fields.map((f) => {
-        const val = getNestedExportValue(entry, f.key);
-        return escapeCsvValue(val);
-      });
-      lines.push(rowValues.join(','));
+        const findPageArgs: any = {
+          filters: Object.keys(filters).length > 0 ? filters : undefined,
+          page: currentPage,
+          pageSize: currentBatchLimit,
+          sort: { createdAt: 'desc' },
+        };
+        if (deepPopulate) {
+          findPageArgs.populate = deepPopulate;
+        }
+
+        const chunkEntries: any[] = await (strapi.documents(uid as any) as any).findMany(findPageArgs);
+
+        if (!chunkEntries || chunkEntries.length === 0) {
+          hasMore = false;
+          break;
+        }
+
+        for (const entry of chunkEntries) {
+          const rowValues = fields.map((f) => escapeCsvValue(getNestedExportValue(entry, f.key)));
+          lines.push(rowValues.join(','));
+          totalExported++;
+          if (totalExported >= maxLimit) {
+            hasMore = false;
+            break;
+          }
+        }
+
+        if (chunkEntries.length < currentBatchLimit) {
+          hasMore = false;
+        } else {
+          currentPage++;
+        }
+      }
     }
 
     // Prepend UTF-8 BOM and terminate lines with CRLF for seamless Excel import
@@ -617,7 +1315,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     return {
       filename,
       csvContent,
-      count: entries ? entries.length : 0,
+      count: totalExported,
       fields: fields.map((f) => f.key),
     };
   },
@@ -690,7 +1388,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     // If all entries belong to a single collection, export full collection schema with deep fields
     if (uids.length === 1) {
       const uid = uids[0];
-      return await this.exportCollectionCsv(uid, { documentIds: byUid[uid] });
+      return await this.exportCollectionCsv(uid, { documentIds: byUid[uid], limit: 0 });
     }
 
     // Multi-collection unified export
@@ -750,7 +1448,100 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
   },
 
   /**
-   * Imports CSV records to update existing records or insert/override records
+   * Imports a single chunk of CSV rows (for large dataset streaming/batching).
+   * Aggregates stats across chunks and writes unified audit trail on the final chunk.
+   */
+  async importChunk(
+    uid: string,
+    rows: Array<Record<string, string>>,
+    options: {
+      batchId?: string;
+      isFirstChunk?: boolean;
+      isLastChunk?: boolean;
+      startRowNumber?: number;
+      mode?: 'auto' | 'update' | 'create_or_override';
+      publish?: boolean;
+      user?: any;
+    }
+  ) {
+    const ct = strapi.contentTypes[uid];
+    if (!ct) {
+      throw new Error(`Content type ${uid} not found`);
+    }
+
+    cleanupStaleSessions();
+
+    const batchId = options.batchId || `csv_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    let session = csvImportSessions.get(batchId);
+
+    if (!session || options.isFirstChunk) {
+      session = {
+        batchId,
+        uid,
+        createdAt: Date.now(),
+        total: 0,
+        created: 0,
+        updated: 0,
+        skipped: 0,
+        newWithoutDocId: 0,
+        errors: [],
+        diffs: [],
+      };
+      csvImportSessions.set(batchId, session);
+    }
+
+    const startRowNumber = options.startRowNumber || (session.total + 2);
+    const chunkStats = await processCsvRows(strapi, ct, uid, rows || [], startRowNumber, options);
+
+    session.total += chunkStats.total;
+    session.created += chunkStats.created;
+    session.updated += chunkStats.updated;
+    session.skipped += chunkStats.skipped;
+    session.newWithoutDocId += chunkStats.newWithoutDocId;
+    session.errors.push(...chunkStats.errors);
+    session.diffs.push(...chunkStats.diffs);
+
+    if (options.isLastChunk) {
+      await recordCsvAuditLog(strapi, ct, uid, batchId, session, options.user);
+
+      try {
+        const bulkService = strapi.plugin('bulk-updater').service('bulkUpdater');
+        if (bulkService && (bulkService as any).invalidateCollectionCache) {
+          (bulkService as any).invalidateCollectionCache(uid);
+        }
+      } catch {}
+
+      const aggregateStats = {
+        total: session.total,
+        created: session.created,
+        updated: session.updated,
+        skipped: session.skipped,
+        newWithoutDocId: session.newWithoutDocId,
+        errors: session.errors,
+        diffs: session.diffs,
+      };
+
+      csvImportSessions.delete(batchId);
+
+      return {
+        success: true,
+        batchId,
+        chunkStats,
+        stats: aggregateStats,
+        isFinished: true,
+      };
+    }
+
+    return {
+      success: true,
+      batchId,
+      chunkStats,
+      isFinished: false,
+    };
+  },
+
+  /**
+   * Imports CSV records to update existing records or insert/override records (single payload).
    */
   async importCsv(
     uid: string,
@@ -771,627 +1562,17 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       throw new Error('CSV is empty or could not be parsed.');
     }
 
-    const attrs = ct.attributes || {};
-    const { mode = 'auto', publish = true, user } = options;
-
-    const stats = {
-      total: parsedRows.length,
-      created: 0,
-      updated: 0,
-      skipped: 0,
-      newWithoutDocId: 0,
-      errors: [] as Array<{ row: number; error: string; documentId?: string }>,
-      diffs: [] as Array<any>,
-    };
-
     const batchId = `csv_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-    const userEmail = user?.email || 'admin@strapi.io';
-    const userName = user ? `${user.firstname || ''} ${user.lastname || ''}`.trim() : 'CSV Importer';
-
-    const findExistingDocument = async (targetDocId: string, docLocale?: string): Promise<any> => {
-      if (!targetDocId) return null;
-      try {
-        const queryArgs: any = { documentId: targetDocId };
-        if (docLocale) queryArgs.locale = docLocale;
-        const found = await (strapi.documents(uid as any) as any).findOne(queryArgs);
-        if (found) return found;
-      } catch {
-        // Strapi 5 throws NotFoundError if documentId does not exist
-      }
-
-      if (/^\d+$/.test(targetDocId)) {
-        try {
-          const queryArgs: any = {
-            filters: { id: parseInt(targetDocId, 10) },
-            limit: 1,
-          };
-          if (docLocale) queryArgs.locale = docLocale;
-          const list = await (strapi.documents(uid as any) as any).findMany(queryArgs);
-          if (list && list.length > 0) return list[0];
-        } catch {
-          // Ignore
-        }
-      }
-
-      return null;
-    };
-
-    const SYSTEM_FIELD_KEYS = new Set([
-      'documentid',
-      'document_id',
-      'docid',
-      'id',
-      'createdat',
-      'updatedat',
-      'publishedat',
-      'createdby',
-      'updatedby',
-      'localizations',
-      'locale',
-      'status',
-    ]);
-
-    for (let i = 0; i < parsedRows.length; i++) {
-      const rowNumber = i + 2; // Row 1 is header
-      const row = parsedRows[i];
-
-      let docId = extractDocId(row);
-      const rowLocale = extractLocale(row);
-
-      // If singleType and no documentId provided in row, auto-detect existing single document
-      if (ct.kind === 'singleType' && !docId) {
-        try {
-          const findSingleArgs: any = {};
-          if (rowLocale) findSingleArgs.locale = rowLocale;
-          const singleDoc = await (strapi.documents(uid as any) as any).findFirst(findSingleArgs);
-          if (singleDoc?.documentId) {
-            docId = singleDoc.documentId;
-          }
-        } catch {}
-      }
-
-      const payload: Record<string, any> = {};
-
-      // Transform and cast row columns to schema field types
-      for (const [key, rawVal] of Object.entries(row)) {
-        const normalizedKey = key.toLowerCase().replace(/[\s_-]/g, '');
-        if (SYSTEM_FIELD_KEYS.has(normalizedKey)) continue;
-
-        if (key.includes('.')) {
-          const [parent, child] = key.split('.');
-          const parentDef = attrs[parent];
-          if (parentDef?.type === 'component' && !parentDef.repeatable && parentDef.component) {
-            const comp = strapi.components[parentDef.component];
-            const childDef = comp?.attributes?.[child];
-            if (childDef) {
-              if (!payload[parent]) payload[parent] = {};
-              let val: any = rawVal;
-              if (rawVal === '' || rawVal === null || rawVal === undefined) {
-                val = null;
-              } else if (childDef.type === 'integer' || childDef.type === 'biginteger') {
-                const parsedInt = parseInt(rawVal, 10);
-                val = isNaN(parsedInt) ? null : parsedInt;
-              } else if (childDef.type === 'float' || childDef.type === 'decimal') {
-                const parsedFloat = parseFloat(rawVal);
-                val = isNaN(parsedFloat) ? null : parsedFloat;
-              } else if (childDef.type === 'boolean') {
-                val = rawVal.toLowerCase() === 'true' || rawVal === '1';
-              } else if (childDef.type === 'json') {
-                try {
-                  val = JSON.parse(rawVal);
-                } catch {
-                  val = rawVal;
-                }
-              }
-              payload[parent][child] = val;
-            }
-          }
-          continue;
-        }
-
-        let attrDef = attrs[key];
-        if (!attrDef) {
-          const matchKey = Object.keys(attrs).find(
-            (k) => k.toLowerCase() === key.toLowerCase() || k.toLowerCase() === key.toLowerCase().replace(/\s+/g, '')
-          );
-          if (matchKey) {
-            attrDef = attrs[matchKey];
-          }
-        }
-        if (!attrDef) continue; // Skip unknown columns
-
-        if (rawVal === '' || rawVal === null || rawVal === undefined) {
-          // Do not overwrite dynamiczone or repeatable component with null unless explicitly desired
-          if (attrDef.type !== 'dynamiczone' && !(attrDef.type === 'component' && attrDef.repeatable)) {
-            payload[key] = null;
-          }
-          continue;
-        }
-
-        switch (attrDef.type) {
-          case 'integer':
-          case 'biginteger': {
-            const parsedInt = parseInt(rawVal, 10);
-            payload[key] = isNaN(parsedInt) ? null : parsedInt;
-            break;
-          }
-          case 'float':
-          case 'decimal': {
-            const parsedFloat = parseFloat(rawVal);
-            payload[key] = isNaN(parsedFloat) ? null : parsedFloat;
-            break;
-          }
-          case 'boolean':
-            payload[key] = rawVal.toLowerCase() === 'true' || rawVal === '1';
-            break;
-          case 'json':
-            try {
-              payload[key] = JSON.parse(rawVal);
-            } catch {
-              payload[key] = rawVal;
-            }
-            break;
-          case 'dynamiczone': {
-            // Dynamic zones in Strapi 5 must be an array of component objects with __component
-            try {
-              const parsed = JSON.parse(rawVal);
-              if (
-                Array.isArray(parsed) &&
-                parsed.every((item) => item && typeof item === 'object' && typeof item.__component === 'string')
-              ) {
-                payload[key] = parsed;
-              }
-            } catch {
-              // Summary text or unparseable format from export: omit to avoid schema validation errors
-            }
-            break;
-          }
-          case 'component': {
-            if (attrDef.repeatable) {
-              try {
-                const parsed = JSON.parse(rawVal);
-                if (Array.isArray(parsed) && parsed.every((item) => item && typeof item === 'object')) {
-                  payload[key] = parsed;
-                }
-              } catch {
-                // Summary text: omit to preserve existing repeatable components
-              }
-            } else {
-              try {
-                const parsed = JSON.parse(rawVal);
-                if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
-                  payload[key] = parsed;
-                }
-              } catch {
-                // Summary text: omit
-              }
-            }
-            break;
-          }
-          case 'relation': {
-            try {
-              const parsed = JSON.parse(rawVal);
-              if (Array.isArray(parsed) || (typeof parsed === 'object' && parsed !== null)) {
-                payload[key] = parsed;
-                break;
-              }
-            } catch {}
-
-            if (isValidDocId(rawVal)) {
-              payload[key] = rawVal;
-            } else if (rawVal.includes(';') || rawVal.includes(',')) {
-              const parts = rawVal.split(/[;,]/).map((s) => s.trim()).filter(Boolean);
-              if (parts.length > 0 && parts.every((p) => isValidDocId(p))) {
-                payload[key] = parts;
-              }
-            }
-            break;
-          }
-          case 'media': {
-            if (/^\d+$/.test(rawVal.trim())) {
-              payload[key] = parseInt(rawVal.trim(), 10);
-            } else {
-              try {
-                const parsed = JSON.parse(rawVal);
-                if (typeof parsed === 'number' || typeof parsed === 'object') {
-                  payload[key] = parsed;
-                }
-              } catch {}
-            }
-            break;
-          }
-          default:
-            payload[key] = rawVal;
-        }
-      }
-
-      try {
-        if (mode === 'update') {
-          if (!docId) {
-            stats.skipped++;
-            stats.errors.push({
-              row: rowNumber,
-              error: 'Missing or invalid documentId for Update mode. (Tip: Use Smart Auto-Detect mode to auto-add entries without document IDs).',
-            });
-            continue;
-          }
-
-          const existing = await findExistingDocument(docId, rowLocale);
-
-          if (!existing) {
-            stats.skipped++;
-            stats.errors.push({
-              row: rowNumber,
-              documentId: docId,
-              error: `Document with ID "${docId}" not found in database.`,
-            });
-            continue;
-          }
-
-          const resolvedDocId = existing.documentId || docId;
-          const mergedPayload = { ...payload };
-          for (const key of Object.keys(payload)) {
-            if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
-              mergedPayload[key] = { ...((existing as any)[key] || {}), ...payload[key] };
-            }
-          }
-
-          if (Object.keys(mergedPayload).length === 0) {
-            stats.skipped++;
-            stats.diffs.push({
-              uid,
-              collectionName: ct.info?.displayName || uid,
-              documentId: resolvedDocId,
-              label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
-              attribute: '',
-              oldValue: existing,
-              newValue: {},
-              status: 'skipped',
-              message: `Skipped (no editable attributes in row ${rowNumber})`,
-            });
-            continue;
-          }
-
-          const updateArgs: any = {
-            documentId: resolvedDocId,
-            data: mergedPayload,
-          };
-          if (rowLocale) updateArgs.locale = rowLocale;
-
-          await (strapi.documents(uid as any) as any).update(updateArgs);
-
-          if (publish && ct.options?.draftAndPublish) {
-            try {
-              const pubArgs: any = { documentId: resolvedDocId };
-              if (rowLocale) pubArgs.locale = rowLocale;
-              await (strapi.documents(uid as any) as any).publish(pubArgs);
-            } catch (pubErr) {
-              strapi.log.warn(`[bulk-updater] Auto-publish failed for ${resolvedDocId}:`, pubErr);
-            }
-          }
-
-          try {
-            await recordContentHistoryVersion(strapi, {
-              uid,
-              documentId: resolvedDocId,
-              userId: user?.id,
-              statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
-            });
-          } catch {}
-
-          stats.updated++;
-          for (const attrKey of Object.keys(payload)) {
-            const oldVal = (existing as any)?.[attrKey] ?? null;
-            const newVal = payload[attrKey];
-            stats.diffs.push({
-              uid,
-              collectionName: ct.info?.displayName || uid,
-              documentId: resolvedDocId,
-              label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
-              attribute: attrKey,
-              oldValue: oldVal,
-              newValue: newVal,
-              status: 'updated',
-              message: `Updated "${attrKey}" via CSV import (row ${rowNumber})`,
-            });
-          }
-        } else if (mode === 'create_or_override') {
-          let existing: any = null;
-          if (docId) {
-            existing = await findExistingDocument(docId, rowLocale);
-          }
-
-          if (existing) {
-            const resolvedDocId = existing.documentId || docId;
-            const mergedPayload = { ...payload };
-            for (const key of Object.keys(payload)) {
-              if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
-                mergedPayload[key] = { ...((existing as any)[key] || {}), ...payload[key] };
-              }
-            }
-
-            const updateArgs: any = {
-              documentId: resolvedDocId,
-              data: mergedPayload,
-            };
-            if (rowLocale) updateArgs.locale = rowLocale;
-
-            await (strapi.documents(uid as any) as any).update(updateArgs);
-
-            if (publish && ct.options?.draftAndPublish) {
-              try {
-                const pubArgs: any = { documentId: resolvedDocId };
-                if (rowLocale) pubArgs.locale = rowLocale;
-                await (strapi.documents(uid as any) as any).publish(pubArgs);
-              } catch (pubErr) {
-                strapi.log.warn(`[bulk-updater] Auto-publish failed for ${resolvedDocId}:`, pubErr);
-              }
-            }
-
-            try {
-              await recordContentHistoryVersion(strapi, {
-                uid,
-                documentId: resolvedDocId,
-                userId: user?.id,
-                statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
-              });
-            } catch {}
-
-            stats.updated++;
-            for (const attrKey of Object.keys(payload)) {
-              const oldVal = (existing as any)?.[attrKey] ?? null;
-              const newVal = payload[attrKey];
-              stats.diffs.push({
-                uid,
-                collectionName: ct.info?.displayName || uid,
-                documentId: resolvedDocId,
-                label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
-                attribute: attrKey,
-                oldValue: oldVal,
-                newValue: newVal,
-                status: 'updated',
-                message: `Overridden "${attrKey}" via CSV import (row ${rowNumber})`,
-              });
-            }
-            continue;
-          }
-
-          const createArgs: any = { data: payload };
-          if (rowLocale) createArgs.locale = rowLocale;
-          const created: any = await strapi.documents(uid as any).create(createArgs);
-
-          const newDocId = created?.documentId || docId;
-          if (publish && ct.options?.draftAndPublish && newDocId) {
-            try {
-              const pubArgs: any = { documentId: newDocId };
-              if (rowLocale) pubArgs.locale = rowLocale;
-              await (strapi.documents(uid as any) as any).publish(pubArgs);
-            } catch (pubErr) {
-              strapi.log.warn(`[bulk-updater] Auto-publish failed for ${newDocId}:`, pubErr);
-            }
-          }
-
-          try {
-            await recordContentHistoryVersion(strapi, {
-              uid,
-              documentId: newDocId,
-              userId: user?.id,
-              statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
-            });
-          } catch {}
-
-          stats.created++;
-          if (!docId) {
-            stats.newWithoutDocId++;
-          }
-          for (const attrKey of Object.keys(payload)) {
-            stats.diffs.push({
-              uid,
-              collectionName: ct.info?.displayName || uid,
-              documentId: newDocId,
-              label: created?.title || created?.name || `New Entry #${newDocId}`,
-              attribute: attrKey,
-              oldValue: null,
-              newValue: payload[attrKey],
-              status: 'created',
-              message: docId
-                ? `Created "${attrKey}" via CSV import (row ${rowNumber})`
-                : `Created "${attrKey}" as new entry (row ${rowNumber})`,
-            });
-          }
-        } else {
-          // Default: Smart Auto-Detect ('auto')
-          let existing: any = null;
-          if (docId) {
-            existing = await findExistingDocument(docId, rowLocale);
-          }
-
-          if (existing) {
-            const resolvedDocId = existing.documentId || docId;
-            const mergedPayload = { ...payload };
-            for (const key of Object.keys(payload)) {
-              if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
-                mergedPayload[key] = { ...((existing as any)[key] || {}), ...payload[key] };
-              }
-            }
-
-            const updateArgs: any = {
-              documentId: resolvedDocId,
-              data: mergedPayload,
-            };
-            if (rowLocale) updateArgs.locale = rowLocale;
-
-            await (strapi.documents(uid as any) as any).update(updateArgs);
-
-            if (publish && ct.options?.draftAndPublish) {
-              try {
-                const pubArgs: any = { documentId: resolvedDocId };
-                if (rowLocale) pubArgs.locale = rowLocale;
-                await (strapi.documents(uid as any) as any).publish(pubArgs);
-              } catch (pubErr) {
-                strapi.log.warn(`[bulk-updater] Auto-publish failed for ${resolvedDocId}:`, pubErr);
-              }
-            }
-
-            try {
-              await recordContentHistoryVersion(strapi, {
-                uid,
-                documentId: resolvedDocId,
-                userId: user?.id,
-                statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
-              });
-            } catch {}
-
-            stats.updated++;
-            for (const attrKey of Object.keys(payload)) {
-              const oldVal = (existing as any)?.[attrKey] ?? null;
-              const newVal = payload[attrKey];
-              stats.diffs.push({
-                uid,
-                collectionName: ct.info?.displayName || uid,
-                documentId: resolvedDocId,
-                label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
-                attribute: attrKey,
-                oldValue: oldVal,
-                newValue: newVal,
-                status: 'updated',
-                message: `Updated "${attrKey}" via CSV import (row ${rowNumber})`,
-              });
-            }
-            continue;
-          }
-
-          // Missing docId OR provided docId does not exist in DB -> create new
-          const createArgs: any = { data: payload };
-          if (rowLocale) createArgs.locale = rowLocale;
-          const created: any = await strapi.documents(uid as any).create(createArgs);
-
-          const newDocId = created?.documentId || docId;
-          if (publish && ct.options?.draftAndPublish && newDocId) {
-            try {
-              const pubArgs: any = { documentId: newDocId };
-              if (rowLocale) pubArgs.locale = rowLocale;
-              await (strapi.documents(uid as any) as any).publish(pubArgs);
-            } catch (pubErr) {
-              strapi.log.warn(`[bulk-updater] Auto-publish failed for ${newDocId}:`, pubErr);
-            }
-          }
-
-          try {
-            await recordContentHistoryVersion(strapi, {
-              uid,
-              documentId: newDocId,
-              userId: user?.id,
-              statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
-            });
-          } catch {}
-
-          stats.created++;
-          if (!docId) {
-            stats.newWithoutDocId++;
-          }
-          for (const attrKey of Object.keys(payload)) {
-            stats.diffs.push({
-              uid,
-              collectionName: ct.info?.displayName || uid,
-              documentId: newDocId,
-              label: created?.title || created?.name || `New Entry #${newDocId}`,
-              attribute: attrKey,
-              oldValue: null,
-              newValue: payload[attrKey],
-              status: 'created',
-              message: docId
-                ? `Created "${attrKey}" as new entry (documentId "${docId}" not found in database - row ${rowNumber})`
-                : `Created "${attrKey}" as new entry (no documentId provided in CSV - row ${rowNumber})`,
-            });
-          }
-        }
-      } catch (err: any) {
-        stats.errors.push({
-          row: rowNumber,
-          documentId: docId || undefined,
-          error: extractDetailedErrorMessage(err),
-        });
-      }
-    }
+    const stats = await processCsvRows(strapi, ct, uid, parsedRows, 2, options);
 
     try {
       const bulkService = strapi.plugin('bulk-updater').service('bulkUpdater');
       if (bulkService && (bulkService as any).invalidateCollectionCache) {
         (bulkService as any).invalidateCollectionCache(uid);
       }
-    } catch {
-      // Ignore
-    }
+    } catch {}
 
-    if (stats.updated > 0 || stats.created > 0) {
-      try {
-        const auditService = strapi.plugin('bulk-updater').service('audit');
-        if (auditService) {
-          const isEnabled = typeof auditService.isAuditEnabled === 'function'
-            ? auditService.isAuditEnabled()
-            : Boolean(auditService.getAuditConfig?.().enabled ?? true);
-
-          if (isEnabled) {
-            const collectionDisplayName = ct.info?.displayName || uid;
-            const updatedDiffs = stats.diffs.filter(
-              (d) => d.status === 'updated' || d.status === 'created'
-            );
-            const uniqueAttributes = Array.from(
-              new Set(updatedDiffs.map((d) => d.attribute))
-            ).filter(Boolean);
-            const attrListStr = uniqueAttributes.length > 0 ? uniqueAttributes.join(', ') : 'fields';
-
-            const batchAttribute = `CSV [${collectionDisplayName}]: ${attrListStr}`;
-
-            let batchValue = '';
-            if (updatedDiffs.length === 1) {
-              const d = updatedDiffs[0];
-              const newStr = d.newValue !== null && d.newValue !== undefined ? String(d.newValue) : '(empty)';
-              batchValue = `"${d.label}": ${d.attribute} → "${newStr}"`;
-            } else if (updatedDiffs.length > 1 && stats.updated === 1 && stats.created === 0) {
-              const d = updatedDiffs[0];
-              const changes = updatedDiffs
-                .map((ud) => `${ud.attribute}: "${ud.newValue ?? ''}"`)
-                .join(', ');
-              batchValue = `"${d.label}": ${changes}`;
-            } else {
-              const sampleVal = updatedDiffs[0]
-                ? ` (e.g. ${updatedDiffs[0].attribute}: "${updatedDiffs[0].newValue ?? ''}")`
-                : '';
-              batchValue = `${stats.updated} updated, ${stats.created} created in ${collectionDisplayName}${sampleVal}`;
-            }
-
-            const batchSummary = {
-              batchId,
-              attribute: batchAttribute,
-              value: batchValue,
-              updatedCount: stats.updated + stats.created,
-              skippedCount: stats.skipped,
-              totalTargets: stats.total,
-            };
-
-            const userObj = {
-              email: userEmail || 'admin@strapi.io',
-              firstname: userName || 'Admin',
-            };
-
-            if (typeof auditService.recordBatch === 'function') {
-              await auditService.recordBatch(batchSummary, stats.diffs, userObj);
-            } else if (typeof auditService.logOperation === 'function') {
-              await auditService.logOperation({
-                ...batchSummary,
-                userEmail,
-                userName,
-                diffs: stats.diffs,
-              });
-            }
-          }
-        }
-      } catch (auditErr) {
-        strapi.log.warn('[bulk-updater] Failed logging CSV import audit:', auditErr);
-      }
-    }
+    await recordCsvAuditLog(strapi, ct, uid, batchId, stats, options.user);
 
     return {
       success: true,

@@ -210,6 +210,14 @@ export default {
           policies: [],
         },
       },
+      {
+        method: 'POST',
+        path: '/csv/import-chunk',
+        handler: 'csv.importChunk',
+        config: {
+          policies: [],
+        },
+      },
     ],
   },
 };

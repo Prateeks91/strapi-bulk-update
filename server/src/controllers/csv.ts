@@ -124,4 +124,36 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       ctx.body = { success: false, error: err.message };
     }
   },
+
+  async importChunk(ctx: any) {
+    try {
+      const { uid, rows, batchId, isFirstChunk, isLastChunk, startRowNumber, mode, publish } = ctx.request.body;
+      if (!uid) {
+        ctx.status = 400;
+        ctx.body = { success: false, error: 'Target collection UID is required.' };
+        return;
+      }
+      if (!Array.isArray(rows)) {
+        ctx.status = 400;
+        ctx.body = { success: false, error: 'Rows array is required.' };
+        return;
+      }
+
+      const csvService = strapi.plugin('bulk-updater').service('csv');
+      const result = await csvService.importChunk(uid, rows, {
+        batchId: batchId ? String(batchId) : undefined,
+        isFirstChunk: Boolean(isFirstChunk),
+        isLastChunk: Boolean(isLastChunk),
+        startRowNumber: typeof startRowNumber === 'number' ? startRowNumber : undefined,
+        mode: mode === 'update' ? 'update' : mode === 'create_or_override' ? 'create_or_override' : 'auto',
+        publish: publish !== false,
+        user: ctx.state.user,
+      });
+
+      ctx.body = result;
+    } catch (err: any) {
+      ctx.status = 500;
+      ctx.body = { success: false, error: err.message };
+    }
+  },
 });

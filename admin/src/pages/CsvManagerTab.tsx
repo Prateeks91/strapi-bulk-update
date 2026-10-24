@@ -17,7 +17,7 @@ import {
   Alert,
   Checkbox,
 } from '@strapi/design-system';
-import { Download, Upload, ArrowClockwise, Check } from '@strapi/icons';
+import { Download, Upload, ArrowClockwise, Check, ChevronLeft, ChevronRight } from '@strapi/icons';
 import { parseCsv, extractDocId } from '../utils/csvParser';
 import { isAbortError } from '../utils/isAbortError';
 
@@ -38,8 +38,8 @@ export default function CsvManagerTab() {
   const [loadingCollections, setLoadingCollections] = useState<boolean>(true);
   const [selectedUid, setSelectedUid] = useState<string>('');
 
-  // Export filters
-  const [exportLimit, setExportLimit] = useState<number>(1000);
+  // Export filters (0 = Unlimited / All records)
+  const [exportLimit, setExportLimit] = useState<number>(0);
   const [exportOnlyViolations, setExportOnlyViolations] = useState<boolean>(false);
   const [rules, setRules] = useState<any[]>([]);
   const [selectedRuleId, setSelectedRuleId] = useState<string>('');
@@ -49,8 +49,21 @@ export default function CsvManagerTab() {
   const [publishOnImport, setPublishOnImport] = useState<boolean>(true);
   const [csvRawText, setCsvRawText] = useState<string>('');
   const [fileName, setFileName] = useState<string>('');
-  const [parsedPreview, setParsedPreview] = useState<Array<Record<string, string>>>([]);
+  const [allParsedRecords, setAllParsedRecords] = useState<Array<Record<string, string>>>([]);
+  const [previewPage, setPreviewPage] = useState<number>(1);
+  const [previewPageSize, setPreviewPageSize] = useState<number>(10);
   const [importing, setImporting] = useState<boolean>(false);
+  const [importProgress, setImportProgress] = useState<{
+    currentChunk: number;
+    totalChunks: number;
+    percent: number;
+    processedRows: number;
+    totalRows: number;
+    liveCreated: number;
+    liveUpdated: number;
+    liveSkipped: number;
+    liveErrors: number;
+  } | null>(null);
   const [importResult, setImportResult] = useState<any>(null);
 
   useEffect(() => {
@@ -118,7 +131,7 @@ export default function CsvManagerTab() {
       downloadCsvFile(csvStr, filename);
       toggleNotification({
         type: 'success',
-        message: 'Collection exported to CSV successfully',
+        message: `Collection exported successfully (${res.data?.count ?? 0} records)`,
       });
     } catch (err: any) {
       if (isAbortError(err)) return;
@@ -169,13 +182,14 @@ export default function CsvManagerTab() {
     URL.revokeObjectURL(url);
   };
 
-  // Robust RFC-4180 client-side preview parser
+  // RFC-4180 client-side file upload & parser
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
     setFileName(file.name);
     setImportResult(null);
+    setImportProgress(null);
 
     const reader = new FileReader();
     reader.onload = (event) => {
@@ -184,32 +198,100 @@ export default function CsvManagerTab() {
 
       try {
         const records = parseCsv(text);
-        setParsedPreview(records.slice(0, 10));
+        setAllParsedRecords(records);
+        setPreviewPage(1);
       } catch (err) {
-        setParsedPreview([]);
+        setAllParsedRecords([]);
       }
     };
     reader.readAsText(file);
   };
 
+  // Chunked batch import engine (batches of 100 rows prevent HTTP 413 "Request entity too large")
   const handleExecuteImport = async () => {
-    if (!selectedUid || !csvRawText) return;
+    if (!selectedUid || allParsedRecords.length === 0) return;
+
+    const totalRows = allParsedRecords.length;
+    const CHUNK_SIZE = 100;
+    const totalChunks = Math.ceil(totalRows / CHUNK_SIZE);
+    const batchId = `csv_batch_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
     try {
       setImporting(true);
       setImportResult(null);
 
-      const res = await post('/bulk-updater/csv/import', {
-        uid: selectedUid,
-        csvText: csvRawText,
-        mode: importMode,
-        publish: publishOnImport,
+      let liveCreated = 0;
+      let liveUpdated = 0;
+      let liveSkipped = 0;
+      let liveErrors = 0;
+      let finalResultData: any = null;
+
+      setImportProgress({
+        currentChunk: 0,
+        totalChunks,
+        percent: 0,
+        processedRows: 0,
+        totalRows,
+        liveCreated: 0,
+        liveUpdated: 0,
+        liveSkipped: 0,
+        liveErrors: 0,
       });
 
-      if (res.data && res.data.success) {
-        setImportResult(res.data);
-        const stats = res.data.stats;
-        let notifMsg = `CSV Import complete: ${stats.created} created, ${stats.updated} updated.`;
+      for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
+        const startIdx = chunkIdx * CHUNK_SIZE;
+        const endIdx = Math.min(startIdx + CHUNK_SIZE, totalRows);
+        const chunkRows = allParsedRecords.slice(startIdx, endIdx);
+        const isFirst = chunkIdx === 0;
+        const isLast = chunkIdx === totalChunks - 1;
+        const startRowNumber = startIdx + 2;
+
+        const res = await post('/bulk-updater/csv/import-chunk', {
+          uid: selectedUid,
+          rows: chunkRows,
+          batchId,
+          isFirstChunk: isFirst,
+          isLastChunk: isLast,
+          startRowNumber,
+          mode: importMode,
+          publish: publishOnImport,
+        });
+
+        if (!res.data || !res.data.success) {
+          throw new Error(res.data?.error || `Chunk ${chunkIdx + 1} failed to process`);
+        }
+
+        const chunkStats = res.data.chunkStats;
+        if (chunkStats) {
+          liveCreated += chunkStats.created || 0;
+          liveUpdated += chunkStats.updated || 0;
+          liveSkipped += chunkStats.skipped || 0;
+          liveErrors += chunkStats.errors?.length || 0;
+        }
+
+        const currentProgressPercent = Math.round(((chunkIdx + 1) / totalChunks) * 100);
+
+        setImportProgress({
+          currentChunk: chunkIdx + 1,
+          totalChunks,
+          percent: currentProgressPercent,
+          processedRows: endIdx,
+          totalRows,
+          liveCreated,
+          liveUpdated,
+          liveSkipped,
+          liveErrors,
+        });
+
+        if (isLast) {
+          finalResultData = res.data;
+        }
+      }
+
+      if (finalResultData && finalResultData.stats) {
+        setImportResult(finalResultData);
+        const stats = finalResultData.stats;
+        let notifMsg = `CSV Import complete: ${stats.created} created, ${stats.updated} updated across ${stats.total} records.`;
         if (stats.newWithoutDocId && stats.newWithoutDocId > 0) {
           notifMsg += ` (${stats.newWithoutDocId} new entries created due to omitted documentId)`;
         }
@@ -217,14 +299,12 @@ export default function CsvManagerTab() {
           type: 'success',
           message: notifMsg,
         });
-      } else {
-        throw new Error(res.data?.error || 'Import failed');
       }
     } catch (err: any) {
       if (isAbortError(err)) return;
       toggleNotification({
         type: 'danger',
-        message: err.message || 'Error processing CSV import',
+        message: err.message || 'Error processing CSV import batch',
       });
     } finally {
       setImporting(false);
@@ -243,7 +323,7 @@ export default function CsvManagerTab() {
               CSV Export &amp; Import Center
             </Typography>
             <Typography variant="pi" textColor="neutral600">
-              Export all records, filtered subsets, or rule violations into CSV. Correct or add records in spreadsheets and re-upload with full schema &amp; quota enforcement.
+              Export all records (including 10,000+ datasets), filtered subsets, or rule violations into CSV. Correct or add records in spreadsheets and re-upload with high-performance chunked batch processing.
             </Typography>
           </Box>
           <Button variant="secondary" startIcon={<ArrowClockwise />} onClick={fetchInitialData}>
@@ -263,6 +343,7 @@ export default function CsvManagerTab() {
                 onChange={(val: string) => {
                   setSelectedUid(val);
                   setImportResult(null);
+                  setImportProgress(null);
                 }}
                 disabled={loadingCollections}
                 placeholder="Select a collection..."
@@ -292,10 +373,24 @@ export default function CsvManagerTab() {
             1. Export Data to CSV
           </Typography>
           <Typography variant="pi" textColor="neutral600" marginBottom={4}>
-            Extract entire collections or pinpoint records violating validation quotas.
+            Extract entire collections without artificial limits (streams 10,000+ records in paged chunks) or pinpoint records violating validation quotas.
           </Typography>
 
           <Flex gap={4} wrap="wrap" alignItems="center" marginTop={3}>
+            {/* Export Limit Selector */}
+            <Box style={{ width: 220 }}>
+              <SingleSelect
+                value={String(exportLimit)}
+                onChange={(val: string) => setExportLimit(Number(val))}
+                placeholder="Export Limit"
+              >
+                <SingleSelectOption value="0">All Records (No Limit)</SingleSelectOption>
+                <SingleSelectOption value="10000">Up to 10,000 Records</SingleSelectOption>
+                <SingleSelectOption value="5000">Up to 5,000 Records</SingleSelectOption>
+                <SingleSelectOption value="1000">Up to 1,000 Records</SingleSelectOption>
+              </SingleSelect>
+            </Box>
+
             {/* Standard Collection Export */}
             <Button
               variant="default"
@@ -303,7 +398,7 @@ export default function CsvManagerTab() {
               onClick={handleExportCollection}
               disabled={!selectedUid}
             >
-              Export All {selectedCol?.displayName || 'Collection'} Records (.csv)
+              Export {exportLimit === 0 ? 'All' : `${exportLimit}`} {selectedCol?.displayName || 'Collection'} Records (.csv)
             </Button>
 
             {/* Violations Export */}
@@ -340,7 +435,7 @@ export default function CsvManagerTab() {
             2. Import &amp; Batch Override CSV
           </Typography>
           <Typography variant="pi" textColor="neutral600" marginBottom={4}>
-            Upload an updated CSV file to bulk update existing records or insert new records.
+            Upload an updated CSV file (supports 10,000+ records via chunked streaming) to bulk update existing records or insert new records.
           </Typography>
 
           {/* Configuration Modes */}
@@ -401,48 +496,61 @@ export default function CsvManagerTab() {
             </label>
           </Box>
 
-          {/* Parsed Preview Table */}
-          {parsedPreview.length > 0 && (() => {
-            const missingDocIdCount = parsedPreview.filter(
-              (row) => !extractDocId(row)
-            ).length;
-            const headers = Object.keys(parsedPreview[0]);
+          {/* Parsed Preview Table with Full-Dataset Inspection & Pagination */}
+          {allParsedRecords.length > 0 && (() => {
+            const totalRows = allParsedRecords.length;
+            const missingDocIdCount = allParsedRecords.filter((row) => !extractDocId(row)).length;
+            const updateCount = totalRows - missingDocIdCount;
+            const headers = Object.keys(allParsedRecords[0]);
+
+            const totalPages = Math.ceil(totalRows / previewPageSize) || 1;
+            const safePage = Math.min(Math.max(1, previewPage), totalPages);
+            const startIndex = (safePage - 1) * previewPageSize;
+            const endIndex = Math.min(startIndex + previewPageSize, totalRows);
+            const displayedRows = allParsedRecords.slice(startIndex, endIndex);
 
             return (
               <Box marginTop={4} background="neutral0" padding={4} hasRadius>
-                <Flex justifyContent="space-between" alignItems="center" marginBottom={3}>
+                <Flex justifyContent="space-between" alignItems="center" marginBottom={3} wrap="wrap" gap={2}>
                   <Box>
                     <Typography variant="sigma" textColor="neutral700">
-                      FILE PREVIEW (FIRST {parsedPreview.length} ROWS)
+                      FILE PREVIEW — {totalRows.toLocaleString()} RECORDS DETECTED IN CSV
                     </Typography>
                     <Typography variant="pi" textColor="neutral500" display="block">
-                      {parsedPreview.length} previewed row{parsedPreview.length > 1 ? 's' : ''} •{' '}
+                      {totalRows.toLocaleString()} total row{totalRows > 1 ? 's' : ''} •{' '}
+                      {updateCount > 0 ? `${updateCount.toLocaleString()} updates` : ''}
+                      {updateCount > 0 && missingDocIdCount > 0 ? ', ' : ''}
                       {missingDocIdCount > 0
-                        ? `${missingDocIdCount} row${missingDocIdCount > 1 ? 's' : ''} missing documentId (will be created as new entries)`
-                        : 'All previewed rows contain document IDs'}
+                        ? `${missingDocIdCount.toLocaleString()} new entries (missing documentId)`
+                        : ''}
                     </Typography>
                   </Box>
-                  <Badge backgroundColor={missingDocIdCount > 0 ? 'warning100' : 'success100'} textColor={missingDocIdCount > 0 ? 'warning700' : 'success700'}>
-                    {missingDocIdCount > 0 ? `${missingDocIdCount} New (No ID)` : 'Ready to Import'}
-                  </Badge>
+                  <Flex gap={2}>
+                    <Badge backgroundColor="primary100" textColor="primary700">
+                      🔄 {updateCount.toLocaleString()} Updates
+                    </Badge>
+                    {missingDocIdCount > 0 && (
+                      <Badge backgroundColor="warning100" textColor="warning700">
+                        ➕ {missingDocIdCount.toLocaleString()} New (No ID)
+                      </Badge>
+                    )}
+                  </Flex>
                 </Flex>
 
                 {missingDocIdCount > 0 && (
                   <Box marginBottom={3}>
-                    <Alert
-                      variant="default"
-                      title="Smart Auto-Detect Active"
-                    >
+                    <Alert variant="default" title="Smart Auto-Detect Active">
                       <Typography variant="omega">
-                        {missingDocIdCount} row{missingDocIdCount > 1 ? 's have' : ' has'} no <code>documentId</code>.{' '}
+                        {missingDocIdCount.toLocaleString()} row{missingDocIdCount > 1 ? 's have' : ' has'} no <code>documentId</code>.{' '}
                         Because no documentId is provided, the engine will automatically treat them as new entries and generate new database IDs for them.
                       </Typography>
                     </Alert>
                   </Box>
                 )}
 
+                {/* Table */}
                 <Box style={{ overflowX: 'auto', maxWidth: '100%', border: '1px solid #e0e0e0', borderRadius: 4 }}>
-                  <Table colCount={headers.length + 1} rowCount={parsedPreview.length + 1}>
+                  <Table colCount={headers.length + 1} rowCount={displayedRows.length + 1}>
                     <Thead>
                       <Tr>
                         <Th style={{ width: 150, minWidth: 150 }}>
@@ -456,20 +564,26 @@ export default function CsvManagerTab() {
                       </Tr>
                     </Thead>
                     <Tbody>
-                      {parsedPreview.map((row, rIdx) => {
+                      {displayedRows.map((row, rIdx) => {
                         const hasDocId = !!extractDocId(row);
+                        const actualRowIndex = startIndex + rIdx + 1;
                         return (
                           <Tr key={rIdx}>
                             <Td>
-                              {hasDocId ? (
-                                <Badge backgroundColor="primary100" textColor="primary700">
-                                  🔄 Match / Update
-                                </Badge>
-                              ) : (
-                                <Badge backgroundColor="warning100" textColor="warning700">
-                                  ➕ New Entry
-                                </Badge>
-                              )}
+                              <Flex direction="column" gap={1}>
+                                {hasDocId ? (
+                                  <Badge backgroundColor="primary100" textColor="primary700">
+                                    🔄 Update
+                                  </Badge>
+                                ) : (
+                                  <Badge backgroundColor="warning100" textColor="warning700">
+                                    ➕ New Entry
+                                  </Badge>
+                                )}
+                                <Typography variant="pi" textColor="neutral500">
+                                  Row #{actualRowIndex}
+                                </Typography>
+                              </Flex>
                             </Td>
                             {headers.map((h) => (
                               <Td key={h} style={{ verticalAlign: 'top', maxWidth: 300 }}>
@@ -504,6 +618,57 @@ export default function CsvManagerTab() {
                   </Table>
                 </Box>
 
+                {/* Pagination Controls */}
+                <Flex justifyContent="space-between" alignItems="center" marginTop={3} wrap="wrap" gap={3}>
+                  <Flex gap={2} alignItems="center">
+                    <Typography variant="pi" textColor="neutral600">
+                      Rows per page:
+                    </Typography>
+                    <Box style={{ width: 80 }}>
+                      <SingleSelect
+                        value={String(previewPageSize)}
+                        onChange={(val: string) => {
+                          setPreviewPageSize(Number(val));
+                          setPreviewPage(1);
+                        }}
+                      >
+                        <SingleSelectOption value="10">10</SingleSelectOption>
+                        <SingleSelectOption value="25">25</SingleSelectOption>
+                        <SingleSelectOption value="50">50</SingleSelectOption>
+                        <SingleSelectOption value="100">100</SingleSelectOption>
+                      </SingleSelect>
+                    </Box>
+                    <Typography variant="pi" textColor="neutral600">
+                      Showing {startIndex + 1}–{endIndex} of {totalRows.toLocaleString()} rows
+                    </Typography>
+                  </Flex>
+
+                  <Flex gap={2} alignItems="center">
+                    <Button
+                      variant="tertiary"
+                      size="S"
+                      startIcon={<ChevronLeft />}
+                      disabled={safePage <= 1 || importing}
+                      onClick={() => setPreviewPage((p) => Math.max(1, p - 1))}
+                    >
+                      Prev
+                    </Button>
+                    <Typography variant="pi" fontWeight="bold" textColor="neutral700">
+                      Page {safePage} of {totalPages}
+                    </Typography>
+                    <Button
+                      variant="tertiary"
+                      size="S"
+                      endIcon={<ChevronRight />}
+                      disabled={safePage >= totalPages || importing}
+                      onClick={() => setPreviewPage((p) => Math.min(totalPages, p + 1))}
+                    >
+                      Next
+                    </Button>
+                  </Flex>
+                </Flex>
+
+                {/* Action CTA */}
                 <Flex justifyContent="flex-end" marginTop={4}>
                   <Button
                     variant="default"
@@ -512,12 +677,55 @@ export default function CsvManagerTab() {
                     onClick={handleExecuteImport}
                     loading={importing}
                   >
-                    Execute Smart Import (Auto-Detect)
+                    Execute Smart Import ({totalRows.toLocaleString()} Records in Batches)
                   </Button>
                 </Flex>
               </Box>
             );
           })()}
+
+          {/* Real-time Chunked Import Progress Card */}
+          {importProgress && (
+            <Box marginTop={4} padding={4} background="neutral0" hasRadius style={{ border: '1px solid #4945ff' }}>
+              <Flex justifyContent="space-between" alignItems="center" marginBottom={2}>
+                <Typography variant="delta" fontWeight="bold" textColor="primary700">
+                  {importing ? `Processing Batch Chunk ${importProgress.currentChunk} of ${importProgress.totalChunks} (${importProgress.percent}%)` : 'Batch Import Complete'}
+                </Typography>
+                <Typography variant="pi" fontWeight="bold" textColor="neutral700">
+                  {importProgress.processedRows.toLocaleString()} / {importProgress.totalRows.toLocaleString()} rows processed
+                </Typography>
+              </Flex>
+
+              {/* Visual Progress Bar */}
+              <Box style={{ width: '100%', height: 10, background: '#e0e0e0', borderRadius: 5, overflow: 'hidden', marginBottom: 12 }}>
+                <Box
+                  style={{
+                    width: `${importProgress.percent}%`,
+                    height: '100%',
+                    background: importProgress.percent === 100 ? '#2f6846' : '#4945ff',
+                    transition: 'width 0.2s ease-in-out',
+                  }}
+                />
+              </Box>
+
+              <Flex gap={3} wrap="wrap" alignItems="center">
+                <Badge backgroundColor="success100" textColor="success700">
+                  Created: {importProgress.liveCreated.toLocaleString()}
+                </Badge>
+                <Badge backgroundColor="primary100" textColor="primary700">
+                  Updated: {importProgress.liveUpdated.toLocaleString()}
+                </Badge>
+                <Badge backgroundColor="neutral150" textColor="neutral700">
+                  Skipped: {importProgress.liveSkipped.toLocaleString()}
+                </Badge>
+                {importProgress.liveErrors > 0 && (
+                  <Badge backgroundColor="danger100" textColor="danger700">
+                    Errors: {importProgress.liveErrors.toLocaleString()}
+                  </Badge>
+                )}
+              </Flex>
+            </Box>
+          )}
 
           {/* Execution Result Banner */}
           {importResult && (
@@ -527,12 +735,12 @@ export default function CsvManagerTab() {
                 title="CSV Import Results"
               >
                 <Typography variant="omega" display="block" marginBottom={1}>
-                  Successfully processed: <strong>{importResult.stats.created} created</strong>
+                  Successfully processed: <strong>{importResult.stats.created.toLocaleString()} created</strong>
                   {importResult.stats.newWithoutDocId > 0 && (
-                    <span> ({importResult.stats.newWithoutDocId} created as new entries because documentId was omitted)</span>
+                    <span> ({importResult.stats.newWithoutDocId.toLocaleString()} created as new entries because documentId was omitted)</span>
                   )}
-                  , <strong>{importResult.stats.updated} updated</strong>,{' '}
-                  <strong>{importResult.stats.skipped} skipped</strong> out of {importResult.stats.total} total rows.
+                  , <strong>{importResult.stats.updated.toLocaleString()} updated</strong>,{' '}
+                  <strong>{importResult.stats.skipped.toLocaleString()} skipped</strong> out of {importResult.stats.total.toLocaleString()} total rows.
                 </Typography>
                 {importResult.stats.newWithoutDocId > 0 && (
                   <Box marginTop={2} padding={2} background="neutral100" hasRadius>
@@ -566,7 +774,7 @@ export default function CsvManagerTab() {
                 {importResult.stats.diffs && importResult.stats.diffs.length > 0 && (
                   <Box marginTop={3} padding={3} background="neutral0" hasRadius style={{ border: '1px solid #dcdce4' }}>
                     <Typography variant="sigma" textColor="neutral800" fontWeight="bold" display="block" marginBottom={2}>
-                      CHANGES APPLIED ({importResult.stats.diffs.length}):
+                      CHANGES APPLIED ({importResult.stats.diffs.length.toLocaleString()}):
                     </Typography>
                     <Box style={{ overflowX: 'auto' }}>
                       <Table colCount={4} rowCount={importResult.stats.diffs.length + 1}>
