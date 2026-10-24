@@ -16,8 +16,9 @@ import {
   Td,
   Alert,
   Checkbox,
+  TextInput,
 } from '@strapi/design-system';
-import { Download, Upload, ArrowClockwise, Check, ChevronLeft, ChevronRight } from '@strapi/icons';
+import { Download, Upload, ArrowClockwise, Check, ChevronLeft, ChevronRight, Eye } from '@strapi/icons';
 import { parseCsv, extractDocId } from '../utils/csvParser';
 import { isAbortError } from '../utils/isAbortError';
 
@@ -66,6 +67,34 @@ export default function CsvManagerTab() {
   } | null>(null);
   const [importResult, setImportResult] = useState<any>(null);
 
+  // Enterprise Guardrail State (Execution Windows, Business Hours, Maker-Checker 4-Eyes, Pre-Flight Dry Run)
+  const [executionWindow, setExecutionWindow] = useState<{
+    enabled: boolean;
+    timeZone: string;
+    isBusinessHours: boolean;
+    policyMessage: string;
+    offPeakStartTime: string;
+    currentServerTime: string;
+  } | null>(null);
+
+  const [preflightLoading, setPreflightLoading] = useState<boolean>(false);
+  const [preflightReport, setPreflightReport] = useState<{
+    totalRows: number;
+    validRows: number;
+    estimatedUpdates: number;
+    estimatedCreates: number;
+    hasErrors: boolean;
+    hasWarnings: boolean;
+    errors: Array<{ row: number; documentId?: string; error: string }>;
+    warnings: Array<{ row: number; documentId?: string; warning: string }>;
+    totalErrorCount: number;
+    totalWarningCount: number;
+  } | null>(null);
+
+  const [showConfirmModal, setShowConfirmModal] = useState<boolean>(false);
+  const [makerNotesInput, setMakerNotesInput] = useState<string>('');
+  const [submittingBatch, setSubmittingBatch] = useState<boolean>(false);
+
   useEffect(() => {
     fetchInitialData();
   }, []);
@@ -77,6 +106,10 @@ export default function CsvManagerTab() {
         get('/bulk-updater/models'),
         get('/bulk-updater/validation-rules'),
       ]);
+
+      if (modelsRes.data?.executionWindow) {
+        setExecutionWindow(modelsRes.data.executionWindow);
+      }
 
       if (modelsRes.data?.collections) {
         setCollections(modelsRes.data.collections);
@@ -311,6 +344,93 @@ export default function CsvManagerTab() {
     }
   };
 
+  // Pre-Flight Dry-Run: Non-destructive validation check before import execution
+  const handleRunPreflight = async () => {
+    if (!selectedUid || allParsedRecords.length === 0) return;
+    try {
+      setPreflightLoading(true);
+      const res = await post('/bulk-updater/csv/validate-preflight', {
+        uid: selectedUid,
+        rows: allParsedRecords,
+        mode: importMode,
+      });
+      if (res.data && res.data.success) {
+        setPreflightReport(res.data);
+        if (res.data.hasErrors) {
+          toggleNotification({
+            type: 'warning',
+            message: `Pre-flight validation: ${res.data.totalErrorCount} error(s) and ${res.data.totalWarningCount} warning(s) detected.`,
+          });
+        } else if (res.data.hasWarnings) {
+          toggleNotification({
+            type: 'warning',
+            message: `Pre-flight validation passed with ${res.data.totalWarningCount} warning(s).`,
+          });
+        } else {
+          toggleNotification({
+            type: 'success',
+            message: `Pre-flight validation passed! All ${res.data.validRows} rows are ready for import.`,
+          });
+        }
+      }
+    } catch (err: any) {
+      if (isAbortError(err)) return;
+      toggleNotification({
+        type: 'danger',
+        message: err.message || 'Failed running pre-flight validation',
+      });
+    } finally {
+      setPreflightLoading(false);
+    }
+  };
+
+  // Submit CSV Batch with Chosen Execution Mode (Maker-Checker 4-Eyes, Off-Peak Scheduling, Immediate)
+  const submitBatchWithMode = async (
+    executionMode: 'immediate' | 'queue_offpeak' | 'maker_checker',
+    forceImmediate = false
+  ) => {
+    if (!selectedUid || allParsedRecords.length === 0) return;
+
+    if (executionMode === 'immediate') {
+      setShowConfirmModal(false);
+      await handleExecuteImport();
+      return;
+    }
+
+    try {
+      setSubmittingBatch(true);
+      const res = await post('/bulk-updater/csv/submit-batch', {
+        uid: selectedUid,
+        rows: allParsedRecords,
+        executionMode,
+        makerNotes: makerNotesInput,
+        forceImmediate,
+        mode: importMode,
+        publish: publishOnImport,
+      });
+
+      setShowConfirmModal(false);
+
+      if (res.data && res.data.pending) {
+        setMakerNotesInput('');
+        toggleNotification({
+          type: 'success',
+          message: res.data.message || 'CSV batch submitted for Checker authorization.',
+        });
+      } else if (res.data && res.data.executeNow) {
+        await handleExecuteImport();
+      }
+    } catch (err: any) {
+      if (isAbortError(err)) return;
+      toggleNotification({
+        type: 'danger',
+        message: err.message || 'Failed submitting CSV batch',
+      });
+    } finally {
+      setSubmittingBatch(false);
+    }
+  };
+
   const selectedCol = collections.find((c) => c.uid === selectedUid);
 
   return (
@@ -537,6 +657,66 @@ export default function CsvManagerTab() {
                   </Flex>
                 </Flex>
 
+                {/* Pre-Flight Inspection Card */}
+                {preflightReport && (
+                  <Box
+                    marginBottom={3}
+                    padding={4}
+                    background={preflightReport.hasErrors ? 'danger100' : preflightReport.hasWarnings ? 'warning100' : 'success100'}
+                    hasRadius
+                    style={{ border: `1px solid ${preflightReport.hasErrors ? '#d9534f' : preflightReport.hasWarnings ? '#f0ad4e' : '#5cb85c'}` }}
+                  >
+                    <Flex direction="column" gap={2}>
+                      <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={2}>
+                        <Typography fontWeight="bold" textColor={preflightReport.hasErrors ? 'danger700' : preflightReport.hasWarnings ? 'warning700' : 'success700'}>
+                          {preflightReport.hasErrors
+                            ? `⚠️ Pre-Flight Check: ${preflightReport.totalErrorCount} error(s) detected`
+                            : preflightReport.hasWarnings
+                            ? `⚡ Pre-Flight Check: ${preflightReport.validRows} valid rows with ${preflightReport.totalWarningCount} warning(s)`
+                            : `✅ Pre-Flight Check Passed: All ${preflightReport.validRows} rows are ready for import`}
+                        </Typography>
+                        <Flex gap={2}>
+                          <Badge backgroundColor="success100" textColor="success700">
+                            ✓ {preflightReport.validRows} Valid Rows
+                          </Badge>
+                          <Badge backgroundColor="primary100" textColor="primary700">
+                            🔄 {preflightReport.estimatedUpdates} Updates
+                          </Badge>
+                          <Badge backgroundColor="warning100" textColor="warning700">
+                            ➕ {preflightReport.estimatedCreates} New
+                          </Badge>
+                        </Flex>
+                      </Flex>
+
+                      {preflightReport.hasErrors && (
+                        <Box marginTop={2} background="neutral0" padding={3} hasRadius style={{ maxHeight: 160, overflowY: 'auto' }}>
+                          <Typography variant="pi" fontWeight="bold" textColor="danger700" display="block" marginBottom={1}>
+                            Validation Errors ({preflightReport.totalErrorCount}):
+                          </Typography>
+                          {preflightReport.errors.map((e: any, idx: number) => (
+                            <Typography key={idx} variant="pi" textColor="danger700" display="block">
+                              • Row {e.row}: {e.error}
+                            </Typography>
+                          ))}
+                        </Box>
+                      )}
+
+                      {preflightReport.hasWarnings && (
+                        <Box marginTop={2} background="neutral0" padding={3} hasRadius style={{ maxHeight: 140, overflowY: 'auto' }}>
+                          <Typography variant="pi" fontWeight="bold" textColor="warning700" display="block" marginBottom={1}>
+                            Warnings ({preflightReport.totalWarningCount}):
+                          </Typography>
+                          {preflightReport.warnings.map((w: any, idx: number) => (
+                            <Typography key={idx} variant="pi" textColor="warning700" display="block">
+                              • Row {w.row}: {w.warning}
+                            </Typography>
+                          ))}
+                        </Box>
+                      )}
+                    </Flex>
+                  </Box>
+                )}
+
                 {missingDocIdCount > 0 && (
                   <Box marginBottom={3}>
                     <Alert variant="default" title="Smart Auto-Detect Active">
@@ -668,16 +848,27 @@ export default function CsvManagerTab() {
                   </Flex>
                 </Flex>
 
-                {/* Action CTA */}
-                <Flex justifyContent="flex-end" marginTop={4}>
+                {/* Pre-Flight and Import Action CTAs */}
+                <Flex justifyContent="space-between" alignItems="center" marginTop={4} wrap="wrap" gap={3}>
+                  <Button
+                    variant="secondary"
+                    size="L"
+                    startIcon={<Eye />}
+                    onClick={handleRunPreflight}
+                    loading={preflightLoading}
+                    disabled={importing}
+                  >
+                    Run Pre-Flight Dry Run
+                  </Button>
+
                   <Button
                     variant="default"
                     size="L"
                     startIcon={<Check />}
-                    onClick={handleExecuteImport}
-                    loading={importing}
+                    onClick={() => setShowConfirmModal(true)}
+                    loading={importing || submittingBatch}
                   >
-                    Execute Smart Import ({totalRows.toLocaleString()} Records in Batches)
+                    Review &amp; Import ({totalRows.toLocaleString()} Records)...
                   </Button>
                 </Flex>
               </Box>
@@ -834,6 +1025,262 @@ export default function CsvManagerTab() {
           )}
         </Box>
       </Flex>
+
+      {/* Confirmation Modal with Enterprise Guardrails (Maker-Checker, Execution Windows, Off-Peak Scheduling) */}
+      {showConfirmModal && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(20, 20, 30, 0.65)',
+            backdropFilter: 'blur(2px)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 9999,
+            padding: 16,
+            boxSizing: 'border-box',
+            overflowY: 'auto',
+          }}
+          onClick={() => setShowConfirmModal(false)}
+        >
+          <Box
+            background="neutral0"
+            hasRadius
+            shadow="popupShadow"
+            style={{
+              maxWidth: 680,
+              width: '100%',
+              maxHeight: 'calc(100vh - 48px)',
+              display: 'flex',
+              flexDirection: 'column',
+              overflow: 'hidden',
+              position: 'relative',
+              boxShadow: '0 24px 48px rgba(0, 0, 0, 0.32), 0 0 1px rgba(0, 0, 0, 0.2)',
+            }}
+            onClick={(e: React.MouseEvent) => e.stopPropagation()}
+          >
+            {/* Modal Header */}
+            <Box
+              padding={5}
+              background="neutral100"
+              style={{
+                borderBottom: '1px solid rgba(120, 120, 150, 0.2)',
+                flexShrink: 0,
+              }}
+            >
+              <Flex justifyContent="space-between" alignItems="center">
+                <Box>
+                  <Typography variant="delta" fontWeight="bold">
+                    Confirm CSV Bulk Import
+                  </Typography>
+                  <Typography variant="pi" textColor="neutral600" display="block">
+                    Review import target, record actions, publishing mode, and execution window policies before proceeding.
+                  </Typography>
+                </Box>
+              </Flex>
+            </Box>
+
+            {/* Modal Body */}
+            <Box
+              padding={5}
+              style={{
+                flex: '1 1 auto',
+                minHeight: 0,
+                overflowY: 'auto',
+                WebkitOverflowScrolling: 'touch',
+              }}
+            >
+              {/* Target Summary */}
+              <Box padding={4} background="neutral100" hasRadius marginBottom={4}>
+                <Typography variant="sigma" textColor="neutral600" marginBottom={2} display="block">
+                  IMPORT DETAILS
+                </Typography>
+                <Flex direction="column" gap={2}>
+                  <Flex justifyContent="space-between" alignItems="center">
+                    <Typography fontWeight="semiBold">Target Collection:</Typography>
+                    <Badge backgroundColor="primary100" textColor="primary700">
+                      {selectedCol?.displayName || selectedUid}
+                    </Badge>
+                  </Flex>
+
+                  <Flex justifyContent="space-between" alignItems="center">
+                    <Typography fontWeight="semiBold">Total Detected Records:</Typography>
+                    <Typography fontWeight="bold" textColor="primary600">
+                      {allParsedRecords.length.toLocaleString()} records
+                    </Typography>
+                  </Flex>
+
+                  <Flex justifyContent="space-between" alignItems="center">
+                    <Typography fontWeight="semiBold">Action Breakdown:</Typography>
+                    <Flex gap={2}>
+                      <Badge backgroundColor="primary100" textColor="primary700">
+                        🔄 {allParsedRecords.filter((r) => !!extractDocId(r)).length.toLocaleString()} Updates
+                      </Badge>
+                      <Badge backgroundColor="warning100" textColor="warning700">
+                        ➕ {allParsedRecords.filter((r) => !extractDocId(r)).length.toLocaleString()} New (No ID)
+                      </Badge>
+                    </Flex>
+                  </Flex>
+
+                  <Flex justifyContent="space-between" alignItems="center">
+                    <Typography fontWeight="semiBold">Import Mode:</Typography>
+                    <Badge backgroundColor="neutral200" textColor="neutral800">
+                      {importMode === 'update'
+                        ? 'Update Only (Exact Document IDs)'
+                        : importMode === 'create_or_override'
+                        ? 'Create or Override'
+                        : 'Smart Auto-Detect'}
+                    </Badge>
+                  </Flex>
+
+                  <Flex justifyContent="space-between" alignItems="center">
+                    <Typography fontWeight="semiBold">Publishing Mode:</Typography>
+                    <Badge
+                      backgroundColor={publishOnImport ? 'success100' : 'warning100'}
+                      textColor={publishOnImport ? 'success700' : 'warning700'}
+                    >
+                      {publishOnImport ? 'Publish Immediately' : 'Keep as Draft'}
+                    </Badge>
+                  </Flex>
+
+                  {preflightReport && (
+                    <Flex justifyContent="space-between" alignItems="center" marginTop={2} paddingTop={2} style={{ borderTop: '1px solid #eaeaef' }}>
+                      <Typography variant="pi" textColor="neutral600">
+                        Pre-Flight Status:
+                      </Typography>
+                      <Typography
+                        variant="pi"
+                        fontWeight="bold"
+                        textColor={preflightReport.hasErrors ? 'danger700' : preflightReport.hasWarnings ? 'warning700' : 'success700'}
+                      >
+                        {preflightReport.hasErrors
+                          ? `⚠️ ${preflightReport.totalErrorCount} errors found`
+                          : preflightReport.hasWarnings
+                          ? `⚡ Passed with ${preflightReport.totalWarningCount} warnings`
+                          : '✅ 100% Passed'}
+                      </Typography>
+                    </Flex>
+                  )}
+                </Flex>
+              </Box>
+
+              {/* Developer Server Execution Window Policy */}
+              <Box padding={4} hasRadius marginBottom={4} background={executionWindow?.isBusinessHours ? 'warning100' : 'success100'}>
+                <Flex direction="column" gap={1}>
+                  <Flex gap={2} alignItems="center">
+                    <Typography fontWeight="bold" textColor={executionWindow?.isBusinessHours ? 'warning700' : 'success700'}>
+                      {executionWindow?.isBusinessHours ? '⏰ Peak Business Hours Restriction Active' : '✅ Server Off-Peak Window Active'}
+                    </Typography>
+                  </Flex>
+                  <Typography variant="pi" textColor={executionWindow?.isBusinessHours ? 'warning700' : 'success700'}>
+                    {executionWindow?.policyMessage || (executionWindow?.isBusinessHours
+                      ? 'Server policy restricts bulk operations during peak business hours (09:00 - 18:00). Direct execution is paused to preserve API throughput.'
+                      : 'Currently outside peak business hours. Direct execution is permitted.')}
+                  </Typography>
+                </Flex>
+              </Box>
+
+              {/* Publish Immediately vs Keep as Draft Option */}
+              <Box
+                padding={4}
+                background="neutral100"
+                hasRadius
+                marginBottom={4}
+                style={{ border: '1px solid rgba(120, 120, 150, 0.15)' }}
+              >
+                <Flex gap={3} alignItems="flex-start">
+                  <Checkbox
+                    checked={publishOnImport}
+                    onValueChange={(val: boolean) => setPublishOnImport(Boolean(val))}
+                  />
+                  <Box style={{ cursor: 'pointer' }} onClick={() => setPublishOnImport(!publishOnImport)}>
+                    <Typography fontWeight="bold" display="block">
+                      Publish immediately upon checker approval / execution
+                    </Typography>
+                    <Typography variant="pi" textColor="neutral600">
+                      When checked (default), content types with Draft &amp; Publish enabled will have their updated documents published immediately upon execution. When unchecked, changes remain in Draft for further editorial review.
+                    </Typography>
+                  </Box>
+                </Flex>
+              </Box>
+
+              {/* Change Request / Release Notes */}
+              <Box marginBottom={2}>
+                <TextInput
+                  label="Change Request / Release Notes (Optional)"
+                  name="makerNotes"
+                  placeholder="e.g. REL-5040: Bulk updating catalog attributes via CSV"
+                  value={makerNotesInput}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setMakerNotesInput(e.target.value)}
+                />
+              </Box>
+            </Box>
+
+            {/* Modal Footer */}
+            <Box
+              padding={4}
+              background="neutral100"
+              style={{
+                borderTop: '1px solid rgba(120, 120, 150, 0.2)',
+                flexShrink: 0,
+                position: 'sticky',
+                bottom: 0,
+                zIndex: 20,
+                boxShadow: '0 -4px 16px rgba(0, 0, 0, 0.08)',
+              }}
+            >
+              <Flex justifyContent="space-between" alignItems="center" gap={3} style={{ width: '100%' }}>
+                <Button variant="tertiary" size="M" onClick={() => setShowConfirmModal(false)}>
+                  Cancel
+                </Button>
+                <Flex gap={2} wrap="wrap" justifyContent="flex-end" alignItems="center">
+                  {/* Maker-Checker Button */}
+                  <Button
+                    variant={executionWindow?.isBusinessHours ? 'default' : 'secondary'}
+                    size="M"
+                    onClick={() => submitBatchWithMode('maker_checker')}
+                    loading={submittingBatch}
+                  >
+                    Submit for Checker Approval
+                  </Button>
+
+                  {/* Scheduled Off-Peak Queue or Immediate Button */}
+                  {executionWindow?.isBusinessHours ? (
+                    <>
+                      <Button
+                        variant="secondary"
+                        size="M"
+                        onClick={() => submitBatchWithMode('queue_offpeak')}
+                        loading={submittingBatch}
+                      >
+                        Queue for Off-Peak ({executionWindow?.offPeakStartTime || '18:00'})
+                      </Button>
+                      <Button
+                        variant="danger-light"
+                        size="S"
+                        onClick={() => submitBatchWithMode('immediate', true)}
+                        loading={importing}
+                      >
+                        Force Run Now
+                      </Button>
+                    </>
+                  ) : (
+                    <Button
+                      variant="default"
+                      size="M"
+                      onClick={() => submitBatchWithMode('immediate')}
+                      loading={importing}
+                    >
+                      Confirm &amp; Execute Now
+                    </Button>
+                  )}
+                </Flex>
+              </Flex>
+            </Box>
+          </Box>
+        </div>
+      )}
     </Box>
   );
 }

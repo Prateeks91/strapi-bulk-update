@@ -618,6 +618,13 @@ const batchJobsMap = new Map<string, BatchJobState>();
 let isRunnerRunning = false;
 let runnerInterval: NodeJS.Timeout | null = null;
 
+export function registerPendingBatch(batch: PendingBatch, jobState?: BatchJobState) {
+  pendingBatches.set(batch.id, batch);
+  if (jobState) {
+    batchJobsMap.set(batch.id, jobState);
+  }
+}
+
 export function invalidateCollectionCache(uid: string) {
   modelsCache.delete(uid);
   for (const key of queryCache.keys()) {
@@ -1397,6 +1404,27 @@ async function executePublishBatchInternal(
   };
 }
 
+async function executeBatchByPayload(
+  strapi: Core.Strapi,
+  batch: PendingBatch,
+  currentUser: any
+) {
+  if (batch.payload?.action === 'csv_import') {
+    const csvService = strapi.plugin('bulk-updater').service('csv');
+    return await csvService.executeCsvPendingBatch(
+      batch.payload.uid,
+      batch.payload.rows,
+      batch.id,
+      batch.payload.options,
+      currentUser
+    );
+  } else if (batch.payload?.action === 'publish') {
+    return await executePublishBatchInternal(strapi, batch.payload, currentUser, batch.id);
+  } else {
+    return await executeBatchInternal(strapi, batch.payload, currentUser, batch.id);
+  }
+}
+
 export default ({ strapi }: { strapi: Core.Strapi }) => {
   // Initialize periodic runner for off-peak queue execution
   if (!runnerInterval) {
@@ -1410,9 +1438,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         for (const [id, batch] of pendingBatches.entries()) {
           if (batch.status === 'queued_offpeak' && !isBusinessHours) {
             strapi.log.info(`[bulk-updater] Executing off-peak queued batch: ${id}`);
-            const result = batch.payload?.action === 'publish'
-              ? await executePublishBatchInternal(strapi, batch.payload, batch.createdBy, id)
-              : await executeBatchInternal(strapi, batch.payload, batch.createdBy, id);
+            const result = await executeBatchByPayload(strapi, batch, batch.createdBy);
             batch.status = 'executed';
             batch.executionResult = result;
           }
@@ -2888,9 +2914,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
       if (options.executeImmediately || !isBusinessHours) {
         batch.status = 'approved';
-        const result = batch.payload?.action === 'publish'
-          ? await executePublishBatchInternal(strapi, batch.payload, checkerUser, batch.id)
-          : await executeBatchInternal(strapi, batch.payload, checkerUser, batch.id);
+        const result = await executeBatchByPayload(strapi, batch, checkerUser);
         batch.status = 'executed';
         batch.executionResult = result;
         return {
@@ -2957,9 +2981,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         throw new Error(`Batch ${batchId} has already been executed.`);
       }
 
-      const result = batch.payload?.action === 'publish'
-        ? await executePublishBatchInternal(strapi, batch.payload, currentUser, batch.id)
-        : await executeBatchInternal(strapi, batch.payload, currentUser, batch.id);
+      const result = await executeBatchByPayload(strapi, batch, currentUser);
       batch.status = 'executed';
       batch.executionResult = result;
 
@@ -3234,6 +3256,23 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
     invalidateCollectionCache(uid: string) {
       invalidateCollectionCache(uid);
+    },
+
+    registerPendingBatch(batch: PendingBatch, jobState?: BatchJobState) {
+      pendingBatches.set(batch.id, batch);
+      if (jobState) {
+        batchJobsMap.set(batch.id, jobState);
+      }
+      return batch;
+    },
+
+    getExecutionWindowConfig() {
+      return getExecutionWindowConfig(strapi);
+    },
+
+    checkBusinessHours(config?: ExecutionWindowConfig) {
+      const cfg = config || getExecutionWindowConfig(strapi);
+      return checkBusinessHours(cfg);
     },
   };
 };

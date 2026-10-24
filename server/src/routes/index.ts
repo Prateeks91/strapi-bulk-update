@@ -218,6 +218,22 @@ export default {
           policies: [],
         },
       },
+      {
+        method: 'POST',
+        path: '/csv/validate-preflight',
+        handler: 'csv.validatePreflight',
+        config: {
+          policies: [],
+        },
+      },
+      {
+        method: 'POST',
+        path: '/csv/submit-batch',
+        handler: 'csv.submitBatch',
+        config: {
+          policies: [],
+        },
+      },
     ],
   },
 };

@@ -1,5 +1,12 @@
 import type { Core } from '@strapi/strapi';
 import { recordContentHistoryVersion } from './content-history';
+import {
+  getExecutionWindowConfig,
+  checkBusinessHours,
+  registerPendingBatch,
+  type PendingBatch,
+} from './bulk-updater';
+import { extractHeadingsFromRichText } from './validation-rules';
 
 /**
  * Robust, Excel-Safe CSV string escaping helper (RFC-4180 compliant)
@@ -1578,6 +1585,490 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       success: true,
       batchId,
       stats,
+    };
+  },
+
+  /**
+   * Executes a pending CSV batch approved by Checker or queued for off-peak execution
+   */
+  async executeCsvPendingBatch(
+    uid: string,
+    rows: Array<Record<string, string>>,
+    batchId: string,
+    options: {
+      mode?: 'auto' | 'update' | 'create_or_override';
+      publish?: boolean;
+      user?: any;
+    } = {},
+    checkerUser?: any
+  ) {
+    const ct = strapi.contentTypes[uid];
+    if (!ct) {
+      throw new Error(`Content type ${uid} not found`);
+    }
+
+    const effectiveUser = checkerUser || options.user;
+    const stats = await processCsvRows(strapi, ct, uid, rows || [], 2, {
+      ...options,
+      user: effectiveUser,
+    });
+
+    await recordCsvAuditLog(strapi, ct, uid, batchId, stats, effectiveUser);
+
+    try {
+      const bulkService = strapi.plugin('bulk-updater').service('bulkUpdater');
+      if (bulkService && (bulkService as any).invalidateCollectionCache) {
+        (bulkService as any).invalidateCollectionCache(uid);
+      }
+    } catch {}
+
+    return {
+      success: true,
+      batchId,
+      stats,
+    };
+  },
+
+  /**
+   * Pre-Flight Dry-Run Validation: Non-mutating analysis verifying document existence,
+   * data types, schema integrity, and quota rule violations before execution.
+   */
+  async validatePreflight(
+    uid: string,
+    rows: Array<Record<string, string>>,
+    options: {
+      mode?: 'auto' | 'update' | 'create_or_override';
+    } = {}
+  ) {
+    const ct = strapi.contentTypes[uid];
+    if (!ct) {
+      throw new Error(`Content type ${uid} not found`);
+    }
+
+    const { mode = 'auto' } = options;
+    const attrs = ct.attributes || {};
+
+    let validationRulesService: any = null;
+    let activeRules: any[] = [];
+    try {
+      validationRulesService = strapi.plugin('bulk-updater').service('validationRules');
+      if (validationRulesService) {
+        const rulesRes = await validationRulesService.getRules();
+        activeRules = (rulesRes || []).filter((r: any) => r.enabled);
+      }
+    } catch {}
+
+    let validRows = 0;
+    let estimatedUpdates = 0;
+    let estimatedCreates = 0;
+    const errors: Array<{ row: number; documentId?: string; error: string }> = [];
+    const warnings: Array<{ row: number; documentId?: string; warning: string }> = [];
+
+    for (let i = 0; i < rows.length; i++) {
+      const rowNumber = i + 2;
+      const row = rows[i];
+      const docId = extractDocId(row);
+      const rowLocale = extractLocale(row);
+      let rowHasError = false;
+
+      // 1. Document Existence Check
+      let existing: any = null;
+      if (docId) {
+        existing = await findExistingDocument(strapi, uid, docId, rowLocale);
+      }
+
+      if (mode === 'update') {
+        if (!docId) {
+          errors.push({
+            row: rowNumber,
+            error: 'Missing or invalid documentId for Update Only mode.',
+          });
+          rowHasError = true;
+        } else if (!existing) {
+          errors.push({
+            row: rowNumber,
+            documentId: docId,
+            error: `Document with ID "${docId}" not found in database.`,
+          });
+          rowHasError = true;
+        } else {
+          estimatedUpdates++;
+        }
+      } else if (mode === 'create_or_override') {
+        if (existing) {
+          estimatedUpdates++;
+        } else {
+          estimatedCreates++;
+        }
+      } else {
+        // Smart Auto-Detect
+        if (existing) {
+          estimatedUpdates++;
+        } else {
+          estimatedCreates++;
+          if (docId) {
+            warnings.push({
+              row: rowNumber,
+              documentId: docId,
+              warning: `Document ID "${docId}" not found in DB; will create as a new entry.`,
+            });
+          }
+        }
+      }
+
+      // 2. Schema Type Validation
+      for (const [colKey, rawVal] of Object.entries(row)) {
+        if (!rawVal || rawVal.trim() === '') continue;
+        const normalizedKey = colKey.toLowerCase().replace(/[\s_-]/g, '');
+        if (SYSTEM_FIELD_KEYS.has(normalizedKey)) continue;
+
+        let attrDef = attrs[colKey];
+        if (!attrDef && !colKey.includes('.')) {
+          const matchKey = Object.keys(attrs).find(
+            (k) => k.toLowerCase() === colKey.toLowerCase() || k.toLowerCase() === colKey.toLowerCase().replace(/\s+/g, '')
+          );
+          if (matchKey) attrDef = attrs[matchKey];
+        }
+
+        if (attrDef) {
+          if (attrDef.type === 'integer' || attrDef.type === 'biginteger') {
+            const num = parseInt(rawVal, 10);
+            if (isNaN(num)) {
+              errors.push({
+                row: rowNumber,
+                documentId: docId || undefined,
+                error: `Column "${colKey}" expects an integer, received: "${rawVal}"`,
+              });
+              rowHasError = true;
+            }
+          } else if (attrDef.type === 'float' || attrDef.type === 'decimal') {
+            const num = parseFloat(rawVal);
+            if (isNaN(num)) {
+              errors.push({
+                row: rowNumber,
+                documentId: docId || undefined,
+                error: `Column "${colKey}" expects a numeric float/decimal, received: "${rawVal}"`,
+              });
+              rowHasError = true;
+            }
+          } else if (attrDef.type === 'enumeration' && Array.isArray(attrDef.enum)) {
+            if (!attrDef.enum.includes(rawVal.trim())) {
+              warnings.push({
+                row: rowNumber,
+                documentId: docId || undefined,
+                warning: `Column "${colKey}" value "${rawVal}" is not in defined enum options: [${attrDef.enum.join(', ')}]`,
+              });
+            }
+          } else if (attrDef.type === 'json') {
+            try {
+              JSON.parse(rawVal);
+            } catch {
+              warnings.push({
+                row: rowNumber,
+                documentId: docId || undefined,
+                warning: `Column "${colKey}" is type JSON but contains non-JSON text.`,
+              });
+            }
+          }
+        }
+
+        // 3. Quota Rules Scan
+        if (activeRules.length > 0) {
+          for (const rule of activeRules) {
+            if (rule.collectionUid && rule.collectionUid !== '*' && rule.collectionUid !== uid) continue;
+            if (rule.includeRichTextHtml && (rawVal.includes('<h') || rawVal.includes('# '))) {
+              const headings = extractHeadingsFromRichText(rawVal);
+              for (const [tag, count] of Object.entries(headings)) {
+                const max = rule.quotas?.[tag.toLowerCase()];
+                if (max !== undefined && count > max) {
+                  warnings.push({
+                    row: rowNumber,
+                    documentId: docId || undefined,
+                    warning: `Rule "${rule.name}" quota warning: column "${colKey}" contains ${count} "${tag.toUpperCase()}" headings (maximum allowed: ${max}).`,
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
+
+      if (!rowHasError) {
+        validRows++;
+      }
+    }
+
+    return {
+      success: true,
+      totalRows: rows.length,
+      validRows,
+      estimatedUpdates,
+      estimatedCreates,
+      hasErrors: errors.length > 0,
+      hasWarnings: warnings.length > 0,
+      errors: errors.slice(0, 100),
+      warnings: warnings.slice(0, 100),
+      totalErrorCount: errors.length,
+      totalWarningCount: warnings.length,
+    };
+  },
+
+  /**
+   * Submits a CSV batch with Guardrails: Maker-Checker (4-Eyes), Execution Windows, Off-Peak Scheduling
+   */
+  async submitBatch(
+    uid: string,
+    rows: Array<Record<string, string>>,
+    options: {
+      executionMode?: 'immediate' | 'queue_offpeak' | 'maker_checker';
+      makerNotes?: string;
+      forceImmediate?: boolean;
+      mode?: 'auto' | 'update' | 'create_or_override';
+      publish?: boolean;
+      user?: any;
+    } = {}
+  ) {
+    const ct = strapi.contentTypes[uid];
+    if (!ct) {
+      throw new Error(`Content type ${uid} not found`);
+    }
+
+    if (!rows || rows.length === 0) {
+      throw new Error('No CSV records provided for batch submission.');
+    }
+
+    const {
+      executionMode = 'immediate',
+      makerNotes = '',
+      forceImmediate = false,
+      mode = 'auto',
+      publish = true,
+      user,
+    } = options;
+
+    const executionConfig = getExecutionWindowConfig(strapi);
+    const { isBusinessHours, policyMessage } = checkBusinessHours(executionConfig);
+    const collectionDisplayName = ct.info?.displayName || uid;
+
+    // 1. Enterprise Maker-Checker Flow (4-Eyes Approval Principle)
+    if (executionMode === 'maker_checker') {
+      const batchId = `csv_batch_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      const batch: PendingBatch = {
+        id: batchId,
+        createdAt: new Date().toISOString(),
+        createdBy: user
+          ? {
+              id: user.id,
+              email: user.email,
+              firstname: user.firstname,
+              lastname: user.lastname,
+              username: user.username,
+            }
+          : { email: 'admin@system.local' },
+        payload: {
+          action: 'csv_import',
+          uid,
+          rows,
+          options: {
+            mode,
+            publish,
+            user,
+          },
+          attribute: `CSV Import: ${collectionDisplayName}`,
+          value: `${rows.length} rows (${mode} mode)`,
+          publishOnApproval: publish,
+        },
+        summary: {
+          attribute: `CSV Import: ${collectionDisplayName}`,
+          value: `${rows.length} rows (${mode} mode)`,
+          totalTargets: rows.length,
+          collectionBreakdown: { [collectionDisplayName]: rows.length },
+          publishOnApproval: publish,
+        },
+        status: 'pending_approval',
+        executionMode: 'maker_checker',
+        makerNotes,
+      };
+
+      registerPendingBatch(batch, {
+        id: batchId,
+        createdAt: batch.createdAt,
+        createdBy: batch.createdBy,
+        status: 'pending_approval',
+        executionMode: 'maker_checker',
+        attribute: `CSV Import: ${collectionDisplayName}`,
+        value: `${rows.length} rows (${mode} mode)`,
+        totalTargets: rows.length,
+        processedCount: 0,
+        updatedCount: 0,
+        skippedCount: 0,
+        failedCount: 0,
+        isLive: false,
+        publishOnApproval: publish,
+        makerNotes,
+        results: [],
+      });
+
+      return {
+        success: true,
+        pending: true,
+        batchId,
+        status: 'pending_approval',
+        message: 'CSV batch submitted for Checker authorization (4-Eyes Maker-Checker Workflow).',
+        batch,
+      };
+    }
+
+    // 2. Off-Peak Queued Batch
+    if (executionMode === 'queue_offpeak') {
+      const batchId = `csv_batch_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      const batch: PendingBatch = {
+        id: batchId,
+        createdAt: new Date().toISOString(),
+        createdBy: user
+          ? {
+              id: user.id,
+              email: user.email,
+              firstname: user.firstname,
+              lastname: user.lastname,
+              username: user.username,
+            }
+          : { email: 'admin@system.local' },
+        payload: {
+          action: 'csv_import',
+          uid,
+          rows,
+          options: {
+            mode,
+            publish,
+            user,
+          },
+          attribute: `CSV Import: ${collectionDisplayName}`,
+          value: `${rows.length} rows (${mode} mode)`,
+          publishOnApproval: publish,
+        },
+        summary: {
+          attribute: `CSV Import: ${collectionDisplayName}`,
+          value: `${rows.length} rows (${mode} mode)`,
+          totalTargets: rows.length,
+          collectionBreakdown: { [collectionDisplayName]: rows.length },
+          publishOnApproval: publish,
+        },
+        status: 'queued_offpeak',
+        executionMode: 'queue_offpeak',
+        scheduledFor: executionConfig.offPeakStartTime,
+        makerNotes,
+      };
+
+      registerPendingBatch(batch, {
+        id: batchId,
+        createdAt: batch.createdAt,
+        createdBy: batch.createdBy,
+        status: 'queued_offpeak',
+        executionMode: 'queue_offpeak',
+        scheduledFor: executionConfig.offPeakStartTime,
+        attribute: `CSV Import: ${collectionDisplayName}`,
+        value: `${rows.length} rows (${mode} mode)`,
+        totalTargets: rows.length,
+        processedCount: 0,
+        updatedCount: 0,
+        skippedCount: 0,
+        failedCount: 0,
+        isLive: false,
+        publishOnApproval: publish,
+        makerNotes,
+        results: [],
+      });
+
+      return {
+        success: true,
+        pending: true,
+        batchId,
+        status: 'queued_offpeak',
+        scheduledFor: executionConfig.offPeakStartTime,
+        message: `CSV batch queued for server off-peak maintenance window (${executionConfig.offPeakStartTime}).`,
+        batch,
+      };
+    }
+
+    // 3. Peak Business Hours Restriction Active (Auto-Queue)
+    if (executionConfig.enabled && executionConfig.autoQueueDuringBusinessHours && isBusinessHours && !forceImmediate) {
+      const batchId = `csv_batch_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      const batch: PendingBatch = {
+        id: batchId,
+        createdAt: new Date().toISOString(),
+        createdBy: user
+          ? {
+              id: user.id,
+              email: user.email,
+              firstname: user.firstname,
+              lastname: user.lastname,
+              username: user.username,
+            }
+          : { email: 'admin@system.local' },
+        payload: {
+          action: 'csv_import',
+          uid,
+          rows,
+          options: {
+            mode,
+            publish,
+            user,
+          },
+          attribute: `CSV Import: ${collectionDisplayName}`,
+          value: `${rows.length} rows (${mode} mode)`,
+          publishOnApproval: publish,
+        },
+        summary: {
+          attribute: `CSV Import: ${collectionDisplayName}`,
+          value: `${rows.length} rows (${mode} mode)`,
+          totalTargets: rows.length,
+          collectionBreakdown: { [collectionDisplayName]: rows.length },
+          publishOnApproval: publish,
+        },
+        status: 'queued_offpeak',
+        executionMode: 'queue_offpeak',
+        scheduledFor: executionConfig.offPeakStartTime,
+        makerNotes: 'Automatically queued due to peak business hours restriction.',
+      };
+
+      registerPendingBatch(batch, {
+        id: batchId,
+        createdAt: batch.createdAt,
+        createdBy: batch.createdBy,
+        status: 'queued_offpeak',
+        executionMode: 'queue_offpeak',
+        scheduledFor: executionConfig.offPeakStartTime,
+        attribute: `CSV Import: ${collectionDisplayName}`,
+        value: `${rows.length} rows (${mode} mode)`,
+        totalTargets: rows.length,
+        processedCount: 0,
+        updatedCount: 0,
+        skippedCount: 0,
+        failedCount: 0,
+        isLive: false,
+        publishOnApproval: publish,
+        policyMessage,
+        makerNotes: 'Automatically queued due to peak business hours restriction.',
+        results: [],
+      });
+
+      return {
+        success: true,
+        pending: true,
+        batchId,
+        status: 'queued_offpeak',
+        scheduledFor: executionConfig.offPeakStartTime,
+        message: policyMessage,
+        batch,
+      };
+    }
+
+    // 4. Immediate execution allowed: Signal frontend to proceed with chunked execution
+    return {
+      success: true,
+      pending: false,
+      executeNow: true,
     };
   },
 });

@@ -3954,6 +3954,11 @@ const BulkUpdater: React.FC = () => {
                             {batch.summary.attribute}: "{formatDisplayValue(batch.summary.value)}"
                           </Typography>
                           <Flex gap={1} alignItems="center" marginTop={1}>
+                            {(batch.payload?.action === 'csv_import' || batch.id?.startsWith('csv_')) && (
+                              <Badge backgroundColor="secondary100" textColor="secondary700">
+                                📊 CSV IMPORT
+                              </Badge>
+                            )}
                             <Badge
                               backgroundColor={batch.summary.publishOnApproval === false ? 'warning100' : 'success100'}
                               textColor={batch.summary.publishOnApproval === false ? 'warning700' : 'success700'}

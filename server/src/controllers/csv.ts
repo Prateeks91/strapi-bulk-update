@@ -156,4 +156,61 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       ctx.body = { success: false, error: err.message };
     }
   },
+
+  async validatePreflight(ctx: any) {
+    try {
+      const { uid, rows, mode } = ctx.request.body;
+      if (!uid) {
+        ctx.status = 400;
+        ctx.body = { success: false, error: 'Target collection UID is required.' };
+        return;
+      }
+      if (!Array.isArray(rows)) {
+        ctx.status = 400;
+        ctx.body = { success: false, error: 'Rows array is required.' };
+        return;
+      }
+
+      const csvService = strapi.plugin('bulk-updater').service('csv');
+      const result = await csvService.validatePreflight(uid, rows, {
+        mode: mode === 'update' ? 'update' : mode === 'create_or_override' ? 'create_or_override' : 'auto',
+      });
+
+      ctx.body = result;
+    } catch (err: any) {
+      ctx.status = 500;
+      ctx.body = { success: false, error: err.message };
+    }
+  },
+
+  async submitBatch(ctx: any) {
+    try {
+      const { uid, rows, executionMode, makerNotes, forceImmediate, mode, publish } = ctx.request.body;
+      if (!uid) {
+        ctx.status = 400;
+        ctx.body = { success: false, error: 'Target collection UID is required.' };
+        return;
+      }
+      if (!Array.isArray(rows)) {
+        ctx.status = 400;
+        ctx.body = { success: false, error: 'Rows array is required.' };
+        return;
+      }
+
+      const csvService = strapi.plugin('bulk-updater').service('csv');
+      const result = await csvService.submitBatch(uid, rows, {
+        executionMode,
+        makerNotes,
+        forceImmediate: Boolean(forceImmediate),
+        mode: mode === 'update' ? 'update' : mode === 'create_or_override' ? 'create_or_override' : 'auto',
+        publish: publish !== false,
+        user: ctx.state.user,
+      });
+
+      ctx.body = result;
+    } catch (err: any) {
+      ctx.status = 500;
+      ctx.body = { success: false, error: err.message };
+    }
+  },
 });
