@@ -246,13 +246,18 @@ export function getAllNestedValues(obj: any, path: string): DynamicZoneItemMatch
       if (parsed.targetIndex !== undefined && idx !== parsed.targetIndex) return;
       if (parsed.targetComponentUid && item.__component !== parsed.targetComponentUid) return;
 
+      const compSchema = (global as any).strapi?.components?.[item.__component];
+      const fieldInSchema = tail.length > 0 && compSchema?.attributes
+        ? tail[0] in compSchema.attributes
+        : false;
+
       const subVal = tail.length > 0 ? getDeepProperty(item, tail.join('.')) : item;
-      if (subVal !== undefined) {
+      if (subVal !== undefined || fieldInSchema) {
         results.push({
           index: idx,
           componentUid: item.__component,
           componentName: formatComponentName(item.__component),
-          value: subVal,
+          value: subVal !== undefined ? subVal : null,
           path: `${head}[#${idx}${item.__component ? ` ${formatComponentName(item.__component)}` : ''}].${tail.join('.')}`,
         });
       }
@@ -396,7 +401,10 @@ export function setDeepProperty(
         if (item.__component !== options.targetComponentUid) return item;
       }
 
-      if (head in item || (tail.length > 0 && typeof item[head] === 'object')) {
+      const compSchema = (global as any).strapi?.components?.[item.__component];
+      const fieldExistsInSchema = compSchema?.attributes ? head in compSchema.attributes : true;
+
+      if (head in item || fieldExistsInSchema || tail.length === 0) {
         return {
           ...item,
           [head]: setDeepProperty(item[head], tail, value, options),
@@ -2137,7 +2145,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
     }: {
       attribute: string;
       value: string;
-      selectedEntries?: Array<{ uid: string; documentId: string }>;
+      selectedEntries?: Array<{ uid: string; documentId: string; dynamicZoneIndexes?: number[]; targetComponentUid?: string }>;
       selectedCollections?: string[];
       isRegex?: boolean;
       regexPattern?: string;
@@ -2146,7 +2154,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         throw new Error('Attribute name is required.');
       }
 
-      const targetsMap = new Map<string, { uid: string; documentId: string }>();
+      const targetsMap = new Map<string, { uid: string; documentId: string; dynamicZoneIndexes?: number[]; targetComponentUid?: string }>();
 
       // 1. Add entire collections if selected
       for (const colUid of selectedCollections) {
@@ -2162,7 +2170,12 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       for (const item of selectedEntries) {
         if (!item.uid || !item.documentId) continue;
         const key = `${item.uid}@@@${item.documentId}`;
-        targetsMap.set(key, { uid: item.uid, documentId: item.documentId });
+        targetsMap.set(key, {
+          uid: item.uid,
+          documentId: item.documentId,
+          dynamicZoneIndexes: item.dynamicZoneIndexes,
+          targetComponentUid: item.targetComponentUid,
+        });
       }
 
       if (targetsMap.size === 0) {
@@ -2240,6 +2253,53 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
             `Entry #${target.documentId}`;
 
           if (isComponentNested) {
+            const parsed = parseDynamicZonePath(attribute);
+            const rootKey = parsed.rootKey;
+            const isRootDz = contentType?.attributes?.[rootKey]?.type === 'dynamiczone';
+            const targetIndexes = target.dynamicZoneIndexes;
+            const targetComponentUid = target.targetComponentUid || parsed.targetComponentUid;
+
+            if (isRootDz && currentEntry?.[rootKey] && Array.isArray(currentEntry[rootKey])) {
+              let affectedMatches = getAllNestedValues({ [rootKey]: currentEntry[rootKey] }, attribute);
+              if (targetIndexes && targetIndexes.length > 0) {
+                affectedMatches = affectedMatches.filter((m) => targetIndexes.includes(m.index));
+              }
+              if (targetComponentUid) {
+                affectedMatches = affectedMatches.filter((m) => m.componentUid === targetComponentUid);
+              }
+
+              if (affectedMatches.length > 0) {
+                for (const match of affectedMatches) {
+                  let blockNewVal = value;
+                  if (regexObj && typeof match.value === 'string') {
+                    blockNewVal = match.value.replace(regexObj, value);
+                  }
+                  const hasChange = String(match.value ?? '') !== String(blockNewVal ?? '');
+                  if (hasChange) {
+                    willUpdateCount++;
+                  } else {
+                    unchangedCount++;
+                  }
+
+                  diffs.push({
+                    uid: target.uid,
+                    collectionName: displayName,
+                    documentId: target.documentId,
+                    label: `${entryLabel} [Block #${match.index} (${match.componentName})]`,
+                    attribute: `${rootKey}[#${match.index} ${match.componentName}].${parsed.subPath}`,
+                    oldValue: match.value ?? null,
+                    newValue: blockNewVal,
+                    oldDisplay: match.value !== undefined && match.value !== null && String(match.value).trim() !== '' ? String(match.value) : '(empty)',
+                    newDisplay: String(blockNewVal ?? ''),
+                    hasChange,
+                    status: hasChange ? 'will_update' : 'unchanged',
+                    message: hasChange ? 'Block value will be updated' : 'Block already has target value',
+                  });
+                }
+                continue;
+              }
+            }
+
             const currentVal = getDeepProperty(currentEntry, attribute);
 
             let newValue = value;

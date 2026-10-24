@@ -206,7 +206,11 @@ export interface DynamicZoneItemMatch {
 /**
  * Extracts all matching instances of a nested property across dynamic zone components or repeatable arrays.
  */
-export function getAllNestedValues(obj: any, path: string): DynamicZoneItemMatch[] {
+export function getAllNestedValues(
+  obj: any,
+  path: string,
+  availableAttributes?: string[]
+): DynamicZoneItemMatch[] {
   if (!obj || !path) return [];
   const parsed = parseDynamicZonePath(path);
   const parts = parsed.cleanPath.split('.');
@@ -222,14 +226,18 @@ export function getAllNestedValues(obj: any, path: string): DynamicZoneItemMatch
       if (parsed.targetIndex !== undefined && idx !== parsed.targetIndex) return;
       if (parsed.targetComponentUid && item.__component !== parsed.targetComponentUid) return;
 
-      const subVal = tail.length > 0 ? getNestedValue(item, tail.join('.')) : item;
-      if (subVal !== undefined) {
+      const subPath = tail.join('.');
+      const scopedPath = item.__component ? `${head}[${item.__component}].${subPath}` : '';
+      const isSupported = availableAttributes ? availableAttributes.includes(scopedPath) : false;
+
+      const subVal = tail.length > 0 ? getNestedValue(item, subPath) : item;
+      if (subVal !== undefined || isSupported) {
         results.push({
           index: idx,
           componentUid: item.__component,
           componentName: formatComponentName(item.__component),
-          value: subVal,
-          path: `${head}[#${idx}${item.__component ? ` ${formatComponentName(item.__component)}` : ''}].${tail.join('.')}`,
+          value: subVal !== undefined ? subVal : null,
+          path: `${head}[#${idx}${item.__component ? ` ${formatComponentName(item.__component)}` : ''}].${subPath}`,
         });
       }
     });
@@ -624,7 +632,7 @@ function renderCellContent(
     }
 
     case 'search_attr': {
-      const matches = getAllNestedValues(entry, searchAttribute);
+      const matches = getAllNestedValues(entry, searchAttribute, col?.attributes);
       if (matches.length === 0) {
         return (
           <Typography textColor="neutral500" style={{ fontStyle: 'italic' }}>
@@ -695,7 +703,7 @@ function renderCellContent(
     }
 
     case 'target_attr': {
-      const matches = getAllNestedValues(entry, selectedAttribute);
+      const matches = getAllNestedValues(entry, selectedAttribute, col?.attributes);
       if (matches.length === 0) {
         return (
           <Typography textColor="neutral500" style={{ fontStyle: 'italic' }}>
@@ -1823,12 +1831,16 @@ const BulkUpdater: React.FC = () => {
       return;
     }
 
-    const targets: Array<{ uid: string; documentId: string }> = [];
+    const targets: Array<{ uid: string; documentId: string; dynamicZoneIndexes?: number[] }> = [];
     Object.keys(selectedEntries).forEach((key) => {
       if (selectedEntries[key]) {
         const parts = key.split(KEY_SEP);
         if (parts.length === 2) {
-          targets.push({ uid: parts[0], documentId: parts[1] });
+          const targetObj: any = { uid: parts[0], documentId: parts[1] };
+          if (selectedDzBlocks[key] && selectedDzBlocks[key].length > 0) {
+            targetObj.dynamicZoneIndexes = selectedDzBlocks[key];
+          }
+          targets.push(targetObj);
         }
       }
     });
@@ -1999,6 +2011,21 @@ const BulkUpdater: React.FC = () => {
 
           await fetchModels();
           await fetchAuditHistory();
+
+          if (selectedCollectionUid) {
+            loadCollectionPage(
+              selectedCollectionUid,
+              collectionPages[selectedCollectionUid]?.page || 1,
+              undefined,
+              undefined,
+              undefined,
+              filterOperator,
+              filterQuery,
+              entrySearch,
+              false,
+              searchAttribute
+            );
+          }
         }
       } else {
         setIsSubmittingBatch(false);
@@ -3315,12 +3342,15 @@ const BulkUpdater: React.FC = () => {
                                   {isDzExpanded && dzFields.map((dzKey) => {
                                     const blocks = entry[dzKey] || [];
                                     const targetParsed = parseDynamicZonePath(selectedAttribute);
+                                    const isBlockApplicable = (blockItem: any) => {
+                                      if (!targetParsed.subPath) return true;
+                                      const scopedPath = `${dzKey}[${blockItem?.__component}].${targetParsed.subPath}`;
+                                      const componentSupports = (col?.attributes || attributes || []).includes(scopedPath);
+                                      return componentSupports || getNestedValue(blockItem, targetParsed.subPath) !== undefined;
+                                    };
                                     const allApplicableIndexes = blocks
                                       .map((_: any, i: number) => i)
-                                      .filter((i: number) => {
-                                        if (!targetParsed.subPath) return true;
-                                        return getNestedValue(blocks[i], targetParsed.subPath) !== undefined;
-                                      });
+                                      .filter((i: number) => isBlockApplicable(blocks[i]));
 
                                     return (
                                       <Tr key={`${key}-dz-${dzKey}`}>
@@ -3359,8 +3389,10 @@ const BulkUpdater: React.FC = () => {
                                                 {blocks.map((block: any, bIdx: number) => {
                                                   const compUid = block.__component;
                                                   const compLabel = formatComponentName(compUid);
+                                                  const scopedPath = `${dzKey}[${compUid}].${targetParsed.subPath}`;
+                                                  const componentSupports = (col?.attributes || attributes || []).includes(scopedPath);
                                                   const blockVal = targetParsed.subPath ? getNestedValue(block, targetParsed.subPath) : undefined;
-                                                  const hasTargetAttr = blockVal !== undefined;
+                                                  const hasTargetAttr = componentSupports || blockVal !== undefined;
 
                                                   const isBlockChecked = hasTargetAttr && isSelected && (selectedDzBlocks[key] !== undefined ? selectedDzBlocks[key].includes(bIdx) : true);
 
