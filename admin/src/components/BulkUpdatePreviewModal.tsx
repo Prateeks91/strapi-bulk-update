@@ -50,6 +50,13 @@ interface BulkUpdatePreviewModalProps {
   attribute: string;
   targetValueDisplay: string;
   publishOnApproval?: boolean;
+  lifecycleStats?: {
+    published: number;
+    modified: number;
+    draft: number;
+    pendingReview: number;
+    unreviewedCount: number;
+  };
 }
 
 const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
@@ -61,6 +68,7 @@ const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
   attribute,
   targetValueDisplay,
   publishOnApproval = true,
+  lifecycleStats,
 }) => {
   const [filterTab, setFilterTab] = useState<'all' | 'will_update' | 'unchanged' | 'will_skip'>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -191,6 +199,21 @@ const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
             </Box>
           ) : (
             <>
+              {/* Unreviewed Content Notice */}
+              {publishOnApproval && lifecycleStats && lifecycleStats.unreviewedCount > 0 && (
+                <Box marginBottom={4} padding={3} background="warning100" hasRadius style={{ border: '1px solid #f5c0b8' }}>
+                  <Flex gap={2} alignItems="center">
+                    <Typography variant="pi" fontWeight="bold" textColor="warning700">
+                      ⚠️ Safe Publishing Active:
+                    </Typography>
+                    <Typography variant="pi" textColor="warning700">
+                      {lifecycleStats.unreviewedCount} target record(s) contain unreviewed draft changes ({lifecycleStats.draft} Draft, {lifecycleStats.modified} Modified).
+                      By default, these will be updated as drafts without publishing unreviewed revisions to production visitors.
+                    </Typography>
+                  </Flex>
+                </Box>
+              )}
+
               {/* 4 Summary KPI Cards */}
               <Flex gap={3} marginBottom={4} wrap="wrap">
                 <Box

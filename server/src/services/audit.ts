@@ -205,6 +205,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       updatedCount: number;
       skippedCount: number;
       totalTargets: number;
+      publishOnApproval?: boolean;
+      publishStrategy?: 'safe' | 'all';
+      unreviewedConsent?: boolean;
     },
     results: any[],
     user?: any
@@ -221,6 +224,8 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         updatedCount: batchSummary.updatedCount,
         skippedCount: batchSummary.skippedCount,
         totalTargets: batchSummary.totalTargets,
+        publishStrategy: batchSummary.publishStrategy,
+        unreviewedConsent: batchSummary.unreviewedConsent,
       },
       user
     );
@@ -249,6 +254,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           updatedCount: batchSummary.updatedCount,
           skippedCount: batchSummary.skippedCount,
           totalTargets: batchSummary.totalTargets,
+          publishOnApproval: batchSummary.publishOnApproval,
+          publishStrategy: batchSummary.publishStrategy,
+          unreviewedConsent: batchSummary.unreviewedConsent,
           diffs: results,
           isRolledBack: false,
           rolledBackAt: null,

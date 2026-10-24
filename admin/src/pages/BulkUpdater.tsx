@@ -90,6 +90,9 @@ interface AuditRecord {
   updatedCount: number;
   skippedCount: number;
   totalTargets: number;
+  publishOnApproval?: boolean;
+  publishStrategy?: 'safe' | 'all';
+  unreviewedConsent?: boolean;
   diffs: UpdateResult[];
   isRolledBack: boolean;
   rolledBackAt: string | null;
@@ -116,13 +119,20 @@ interface PendingBatch {
   createdAt: string;
   createdBy: { id?: string | number; email?: string; firstname?: string; lastname?: string; username?: string };
   payload: {
+    action?: string;
     attribute: string;
     value: string;
-    selectedEntries?: Array<{ uid: string; documentId: string }>;
+    selectedEntries?: Array<{ uid: string; documentId: string; dynamicZoneIndexes?: number[] }>;
     selectedCollections?: string[];
     isRegex?: boolean;
     regexPattern?: string;
     publishOnApproval?: boolean;
+    publishStrategy?: 'safe' | 'all';
+    unreviewedConsent?: boolean;
+    unreviewedCount?: number;
+    rows?: any[];
+    uid?: string;
+    options?: any;
   };
   summary: {
     attribute: string;
@@ -130,6 +140,9 @@ interface PendingBatch {
     totalTargets: number;
     collectionBreakdown: Record<string, number>;
     publishOnApproval?: boolean;
+    publishStrategy?: 'safe' | 'all';
+    unreviewedConsent?: boolean;
+    unreviewedCount?: number;
   };
   status: 'pending_approval' | 'queued_offpeak' | 'approved' | 'rejected' | 'executed';
   executionMode: 'maker_checker' | 'queue_offpeak' | 'immediate';
@@ -845,9 +858,11 @@ const BulkUpdater: React.FC = () => {
   const [pendingBatchesLoading, setPendingBatchesLoading] = useState<boolean>(false);
   const [approvingBatchId, setApprovingBatchId] = useState<string | null>(null);
   const [rejectingBatchId, setRejectingBatchId] = useState<string | null>(null);
-  const [executingNowBatchId, setExecutingNowBatchId] = useState<string | null>(null);
   const [makerNotesInput, setMakerNotesInput] = useState<string>('');
   const [publishOnApproval, setPublishOnApproval] = useState<boolean>(true);
+  const [publishStrategy, setPublishStrategy] = useState<'safe' | 'all'>('safe');
+  const [unreviewedConsent, setUnreviewedConsent] = useState<boolean>(false);
+  const [publishConsent, setPublishConsent] = useState<boolean>(false);
 
   // Processing Dashboard & Status Tracking State
   const [showProcessingDashboard, setShowProcessingDashboard] = useState<boolean>(false);
@@ -1799,6 +1814,47 @@ const BulkUpdater: React.FC = () => {
     return breakdown;
   };
 
+  // Lifecycle status breakdown across selected entries
+  const selectedLifecycleStats = useMemo(() => {
+    let published = 0;
+    let modified = 0;
+    let draft = 0;
+    let pendingReview = 0;
+
+    Object.keys(selectedEntries).forEach((key) => {
+      if (!selectedEntries[key]) return;
+      const parts = key.split(KEY_SEP);
+      if (parts.length !== 2) return;
+      const [uid, docId] = parts;
+      const col = collections.find((c) => c.uid === uid) || null;
+      const entry =
+        collectionPages[uid]?.entries?.find((e: Entry) => e.documentId === docId || String(e.id) === docId) ||
+        col?.entries?.find((e: Entry) => e.documentId === docId || String(e.id) === docId);
+
+      if (col && col.draftAndPublish === false) {
+        published++;
+      } else if (entry) {
+        const { status } = getEntryLifecycleStatus(entry, col, pendingBatches);
+        if (status === 'published') published++;
+        else if (status === 'modified') modified++;
+        else if (status === 'draft') draft++;
+        else if (status === 'pending_review') pendingReview++;
+      } else {
+        draft++;
+      }
+    });
+
+    const unreviewedCount = draft + modified + pendingReview;
+    return {
+      published,
+      modified,
+      draft,
+      pendingReview,
+      unreviewedCount,
+      total: published + modified + draft + pendingReview,
+    };
+  }, [selectedEntries, collections, collectionPages, pendingBatches]);
+
   // Open Confirmation Modal
   const handleOpenConfirmModal = () => {
     if (!selectedAttribute) {
@@ -1818,6 +1874,8 @@ const BulkUpdater: React.FC = () => {
       return;
     }
 
+    setPublishStrategy('safe');
+    setUnreviewedConsent(false);
     setShowConfirmModal(true);
   };
 
@@ -1927,6 +1985,9 @@ const BulkUpdater: React.FC = () => {
         failedCount: 0,
         isLive: false,
         publishOnApproval,
+        publishStrategy,
+        unreviewedConsent,
+        unreviewedCount: selectedLifecycleStats.unreviewedCount,
         results: [],
       });
 
@@ -1940,6 +2001,9 @@ const BulkUpdater: React.FC = () => {
         makerNotes: makerNotesInput,
         forceImmediate,
         publishOnApproval,
+        publishStrategy,
+        unreviewedConsent,
+        unreviewedCount: selectedLifecycleStats.unreviewedCount,
       };
 
       const res = await post('/bulk-updater/batch-update', payload);
@@ -2122,6 +2186,7 @@ const BulkUpdater: React.FC = () => {
       });
       return;
     }
+    setPublishConsent(false);
     setShowPublishConfirmModal(true);
   };
 
@@ -2164,6 +2229,8 @@ const BulkUpdater: React.FC = () => {
         failedCount: 0,
         isLive: true,
         publishOnApproval: true,
+        unreviewedConsent: publishConsent,
+        unreviewedCount: selectedLifecycleStats.unreviewedCount,
         results: [],
       });
 
@@ -2172,6 +2239,8 @@ const BulkUpdater: React.FC = () => {
         executionMode,
         makerNotes: publishMakerNotesInput,
         forceImmediate,
+        unreviewedConsent: publishConsent,
+        unreviewedCount: selectedLifecycleStats.unreviewedCount,
       };
 
       const res = await post('/bulk-updater/batch-publish', payload);
@@ -3738,6 +3807,21 @@ const BulkUpdater: React.FC = () => {
                     : 'When disabled, entries will be saved as draft versions without publishing to live visitors.'}
                 </Typography>
               </Flex>
+
+              {/* Selection Alert: Unreviewed Content Warning Banner */}
+              {publishOnApproval && selectedLifecycleStats.unreviewedCount > 0 && (
+                <Box marginTop={3} padding={3} background="warning100" hasRadius style={{ border: '1px solid #f5c0b8' }}>
+                  <Flex gap={2} alignItems="flex-start">
+                    <Typography variant="pi" fontWeight="bold" textColor="warning700">
+                      ⚠️ Unreviewed Content Alert:
+                    </Typography>
+                    <Typography variant="pi" textColor="warning700">
+                      {selectedLifecycleStats.unreviewedCount} of {totalSelectedCount} selected record(s) contain unreviewed draft changes ({selectedLifecycleStats.draft} Draft, {selectedLifecycleStats.modified} Modified).
+                      Publishing them live will push all unreviewed draft content across all fields to live visitors. You can select safe publishing (recommended) or provide explicit consent at review time.
+                    </Typography>
+                  </Flex>
+                </Box>
+              )}
             </Box>
 
             {/* Selected Attribute & Collection Context */}
@@ -3997,6 +4081,21 @@ const BulkUpdater: React.FC = () => {
                             >
                               {batch.summary.publishOnApproval === false ? 'DRAFT ONLY' : 'AUTO-PUBLISH'}
                             </Badge>
+                            {batch.summary.publishStrategy === 'safe' && (
+                              <Badge backgroundColor="secondary100" textColor="secondary700">
+                                SAFE PUBLISH
+                              </Badge>
+                            )}
+                            {batch.summary.publishStrategy === 'all' && (
+                              <Badge backgroundColor="warning100" textColor="warning700">
+                                PUBLISH ALL (CONSENTED)
+                              </Badge>
+                            )}
+                            {Boolean(batch.summary.unreviewedCount) && (
+                              <Badge backgroundColor="neutral150" textColor="neutral700">
+                                Unreviewed: {batch.summary.unreviewedCount}
+                              </Badge>
+                            )}
                             <Typography variant="pi" textColor="neutral600">
                               • {batch.summary.totalTargets} records across {Object.keys(batch.summary.collectionBreakdown || {}).length} collections
                             </Typography>
@@ -4197,6 +4296,16 @@ const BulkUpdater: React.FC = () => {
                             {rec.skippedCount > 0 && (
                               <Badge backgroundColor="warning100" textColor="warning700" style={{ marginLeft: 6 }}>
                                 {rec.skippedCount} skipped
+                              </Badge>
+                            )}
+                            {rec.publishStrategy === 'safe' && (
+                              <Badge backgroundColor="secondary100" textColor="secondary700" style={{ marginLeft: 6 }}>
+                                Safe Publish
+                              </Badge>
+                            )}
+                            {rec.publishStrategy === 'all' && (
+                              <Badge backgroundColor="warning100" textColor="warning700" style={{ marginLeft: 6 }}>
+                                Publish All (Consented)
                               </Badge>
                             )}
                           </Td>
@@ -4455,6 +4564,33 @@ const BulkUpdater: React.FC = () => {
                 </Flex>
               </Box>
 
+              {/* Lifecycle Status Breakdown */}
+              <Box marginBottom={4} padding={3} background="neutral100" hasRadius style={{ border: '1px solid rgba(120, 120, 150, 0.15)' }}>
+                <Typography variant="sigma" textColor="neutral600" marginBottom={2} display="block">
+                  LIFECYCLE STATUS BREAKDOWN ({totalSelectedCount} Selected)
+                </Typography>
+                <Flex gap={2} wrap="wrap">
+                  <Badge backgroundColor="success100" textColor="success700">
+                    ✓ Published / Approved: {selectedLifecycleStats.published}
+                  </Badge>
+                  {selectedLifecycleStats.modified > 0 && (
+                    <Badge backgroundColor="primary100" textColor="primary700">
+                      📝 Modified (Unreviewed Revisions): {selectedLifecycleStats.modified}
+                    </Badge>
+                  )}
+                  {selectedLifecycleStats.draft > 0 && (
+                    <Badge backgroundColor="neutral200" textColor="neutral800">
+                      📄 Draft (Never Published): {selectedLifecycleStats.draft}
+                    </Badge>
+                  )}
+                  {selectedLifecycleStats.pendingReview > 0 && (
+                    <Badge backgroundColor="warning100" textColor="warning700">
+                      ⏳ Pending Review: {selectedLifecycleStats.pendingReview}
+                    </Badge>
+                  )}
+                </Flex>
+              </Box>
+
               {/* Collections Breakdown */}
               <Box marginBottom={4}>
                 <Typography variant="sigma" textColor="neutral600" marginBottom={2} display="block">
@@ -4520,6 +4656,116 @@ const BulkUpdater: React.FC = () => {
                 </Flex>
               </Box>
 
+              {/* Publishing Strategy Selection when Unreviewed Records are Selected */}
+              {publishOnApproval && selectedLifecycleStats.unreviewedCount > 0 && (
+                <Box
+                  padding={4}
+                  background="neutral100"
+                  hasRadius
+                  marginBottom={4}
+                  style={{ border: '1px solid #d9d8ff' }}
+                >
+                  <Typography variant="sigma" textColor="neutral600" marginBottom={3} display="block">
+                    PUBLISHING STRATEGY &amp; GOVERNANCE CONSENT
+                  </Typography>
+                  <Flex direction="column" gap={3}>
+                    {/* Strategy 1: Safe Publishing (Recommended) */}
+                    <Box
+                      padding={3}
+                      hasRadius
+                      style={{
+                        border: publishStrategy === 'safe' ? '2px solid #4945ff' : '1px solid #eaeaef',
+                        backgroundColor: publishStrategy === 'safe' ? '#f0f0ff' : '#ffffff',
+                        cursor: 'pointer',
+                      }}
+                      onClick={() => {
+                        setPublishStrategy('safe');
+                        setUnreviewedConsent(false);
+                      }}
+                    >
+                      <Flex gap={2} alignItems="flex-start">
+                        <input
+                          type="radio"
+                          id="strategy-safe"
+                          name="publishStrategy"
+                          checked={publishStrategy === 'safe'}
+                          onChange={() => {
+                            setPublishStrategy('safe');
+                            setUnreviewedConsent(false);
+                          }}
+                          style={{ marginTop: 3 }}
+                        />
+                        <Box>
+                          <Typography fontWeight="bold" display="block">
+                            🛡️ Safe Publishing (Recommended)
+                          </Typography>
+                          <Typography variant="pi" textColor="neutral600">
+                            Only publish records that are already approved &amp; live ({selectedLifecycleStats.published} record{selectedLifecycleStats.published === 1 ? '' : 's'}). The {selectedLifecycleStats.unreviewedCount} unreviewed or draft record(s) will receive the bulk update in Draft mode without publishing unreviewed draft revisions to visitors.
+                          </Typography>
+                        </Box>
+                      </Flex>
+                    </Box>
+
+                    {/* Strategy 2: Publish All Selected */}
+                    <Box
+                      padding={3}
+                      hasRadius
+                      style={{
+                        border: publishStrategy === 'all' ? '2px solid #d02b20' : '1px solid #eaeaef',
+                        backgroundColor: publishStrategy === 'all' ? '#fff5f5' : '#ffffff',
+                        cursor: 'pointer',
+                      }}
+                      onClick={() => setPublishStrategy('all')}
+                    >
+                      <Flex gap={2} alignItems="flex-start">
+                        <input
+                          type="radio"
+                          id="strategy-all"
+                          name="publishStrategy"
+                          checked={publishStrategy === 'all'}
+                          onChange={() => setPublishStrategy('all')}
+                          style={{ marginTop: 3 }}
+                        />
+                        <Box>
+                          <Typography fontWeight="bold" textColor="danger700" display="block">
+                            ⚠️ Publish All Selected Records (Includes Unreviewed Drafts)
+                          </Typography>
+                          <Typography variant="pi" textColor="neutral600">
+                            Publish all {totalSelectedCount} records live to production immediately, pushing all pending unreviewed draft edits in the {selectedLifecycleStats.unreviewedCount} draft/modified record(s) live.
+                          </Typography>
+                        </Box>
+                      </Flex>
+                    </Box>
+
+                    {/* Mandatory Consent Checkbox for Force Publish All */}
+                    {publishStrategy === 'all' && (
+                      <Box
+                        padding={3}
+                        background="danger100"
+                        hasRadius
+                        style={{ border: '1px solid #f5c0b8' }}
+                      >
+                        <Flex gap={3} alignItems="flex-start">
+                          <Checkbox
+                            name="unreviewedConsent"
+                            checked={unreviewedConsent}
+                            onCheckedChange={(checked: boolean) => setUnreviewedConsent(Boolean(checked))}
+                          />
+                          <Box style={{ cursor: 'pointer' }} onClick={() => setUnreviewedConsent(!unreviewedConsent)}>
+                            <Typography fontWeight="bold" textColor="danger700" display="block">
+                              Mandatory Risk Consent Required
+                            </Typography>
+                            <Typography variant="pi" textColor="danger700">
+                              I understand and explicitly consent that {selectedLifecycleStats.unreviewedCount} record(s) with unreviewed draft revisions or saved draft states will be published live to production visitors.
+                            </Typography>
+                          </Box>
+                        </Flex>
+                      </Box>
+                    )}
+                  </Flex>
+                </Box>
+              )}
+
               {/* Notes / Release Ticket (Maker Notes) */}
               <Box marginBottom={2}>
                 <TextInput
@@ -4545,51 +4791,62 @@ const BulkUpdater: React.FC = () => {
                 boxShadow: '0 -4px 16px rgba(0, 0, 0, 0.08)',
               }}
             >
-              <Flex justifyContent="space-between" alignItems="center" gap={3} style={{ width: '100%' }}>
-                <Button variant="tertiary" size="M" onClick={() => setShowConfirmModal(false)}>
-                  Cancel
-                </Button>
-                <Flex gap={2} wrap="wrap" justifyContent="flex-end" alignItems="center">
-                  {/* Maker-Checker Button */}
-                  <Button
-                    variant={executionWindow?.isBusinessHours ? 'default' : 'secondary'}
-                    size="M"
-                    onClick={() => executeBatchWithMode('maker_checker')}
-                    loading={updating}
-                  >
-                    Submit for Checker Approval
+              <Flex direction="column" gap={2} style={{ width: '100%' }}>
+                {publishOnApproval && selectedLifecycleStats.unreviewedCount > 0 && publishStrategy === 'all' && !unreviewedConsent && (
+                  <Typography variant="pi" textColor="danger700" fontWeight="bold">
+                    ⚠️ Explicit consent is required before publishing records with unreviewed draft revisions.
+                  </Typography>
+                )}
+                <Flex justifyContent="space-between" alignItems="center" gap={3} style={{ width: '100%' }}>
+                  <Button variant="tertiary" size="M" onClick={() => setShowConfirmModal(false)}>
+                    Cancel
                   </Button>
-
-                  {/* Scheduled Off-Peak Queue or Immediate Button */}
-                  {executionWindow?.isBusinessHours ? (
-                    <>
-                      <Button
-                        variant="secondary"
-                        size="M"
-                        onClick={() => executeBatchWithMode('queue_offpeak')}
-                        loading={updating}
-                      >
-                        Queue for Off-Peak ({executionWindow?.offPeakStartTime || '18:00'})
-                      </Button>
-                      <Button
-                        variant="danger-light"
-                        size="S"
-                        onClick={() => executeBatchWithMode('immediate', true)}
-                        loading={updating}
-                      >
-                        Force Run Now
-                      </Button>
-                    </>
-                  ) : (
+                  <Flex gap={2} wrap="wrap" justifyContent="flex-end" alignItems="center">
+                    {/* Maker-Checker Button */}
                     <Button
-                      variant="default"
+                      variant={executionWindow?.isBusinessHours ? 'default' : 'secondary'}
                       size="M"
-                      onClick={() => executeBatchWithMode('immediate')}
+                      onClick={() => executeBatchWithMode('maker_checker')}
                       loading={updating}
+                      disabled={updating || (publishOnApproval && selectedLifecycleStats.unreviewedCount > 0 && publishStrategy === 'all' && !unreviewedConsent)}
                     >
-                      Confirm &amp; Execute Now
+                      Submit for Checker Approval
                     </Button>
-                  )}
+
+                    {/* Scheduled Off-Peak Queue or Immediate Button */}
+                    {executionWindow?.isBusinessHours ? (
+                      <>
+                        <Button
+                          variant="secondary"
+                          size="M"
+                          onClick={() => executeBatchWithMode('queue_offpeak')}
+                          loading={updating}
+                          disabled={updating || (publishOnApproval && selectedLifecycleStats.unreviewedCount > 0 && publishStrategy === 'all' && !unreviewedConsent)}
+                        >
+                          Queue for Off-Peak ({executionWindow?.offPeakStartTime || '18:00'})
+                        </Button>
+                        <Button
+                          variant="danger-light"
+                          size="S"
+                          onClick={() => executeBatchWithMode('immediate', true)}
+                          loading={updating}
+                          disabled={updating || (publishOnApproval && selectedLifecycleStats.unreviewedCount > 0 && publishStrategy === 'all' && !unreviewedConsent)}
+                        >
+                          Force Run Now
+                        </Button>
+                      </>
+                    ) : (
+                      <Button
+                        variant="default"
+                        size="M"
+                        onClick={() => executeBatchWithMode('immediate')}
+                        loading={updating}
+                        disabled={updating || (publishOnApproval && selectedLifecycleStats.unreviewedCount > 0 && publishStrategy === 'all' && !unreviewedConsent)}
+                      >
+                        Confirm &amp; Execute Now
+                      </Button>
+                    )}
+                  </Flex>
                 </Flex>
               </Flex>
             </Box>
@@ -4665,6 +4922,28 @@ const BulkUpdater: React.FC = () => {
                 gap: 16,
               }}
             >
+              {/* Lifecycle Status Breakdown */}
+              <Box padding={3} background="neutral100" hasRadius style={{ border: '1px solid #eaeaef' }}>
+                <Typography variant="sigma" textColor="neutral600" marginBottom={2} display="block">
+                  LIFECYCLE STATUS BREAKDOWN ({totalSelectedCount} Selected)
+                </Typography>
+                <Flex gap={2} wrap="wrap">
+                  <Badge backgroundColor="success100" textColor="success700">
+                    ✓ Published: {selectedLifecycleStats.published}
+                  </Badge>
+                  {selectedLifecycleStats.modified > 0 && (
+                    <Badge backgroundColor="primary100" textColor="primary700">
+                      📝 Modified (Unreviewed Revisions): {selectedLifecycleStats.modified}
+                    </Badge>
+                  )}
+                  {selectedLifecycleStats.draft > 0 && (
+                    <Badge backgroundColor="neutral200" textColor="neutral800">
+                      📄 Draft (Never Published): {selectedLifecycleStats.draft}
+                    </Badge>
+                  )}
+                </Flex>
+              </Box>
+
               <Box padding={4} background="neutral100" hasRadius style={{ border: '1px solid #eaeaef' }}>
                 <Typography variant="omega" fontWeight="bold">
                   Collection Breakdown:
@@ -4712,6 +4991,32 @@ const BulkUpdater: React.FC = () => {
                 </Box>
               </Box>
 
+              {/* Explicit Consent Checkbox for Unreviewed Records */}
+              {selectedLifecycleStats.unreviewedCount > 0 && (
+                <Box
+                  padding={4}
+                  background="danger100"
+                  hasRadius
+                  style={{ border: '1px solid #f5c0b8' }}
+                >
+                  <Flex gap={3} alignItems="flex-start">
+                    <Checkbox
+                      name="publishConsent"
+                      checked={publishConsent}
+                      onCheckedChange={(checked: boolean) => setPublishConsent(Boolean(checked))}
+                    />
+                    <Box style={{ cursor: 'pointer' }} onClick={() => setPublishConsent(!publishConsent)}>
+                      <Typography fontWeight="bold" textColor="danger700" display="block">
+                        Mandatory Risk Consent Required
+                      </Typography>
+                      <Typography variant="pi" textColor="danger700">
+                        I understand and explicitly consent that {selectedLifecycleStats.unreviewedCount} record(s) contain unreviewed draft changes ({selectedLifecycleStats.draft} Draft, {selectedLifecycleStats.modified} Modified) and will be published live to production visitors.
+                      </Typography>
+                    </Box>
+                  </Flex>
+                </Box>
+              )}
+
               {/* Business Hours Warning Banner */}
               {executionWindow?.isBusinessHours && (
                 <Box
@@ -4755,49 +5060,60 @@ const BulkUpdater: React.FC = () => {
                 boxShadow: '0 -4px 16px rgba(0, 0, 0, 0.08)',
               }}
             >
-              <Flex justifyContent="space-between" alignItems="center" gap={3} style={{ width: '100%' }}>
-                <Button variant="tertiary" size="M" onClick={() => setShowPublishConfirmModal(false)}>
-                  Cancel
-                </Button>
-                <Flex gap={2} wrap="wrap" justifyContent="flex-end" alignItems="center">
-                  <Button
-                    variant={executionWindow?.isBusinessHours ? 'default' : 'secondary'}
-                    size="M"
-                    onClick={() => executeBatchPublish('maker_checker')}
-                    loading={publishing}
-                  >
-                    Submit for Checker Approval
+              <Flex direction="column" gap={2} style={{ width: '100%' }}>
+                {selectedLifecycleStats.unreviewedCount > 0 && !publishConsent && (
+                  <Typography variant="pi" textColor="danger700" fontWeight="bold">
+                    ⚠️ Please check the mandatory consent box above to confirm publishing unreviewed draft records.
+                  </Typography>
+                )}
+                <Flex justifyContent="space-between" alignItems="center" gap={3} style={{ width: '100%' }}>
+                  <Button variant="tertiary" size="M" onClick={() => setShowPublishConfirmModal(false)}>
+                    Cancel
                   </Button>
-
-                  {executionWindow?.isBusinessHours ? (
-                    <>
-                      <Button
-                        variant="secondary"
-                        size="M"
-                        onClick={() => executeBatchPublish('queue_offpeak')}
-                        loading={publishing}
-                      >
-                        Queue for Off-Peak ({executionWindow?.offPeakStartTime || '18:00'})
-                      </Button>
-                      <Button
-                        variant="danger-light"
-                        size="S"
-                        onClick={() => executeBatchPublish('immediate', true)}
-                        loading={publishing}
-                      >
-                        Force Publish Now
-                      </Button>
-                    </>
-                  ) : (
+                  <Flex gap={2} wrap="wrap" justifyContent="flex-end" alignItems="center">
                     <Button
-                      variant="default"
+                      variant={executionWindow?.isBusinessHours ? 'default' : 'secondary'}
                       size="M"
-                      onClick={() => executeBatchPublish('immediate')}
+                      onClick={() => executeBatchPublish('maker_checker')}
                       loading={publishing}
+                      disabled={publishing || (selectedLifecycleStats.unreviewedCount > 0 && !publishConsent)}
                     >
-                      Confirm &amp; Publish Now
+                      Submit for Checker Approval
                     </Button>
-                  )}
+
+                    {executionWindow?.isBusinessHours ? (
+                      <>
+                        <Button
+                          variant="secondary"
+                          size="M"
+                          onClick={() => executeBatchPublish('queue_offpeak')}
+                          loading={publishing}
+                          disabled={publishing || (selectedLifecycleStats.unreviewedCount > 0 && !publishConsent)}
+                        >
+                          Queue for Off-Peak ({executionWindow?.offPeakStartTime || '18:00'})
+                        </Button>
+                        <Button
+                          variant="danger-light"
+                          size="S"
+                          onClick={() => executeBatchPublish('immediate', true)}
+                          loading={publishing}
+                          disabled={publishing || (selectedLifecycleStats.unreviewedCount > 0 && !publishConsent)}
+                        >
+                          Force Publish Now
+                        </Button>
+                      </>
+                    ) : (
+                      <Button
+                        variant="default"
+                        size="M"
+                        onClick={() => executeBatchPublish('immediate')}
+                        loading={publishing}
+                        disabled={publishing || (selectedLifecycleStats.unreviewedCount > 0 && !publishConsent)}
+                      >
+                        Confirm &amp; Publish Now
+                      </Button>
+                    )}
+                  </Flex>
                 </Flex>
               </Flex>
             </Box>
@@ -4817,6 +5133,7 @@ const BulkUpdater: React.FC = () => {
         previewData={previewData}
         attribute={selectedAttribute}
         publishOnApproval={publishOnApproval}
+        lifecycleStats={selectedLifecycleStats}
         targetValueDisplay={
           relationsMeta[selectedAttribute]
             ? (selectedRelationDocId === '__clear__'

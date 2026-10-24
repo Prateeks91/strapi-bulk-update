@@ -559,13 +559,20 @@ export interface PendingBatch {
   createdAt: string;
   createdBy: { id?: string | number; email?: string; firstname?: string; lastname?: string; username?: string };
   payload: {
+    action?: string;
     attribute: string;
     value: string;
-    selectedEntries?: Array<{ uid: string; documentId: string }>;
+    selectedEntries?: Array<{ uid: string; documentId: string; dynamicZoneIndexes?: number[]; targetComponentUid?: string }>;
     selectedCollections?: string[];
     isRegex?: boolean;
     regexPattern?: string;
     publishOnApproval?: boolean;
+    publishStrategy?: 'safe' | 'all';
+    unreviewedConsent?: boolean;
+    unreviewedCount?: number;
+    rows?: any[];
+    uid?: string;
+    options?: any;
   };
   summary: {
     attribute: string;
@@ -573,6 +580,9 @@ export interface PendingBatch {
     totalTargets: number;
     collectionBreakdown: Record<string, number>;
     publishOnApproval?: boolean;
+    publishStrategy?: 'safe' | 'all';
+    unreviewedConsent?: boolean;
+    unreviewedCount?: number;
   };
   status: 'pending_approval' | 'queued_offpeak' | 'approved' | 'rejected' | 'executed';
   executionMode: 'maker_checker' | 'queue_offpeak' | 'immediate';
@@ -604,6 +614,9 @@ export interface BatchJobState {
   failedCount: number;
   isLive: boolean;
   publishOnApproval: boolean;
+  publishStrategy?: 'safe' | 'all';
+  unreviewedConsent?: boolean;
+  unreviewedCount?: number;
   policyMessage?: string;
   makerNotes?: string;
   results: Array<{
@@ -717,6 +730,8 @@ async function executeBatchInternal(
     isRegex = false,
     regexPattern = '',
     publishOnApproval = true,
+    publishStrategy = 'safe',
+    unreviewedConsent = false,
   }: {
     attribute: string;
     value: string;
@@ -725,6 +740,8 @@ async function executeBatchInternal(
     isRegex?: boolean;
     regexPattern?: string;
     publishOnApproval?: boolean;
+    publishStrategy?: 'safe' | 'all';
+    unreviewedConsent?: boolean;
   },
   currentUser?: any,
   existingBatchId?: string
@@ -790,6 +807,8 @@ async function executeBatchInternal(
     failedCount: 0,
     isLive: false,
     publishOnApproval: Boolean(publishOnApproval),
+    publishStrategy,
+    unreviewedConsent,
     results: [],
   };
   batchJobsMap.set(batchId, jobState);
@@ -887,7 +906,11 @@ async function executeBatchInternal(
 
             // If publishOnApproval is true and content type has draftAndPublish enabled, publish the document
             const isDraftAndPublishComp = Boolean(contentType?.options?.draftAndPublish);
-            if (publishOnApproval && isDraftAndPublishComp) {
+            const isApprovedComp = isDraftAndPublishComp && Boolean(currentEntry?.publishedAt) && currentEntry?.status !== 'modified';
+            const shouldPublishComp = isDraftAndPublishComp && Boolean(publishOnApproval) && (
+              publishStrategy === 'all' ? true : isApprovedComp
+            );
+            if (shouldPublishComp) {
               try {
                 await (strapi.documents(target.uid as any) as any).publish({
                   documentId: target.documentId,
@@ -903,7 +926,7 @@ async function executeBatchInternal(
               uid: target.uid,
               documentId: target.documentId,
               userId: currentUser?.id,
-              statusOverride: (publishOnApproval && isDraftAndPublishComp) ? 'published' : undefined,
+              statusOverride: shouldPublishComp ? 'published' : (isDraftAndPublishComp ? 'draft' : undefined),
             });
 
             const dzDiffs = isRootDz && affectedMatches.length > 0
@@ -1004,7 +1027,11 @@ async function executeBatchInternal(
 
             // If publishOnApproval is true and content type has draftAndPublish enabled, publish the document
             const isDraftAndPublishRel = Boolean(contentType?.options?.draftAndPublish);
-            if (publishOnApproval && isDraftAndPublishRel) {
+            const isApprovedRel = isDraftAndPublishRel && Boolean(currentEntry?.publishedAt) && currentEntry?.status !== 'modified';
+            const shouldPublishRel = isDraftAndPublishRel && Boolean(publishOnApproval) && (
+              publishStrategy === 'all' ? true : isApprovedRel
+            );
+            if (shouldPublishRel) {
               try {
                 await (strapi.documents(target.uid as any) as any).publish({
                   documentId: target.documentId,
@@ -1023,7 +1050,7 @@ async function executeBatchInternal(
               uid: target.uid,
               documentId: target.documentId,
               userId: currentUser?.id,
-              statusOverride: (publishOnApproval && isDraftAndPublishRel) ? 'published' : undefined,
+              statusOverride: shouldPublishRel ? 'published' : (isDraftAndPublishRel ? 'draft' : undefined),
             });
 
             return {
@@ -1055,7 +1082,11 @@ async function executeBatchInternal(
 
           // If publishOnApproval is true and content type has draftAndPublish enabled, publish the document
           const isDraftAndPublishScalar = Boolean(contentType?.options?.draftAndPublish);
-          if (publishOnApproval && isDraftAndPublishScalar) {
+          const isApprovedScalar = isDraftAndPublishScalar && Boolean(currentEntry?.publishedAt) && currentEntry?.status !== 'modified';
+          const shouldPublishScalar = isDraftAndPublishScalar && Boolean(publishOnApproval) && (
+            publishStrategy === 'all' ? true : isApprovedScalar
+          );
+          if (shouldPublishScalar) {
             try {
               await (strapi.documents(target.uid as any) as any).publish({
                 documentId: target.documentId,
@@ -1069,7 +1100,7 @@ async function executeBatchInternal(
             uid: target.uid,
             documentId: target.documentId,
             userId: currentUser?.id,
-            statusOverride: (publishOnApproval && isDraftAndPublishScalar) ? 'published' : undefined,
+            statusOverride: shouldPublishScalar ? 'published' : (isDraftAndPublishScalar ? 'draft' : undefined),
           });
 
           return {
@@ -1171,6 +1202,8 @@ async function executeBatchInternal(
     skippedCount,
     totalTargets: targetsMap.size,
     publishOnApproval,
+    publishStrategy,
+    unreviewedConsent,
   };
 
   // Stateless audit recording via consumer's declared audit schema
@@ -1203,9 +1236,11 @@ async function executePublishBatchInternal(
   {
     selectedEntries = [],
     selectedCollections = [],
+    unreviewedConsent = false,
   }: {
     selectedEntries?: Array<{ uid: string; documentId: string }>;
     selectedCollections?: string[];
+    unreviewedConsent?: boolean;
   },
   currentUser?: any,
   existingBatchId?: string
@@ -1262,6 +1297,7 @@ async function executePublishBatchInternal(
     failedCount: 0,
     isLive: false,
     publishOnApproval: true,
+    unreviewedConsent,
     results: [],
   };
   batchJobsMap.set(batchId, jobState);
@@ -1389,6 +1425,7 @@ async function executePublishBatchInternal(
     skippedCount,
     totalTargets: targetsMap.size,
     publishOnApproval: true,
+    unreviewedConsent,
   };
 
   // Stateless audit recording
@@ -2473,10 +2510,13 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         makerNotes = '',
         forceImmediate = false,
         publishOnApproval = true,
+        publishStrategy = 'safe',
+        unreviewedConsent = false,
+        unreviewedCount = 0,
       }: {
         attribute: string;
         value: string;
-        selectedEntries?: Array<{ uid: string; documentId: string }>;
+        selectedEntries?: Array<{ uid: string; documentId: string; dynamicZoneIndexes?: number[]; targetComponentUid?: string }>;
         selectedCollections?: string[];
         isRegex?: boolean;
         regexPattern?: string;
@@ -2484,6 +2524,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         makerNotes?: string;
         forceImmediate?: boolean;
         publishOnApproval?: boolean;
+        publishStrategy?: 'safe' | 'all';
+        unreviewedConsent?: boolean;
+        unreviewedCount?: number;
       },
       currentUser?: any
     ) {
@@ -2514,13 +2557,16 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
                 username: currentUser.username,
               }
             : { email: 'admin@system.local' },
-          payload: { attribute, value, selectedEntries, selectedCollections, isRegex, regexPattern, publishOnApproval },
+          payload: { attribute, value, selectedEntries, selectedCollections, isRegex, regexPattern, publishOnApproval, publishStrategy, unreviewedConsent, unreviewedCount },
           summary: {
             attribute,
             value,
             totalTargets: summary.totalTargets,
             collectionBreakdown: summary.collectionBreakdown,
             publishOnApproval,
+            publishStrategy,
+            unreviewedConsent,
+            unreviewedCount,
           },
           status: 'pending_approval',
           executionMode: 'maker_checker',
@@ -2543,6 +2589,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           failedCount: 0,
           isLive: false,
           publishOnApproval: Boolean(publishOnApproval),
+          publishStrategy,
+          unreviewedConsent,
+          unreviewedCount,
           makerNotes,
           results: [],
         });
@@ -2577,13 +2626,16 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
                 username: currentUser.username,
               }
             : { email: 'admin@system.local' },
-          payload: { attribute, value, selectedEntries, selectedCollections, isRegex, regexPattern, publishOnApproval },
+          payload: { attribute, value, selectedEntries, selectedCollections, isRegex, regexPattern, publishOnApproval, publishStrategy, unreviewedConsent, unreviewedCount },
           summary: {
             attribute,
             value,
             totalTargets: summary.totalTargets,
             collectionBreakdown: summary.collectionBreakdown,
             publishOnApproval,
+            publishStrategy,
+            unreviewedConsent,
+            unreviewedCount,
           },
           status: 'queued_offpeak',
           executionMode: 'queue_offpeak',
@@ -2608,6 +2660,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           failedCount: 0,
           isLive: false,
           publishOnApproval: Boolean(publishOnApproval),
+          publishStrategy,
+          unreviewedConsent,
+          unreviewedCount,
           makerNotes,
           results: [],
         });
@@ -2643,13 +2698,16 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
                 username: currentUser.username,
               }
             : { email: 'admin@system.local' },
-          payload: { attribute, value, selectedEntries, selectedCollections, isRegex, regexPattern, publishOnApproval },
+          payload: { attribute, value, selectedEntries, selectedCollections, isRegex, regexPattern, publishOnApproval, publishStrategy, unreviewedConsent, unreviewedCount },
           summary: {
             attribute,
             value,
             totalTargets: summary.totalTargets,
             collectionBreakdown: summary.collectionBreakdown,
             publishOnApproval,
+            publishStrategy,
+            unreviewedConsent,
+            unreviewedCount,
           },
           status: 'queued_offpeak',
           executionMode: 'queue_offpeak',
@@ -2674,6 +2732,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           failedCount: 0,
           isLive: false,
           publishOnApproval: Boolean(publishOnApproval),
+          publishStrategy,
+          unreviewedConsent,
+          unreviewedCount,
           policyMessage,
           makerNotes: 'Automatically queued due to peak business hours restriction.',
           results: [],
@@ -2693,7 +2754,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       // 4. Immediate execution
       return await executeBatchInternal(
         strapi,
-        { attribute, value, selectedEntries, selectedCollections, isRegex, regexPattern, publishOnApproval },
+        { attribute, value, selectedEntries, selectedCollections, isRegex, regexPattern, publishOnApproval, publishStrategy, unreviewedConsent },
         currentUser
       );
     },
@@ -2708,12 +2769,16 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         executionMode = 'immediate',
         makerNotes = '',
         forceImmediate = false,
+        unreviewedConsent = false,
+        unreviewedCount = 0,
       }: {
         selectedEntries?: Array<{ uid: string; documentId: string }>;
         selectedCollections?: string[];
         executionMode?: 'immediate' | 'queue_offpeak' | 'maker_checker';
         makerNotes?: string;
         forceImmediate?: boolean;
+        unreviewedConsent?: boolean;
+        unreviewedCount?: number;
       },
       currentUser?: any
     ) {
@@ -2740,13 +2805,15 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
                 username: currentUser.username,
               }
             : { email: 'admin@system.local' },
-          payload: { action: 'publish', attribute: '(publish)', value: 'published', selectedEntries, selectedCollections, publishOnApproval: true },
+          payload: { action: 'publish', attribute: '(publish)', value: 'published', selectedEntries, selectedCollections, publishOnApproval: true, unreviewedConsent, unreviewedCount },
           summary: {
             attribute: '(publish)',
             value: 'published',
             totalTargets: summary.totalTargets,
             collectionBreakdown: summary.collectionBreakdown,
             publishOnApproval: true,
+            unreviewedConsent,
+            unreviewedCount,
           },
           status: 'pending_approval',
           executionMode: 'maker_checker',
@@ -2769,6 +2836,8 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           failedCount: 0,
           isLive: false,
           publishOnApproval: true,
+          unreviewedConsent,
+          unreviewedCount,
           makerNotes,
           results: [],
         });
@@ -2803,13 +2872,15 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
                 username: currentUser.username,
               }
             : { email: 'admin@system.local' },
-          payload: { action: 'publish', attribute: '(publish)', value: 'published', selectedEntries, selectedCollections, publishOnApproval: true },
+          payload: { action: 'publish', attribute: '(publish)', value: 'published', selectedEntries, selectedCollections, publishOnApproval: true, unreviewedConsent, unreviewedCount },
           summary: {
             attribute: '(publish)',
             value: 'published',
             totalTargets: summary.totalTargets,
             collectionBreakdown: summary.collectionBreakdown,
             publishOnApproval: true,
+            unreviewedConsent,
+            unreviewedCount,
           },
           status: 'queued_offpeak',
           executionMode: 'queue_offpeak',
@@ -2834,6 +2905,8 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           failedCount: 0,
           isLive: false,
           publishOnApproval: true,
+          unreviewedConsent,
+          unreviewedCount,
           makerNotes,
           results: [],
         });
@@ -2869,13 +2942,15 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
                 username: currentUser.username,
               }
             : { email: 'admin@system.local' },
-          payload: { action: 'publish', attribute: '(publish)', value: 'published', selectedEntries, selectedCollections, publishOnApproval: true },
+          payload: { action: 'publish', attribute: '(publish)', value: 'published', selectedEntries, selectedCollections, publishOnApproval: true, unreviewedConsent, unreviewedCount },
           summary: {
             attribute: '(publish)',
             value: 'published',
             totalTargets: summary.totalTargets,
             collectionBreakdown: summary.collectionBreakdown,
             publishOnApproval: true,
+            unreviewedConsent,
+            unreviewedCount,
           },
           status: 'queued_offpeak',
           executionMode: 'queue_offpeak',
@@ -2900,6 +2975,8 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           failedCount: 0,
           isLive: false,
           publishOnApproval: true,
+          unreviewedConsent,
+          unreviewedCount,
           policyMessage,
           makerNotes: 'Automatically queued due to peak business hours restriction.',
           results: [],
@@ -2919,7 +2996,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       // 4. Immediate execution
       return await executePublishBatchInternal(
         strapi,
-        { selectedEntries, selectedCollections },
+        { selectedEntries, selectedCollections, unreviewedConsent },
         currentUser
       );
     },

@@ -443,6 +443,8 @@ interface CsvImportSession {
   newWithoutDocId: number;
   errors: Array<{ row: number; error: string; documentId?: string }>;
   diffs: Array<any>;
+  publishStrategy?: 'safe' | 'all';
+  unreviewedConsent?: boolean;
 }
 
 const csvImportSessions = new Map<string, CsvImportSession>();
@@ -513,11 +515,14 @@ export async function processCsvRows(
   options: {
     mode?: 'auto' | 'update' | 'create_or_override';
     publish?: boolean;
+    publishStrategy?: 'safe' | 'all';
+    unreviewedConsent?: boolean;
     user?: any;
   }
 ): Promise<ProcessRowsStats> {
   const attrs = ct.attributes || {};
-  const { mode = 'auto', publish = true, user } = options;
+  const { mode = 'auto', publish = true, publishStrategy = 'safe', user } = options;
+  const isDraftAndPublish = Boolean(ct.options?.draftAndPublish);
 
   const stats: ProcessRowsStats = {
     total: rows.length,
@@ -753,7 +758,12 @@ export async function processCsvRows(
 
         await (strapi.documents(uid as any) as any).update(updateArgs);
 
-        if (publish && ct.options?.draftAndPublish) {
+        const isApproved = isDraftAndPublish && Boolean(existing?.publishedAt) && existing?.status !== 'modified';
+        const shouldPublish = isDraftAndPublish && Boolean(publish) && (
+          publishStrategy === 'all' ? true : isApproved
+        );
+
+        if (shouldPublish) {
           try {
             const pubArgs: any = { documentId: resolvedDocId };
             if (rowLocale) pubArgs.locale = rowLocale;
@@ -768,7 +778,7 @@ export async function processCsvRows(
             uid,
             documentId: resolvedDocId,
             userId: user?.id,
-            statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
+            statusOverride: shouldPublish ? 'published' : (isDraftAndPublish ? 'draft' : undefined),
           });
         } catch {}
 
@@ -811,7 +821,12 @@ export async function processCsvRows(
 
           await (strapi.documents(uid as any) as any).update(updateArgs);
 
-          if (publish && ct.options?.draftAndPublish) {
+          const isApproved = isDraftAndPublish && Boolean(existing?.publishedAt) && existing?.status !== 'modified';
+          const shouldPublish = isDraftAndPublish && Boolean(publish) && (
+            publishStrategy === 'all' ? true : isApproved
+          );
+
+          if (shouldPublish) {
             try {
               const pubArgs: any = { documentId: resolvedDocId };
               if (rowLocale) pubArgs.locale = rowLocale;
@@ -826,7 +841,7 @@ export async function processCsvRows(
               uid,
               documentId: resolvedDocId,
               userId: user?.id,
-              statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
+              statusOverride: shouldPublish ? 'published' : (isDraftAndPublish ? 'draft' : undefined),
             });
           } catch {}
 
@@ -854,7 +869,11 @@ export async function processCsvRows(
         const created: any = await strapi.documents(uid as any).create(createArgs);
 
         const newDocId = created?.documentId || docId;
-        if (publish && ct.options?.draftAndPublish && newDocId) {
+        const shouldPublishNew = isDraftAndPublish && Boolean(publish) && (
+          publishStrategy === 'all' ? true : false
+        );
+
+        if (shouldPublishNew && newDocId) {
           try {
             const pubArgs: any = { documentId: newDocId };
             if (rowLocale) pubArgs.locale = rowLocale;
@@ -869,7 +888,7 @@ export async function processCsvRows(
             uid,
             documentId: newDocId,
             userId: user?.id,
-            statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
+            statusOverride: shouldPublishNew ? 'published' : (isDraftAndPublish ? 'draft' : undefined),
           });
         } catch {}
 
@@ -916,7 +935,12 @@ export async function processCsvRows(
 
           await (strapi.documents(uid as any) as any).update(updateArgs);
 
-          if (publish && ct.options?.draftAndPublish) {
+          const isApproved = isDraftAndPublish && Boolean(existing?.publishedAt) && existing?.status !== 'modified';
+          const shouldPublish = isDraftAndPublish && Boolean(publish) && (
+            publishStrategy === 'all' ? true : isApproved
+          );
+
+          if (shouldPublish) {
             try {
               const pubArgs: any = { documentId: resolvedDocId };
               if (rowLocale) pubArgs.locale = rowLocale;
@@ -931,7 +955,7 @@ export async function processCsvRows(
               uid,
               documentId: resolvedDocId,
               userId: user?.id,
-              statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
+              statusOverride: shouldPublish ? 'published' : (isDraftAndPublish ? 'draft' : undefined),
             });
           } catch {}
 
@@ -960,7 +984,11 @@ export async function processCsvRows(
         const created: any = await strapi.documents(uid as any).create(createArgs);
 
         const newDocId = created?.documentId || docId;
-        if (publish && ct.options?.draftAndPublish && newDocId) {
+        const shouldPublishNew = isDraftAndPublish && Boolean(publish) && (
+          publishStrategy === 'all' ? true : false
+        );
+
+        if (shouldPublishNew && newDocId) {
           try {
             const pubArgs: any = { documentId: newDocId };
             if (rowLocale) pubArgs.locale = rowLocale;
@@ -975,7 +1003,7 @@ export async function processCsvRows(
             uid,
             documentId: newDocId,
             userId: user?.id,
-            statusOverride: publish && ct.options?.draftAndPublish ? 'published' : undefined,
+            statusOverride: shouldPublishNew ? 'published' : (isDraftAndPublish ? 'draft' : undefined),
           });
         } catch {}
 
@@ -1017,7 +1045,10 @@ async function recordCsvAuditLog(
   uid: string,
   batchId: string,
   stats: { total: number; created: number; updated: number; skipped: number; diffs: Array<any> },
-  user?: any
+  user?: any,
+  publishOnApproval?: boolean,
+  publishStrategy?: 'safe' | 'all',
+  unreviewedConsent?: boolean
 ) {
   if (stats.updated === 0 && stats.created === 0) return;
 
@@ -1077,7 +1108,14 @@ async function recordCsvAuditLog(
     };
 
     if (typeof auditService.recordBatch === 'function') {
-      await auditService.recordBatch(batchSummary, stats.diffs, userObj);
+      await auditService.recordBatch(
+        batchSummary,
+        stats.diffs,
+        userObj,
+        publishOnApproval,
+        publishStrategy,
+        unreviewedConsent
+      );
     } else if (typeof auditService.logOperation === 'function') {
       await auditService.logOperation({
         ...batchSummary,
@@ -1468,6 +1506,8 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       startRowNumber?: number;
       mode?: 'auto' | 'update' | 'create_or_override';
       publish?: boolean;
+      publishStrategy?: 'safe' | 'all';
+      unreviewedConsent?: boolean;
       user?: any;
     }
   ) {
@@ -1493,6 +1533,8 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         newWithoutDocId: 0,
         errors: [],
         diffs: [],
+        publishStrategy: options.publishStrategy,
+        unreviewedConsent: options.unreviewedConsent,
       };
       csvImportSessions.set(batchId, session);
     }
@@ -1509,7 +1551,17 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     session.diffs.push(...chunkStats.diffs);
 
     if (options.isLastChunk) {
-      await recordCsvAuditLog(strapi, ct, uid, batchId, session, options.user);
+      await recordCsvAuditLog(
+        strapi,
+        ct,
+        uid,
+        batchId,
+        session,
+        options.user,
+        options.publish !== false,
+        session.publishStrategy || options.publishStrategy,
+        session.unreviewedConsent ?? options.unreviewedConsent
+      );
 
       try {
         const bulkService = strapi.plugin('bulk-updater').service('bulkUpdater');
@@ -1556,6 +1608,8 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     options: {
       mode?: 'auto' | 'update' | 'create_or_override';
       publish?: boolean;
+      publishStrategy?: 'safe' | 'all';
+      unreviewedConsent?: boolean;
       user?: any;
     }
   ) {
@@ -1579,7 +1633,17 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       }
     } catch {}
 
-    await recordCsvAuditLog(strapi, ct, uid, batchId, stats, options.user);
+    await recordCsvAuditLog(
+      strapi,
+      ct,
+      uid,
+      batchId,
+      stats,
+      options.user,
+      options.publish !== false,
+      options.publishStrategy,
+      options.unreviewedConsent
+    );
 
     return {
       success: true,
@@ -1598,6 +1662,8 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     options: {
       mode?: 'auto' | 'update' | 'create_or_override';
       publish?: boolean;
+      publishStrategy?: 'safe' | 'all';
+      unreviewedConsent?: boolean;
       user?: any;
     } = {},
     checkerUser?: any
@@ -1613,7 +1679,17 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       user: effectiveUser,
     });
 
-    await recordCsvAuditLog(strapi, ct, uid, batchId, stats, effectiveUser);
+    await recordCsvAuditLog(
+      strapi,
+      ct,
+      uid,
+      batchId,
+      stats,
+      effectiveUser,
+      options.publish !== false,
+      options.publishStrategy,
+      options.unreviewedConsent
+    );
 
     try {
       const bulkService = strapi.plugin('bulk-updater').service('bulkUpdater');
@@ -1661,6 +1737,15 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     let validRows = 0;
     let estimatedUpdates = 0;
     let estimatedCreates = 0;
+    const isDraftAndPublish = Boolean(ct.options?.draftAndPublish);
+    const lifecycleStats = {
+      isDraftAndPublish,
+      totalChecked: 0,
+      published: 0,
+      modified: 0,
+      draft: 0,
+      unreviewedCount: 0,
+    };
     const errors: Array<{ row: number; documentId?: string; error: string }> = [];
     const warnings: Array<{ row: number; documentId?: string; warning: string }> = [];
 
@@ -1675,6 +1760,20 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       let existing: any = null;
       if (docId) {
         existing = await findExistingDocument(strapi, uid, docId, rowLocale);
+      }
+
+      if (existing && isDraftAndPublish) {
+        lifecycleStats.totalChecked++;
+        const isApproved = Boolean(existing.publishedAt) && existing.status !== 'modified';
+        if (isApproved) {
+          lifecycleStats.published++;
+        } else if (existing.status === 'modified') {
+          lifecycleStats.modified++;
+          lifecycleStats.unreviewedCount++;
+        } else {
+          lifecycleStats.draft++;
+          lifecycleStats.unreviewedCount++;
+        }
       }
 
       if (mode === 'update') {
@@ -1804,6 +1903,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       validRows,
       estimatedUpdates,
       estimatedCreates,
+      lifecycleStats,
       hasErrors: errors.length > 0,
       hasWarnings: warnings.length > 0,
       errors: errors.slice(0, 100),
@@ -1825,6 +1925,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       forceImmediate?: boolean;
       mode?: 'auto' | 'update' | 'create_or_override';
       publish?: boolean;
+      publishStrategy?: 'safe' | 'all';
+      unreviewedConsent?: boolean;
+      unreviewedCount?: number;
       user?: any;
     } = {}
   ) {
@@ -1843,6 +1946,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       forceImmediate = false,
       mode = 'auto',
       publish = true,
+      publishStrategy = 'safe',
+      unreviewedConsent = false,
+      unreviewedCount = 0,
       user,
     } = options;
 
@@ -1872,11 +1978,16 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           options: {
             mode,
             publish,
+            publishStrategy,
+            unreviewedConsent,
             user,
           },
           attribute: `CSV Import: ${collectionDisplayName}`,
           value: `${rows.length} rows (${mode} mode)`,
           publishOnApproval: publish,
+          publishStrategy,
+          unreviewedConsent,
+          unreviewedCount,
         },
         summary: {
           attribute: `CSV Import: ${collectionDisplayName}`,
@@ -1884,10 +1995,16 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           totalTargets: rows.length,
           collectionBreakdown: { [collectionDisplayName]: rows.length },
           publishOnApproval: publish,
+          publishStrategy,
+          unreviewedConsent,
+          unreviewedCount,
         },
         status: 'pending_approval',
         executionMode: 'maker_checker',
         makerNotes,
+        publishStrategy,
+        unreviewedConsent,
+        unreviewedCount,
       };
 
       registerPendingBatch(batch, {
@@ -1905,6 +2022,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         failedCount: 0,
         isLive: false,
         publishOnApproval: publish,
+        publishStrategy,
+        unreviewedConsent,
+        unreviewedCount,
         makerNotes,
         results: [],
       });
@@ -1941,11 +2061,16 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           options: {
             mode,
             publish,
+            publishStrategy,
+            unreviewedConsent,
             user,
           },
           attribute: `CSV Import: ${collectionDisplayName}`,
           value: `${rows.length} rows (${mode} mode)`,
           publishOnApproval: publish,
+          publishStrategy,
+          unreviewedConsent,
+          unreviewedCount,
         },
         summary: {
           attribute: `CSV Import: ${collectionDisplayName}`,
@@ -1953,11 +2078,17 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           totalTargets: rows.length,
           collectionBreakdown: { [collectionDisplayName]: rows.length },
           publishOnApproval: publish,
+          publishStrategy,
+          unreviewedConsent,
+          unreviewedCount,
         },
         status: 'queued_offpeak',
         executionMode: 'queue_offpeak',
         scheduledFor: executionConfig.offPeakStartTime,
         makerNotes,
+        publishStrategy,
+        unreviewedConsent,
+        unreviewedCount,
       };
 
       registerPendingBatch(batch, {
@@ -1976,6 +2107,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         failedCount: 0,
         isLive: false,
         publishOnApproval: publish,
+        publishStrategy,
+        unreviewedConsent,
+        unreviewedCount,
         makerNotes,
         results: [],
       });
@@ -2013,11 +2147,16 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           options: {
             mode,
             publish,
+            publishStrategy,
+            unreviewedConsent,
             user,
           },
           attribute: `CSV Import: ${collectionDisplayName}`,
           value: `${rows.length} rows (${mode} mode)`,
           publishOnApproval: publish,
+          publishStrategy,
+          unreviewedConsent,
+          unreviewedCount,
         },
         summary: {
           attribute: `CSV Import: ${collectionDisplayName}`,
@@ -2025,11 +2164,17 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           totalTargets: rows.length,
           collectionBreakdown: { [collectionDisplayName]: rows.length },
           publishOnApproval: publish,
+          publishStrategy,
+          unreviewedConsent,
+          unreviewedCount,
         },
         status: 'queued_offpeak',
         executionMode: 'queue_offpeak',
         scheduledFor: executionConfig.offPeakStartTime,
         makerNotes: 'Automatically queued due to peak business hours restriction.',
+        publishStrategy,
+        unreviewedConsent,
+        unreviewedCount,
       };
 
       registerPendingBatch(batch, {
@@ -2048,6 +2193,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         failedCount: 0,
         isLive: false,
         publishOnApproval: publish,
+        publishStrategy,
+        unreviewedConsent,
+        unreviewedCount,
         policyMessage,
         makerNotes: 'Automatically queued due to peak business hours restriction.',
         results: [],

@@ -99,7 +99,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
   async importCsv(ctx: any) {
     try {
-      const { uid, csvText, mode, publish } = ctx.request.body;
+      const { uid, csvText, mode, publish, publishStrategy, unreviewedConsent } = ctx.request.body;
       if (!uid) {
         ctx.status = 400;
         ctx.body = { success: false, error: 'Target collection UID is required.' };
@@ -115,6 +115,8 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       const result = await csvService.importCsv(uid, csvText, {
         mode: mode === 'update' ? 'update' : mode === 'create_or_override' ? 'create_or_override' : 'auto',
         publish: publish !== false,
+        publishStrategy: publishStrategy === 'all' ? 'all' : 'safe',
+        unreviewedConsent: Boolean(unreviewedConsent),
         user: ctx.state.user,
       });
 
@@ -127,7 +129,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
   async importChunk(ctx: any) {
     try {
-      const { uid, rows, batchId, isFirstChunk, isLastChunk, startRowNumber, mode, publish } = ctx.request.body;
+      const { uid, rows, batchId, isFirstChunk, isLastChunk, startRowNumber, mode, publish, publishStrategy, unreviewedConsent } = ctx.request.body;
       if (!uid) {
         ctx.status = 400;
         ctx.body = { success: false, error: 'Target collection UID is required.' };
@@ -147,6 +149,8 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         startRowNumber: typeof startRowNumber === 'number' ? startRowNumber : undefined,
         mode: mode === 'update' ? 'update' : mode === 'create_or_override' ? 'create_or_override' : 'auto',
         publish: publish !== false,
+        publishStrategy: publishStrategy === 'all' ? 'all' : 'safe',
+        unreviewedConsent: Boolean(unreviewedConsent),
         user: ctx.state.user,
       });
 
@@ -185,7 +189,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
   async submitBatch(ctx: any) {
     try {
-      const { uid, rows, executionMode, makerNotes, forceImmediate, mode, publish } = ctx.request.body;
+      const { uid, rows, executionMode, makerNotes, forceImmediate, mode, publish, publishStrategy, unreviewedConsent, unreviewedCount } = ctx.request.body;
       if (!uid) {
         ctx.status = 400;
         ctx.body = { success: false, error: 'Target collection UID is required.' };
@@ -204,6 +208,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         forceImmediate: Boolean(forceImmediate),
         mode: mode === 'update' ? 'update' : mode === 'create_or_override' ? 'create_or_override' : 'auto',
         publish: publish !== false,
+        publishStrategy: publishStrategy === 'all' ? 'all' : 'safe',
+        unreviewedConsent: Boolean(unreviewedConsent),
+        unreviewedCount: typeof unreviewedCount === 'number' ? unreviewedCount : 0,
         user: ctx.state.user,
       });
 

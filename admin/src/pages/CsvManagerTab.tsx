@@ -83,6 +83,14 @@ export default function CsvManagerTab() {
     validRows: number;
     estimatedUpdates: number;
     estimatedCreates: number;
+    lifecycleStats?: {
+      isDraftAndPublish: boolean;
+      totalChecked: number;
+      published: number;
+      modified: number;
+      draft: number;
+      unreviewedCount: number;
+    };
     hasErrors: boolean;
     hasWarnings: boolean;
     errors: Array<{ row: number; documentId?: string; error: string }>;
@@ -94,6 +102,8 @@ export default function CsvManagerTab() {
   const [showConfirmModal, setShowConfirmModal] = useState<boolean>(false);
   const [makerNotesInput, setMakerNotesInput] = useState<string>('');
   const [submittingBatch, setSubmittingBatch] = useState<boolean>(false);
+  const [publishStrategy, setPublishStrategy] = useState<'safe' | 'all'>('safe');
+  const [unreviewedConsent, setUnreviewedConsent] = useState<boolean>(false);
 
   useEffect(() => {
     fetchInitialData();
@@ -288,6 +298,8 @@ export default function CsvManagerTab() {
           startRowNumber,
           mode: importMode,
           publish: publishOnImport,
+          publishStrategy,
+          unreviewedConsent,
         });
 
         if (!res.data || !res.data.success) {
@@ -407,6 +419,9 @@ export default function CsvManagerTab() {
         forceImmediate,
         mode: importMode,
         publish: publishOnImport,
+        publishStrategy,
+        unreviewedConsent,
+        unreviewedCount: preflightReport?.lifecycleStats?.unreviewedCount || 0,
       });
 
       setShowConfirmModal(false);
@@ -865,7 +880,11 @@ export default function CsvManagerTab() {
                     variant="default"
                     size="L"
                     startIcon={<Check />}
-                    onClick={() => setShowConfirmModal(true)}
+                    onClick={() => {
+                      setPublishStrategy('safe');
+                      setUnreviewedConsent(false);
+                      setShowConfirmModal(true);
+                    }}
                     loading={importing || submittingBatch}
                   >
                     Review &amp; Import ({totalRows.toLocaleString()} Records)...
@@ -1165,6 +1184,30 @@ export default function CsvManagerTab() {
                 </Flex>
               </Box>
 
+              {/* Lifecycle Status Breakdown */}
+              {preflightReport?.lifecycleStats && preflightReport.lifecycleStats.isDraftAndPublish && (
+                <Box marginBottom={4} padding={3} background="neutral100" hasRadius style={{ border: '1px solid rgba(120, 120, 150, 0.15)' }}>
+                  <Typography variant="sigma" textColor="neutral600" marginBottom={2} display="block">
+                    LIFECYCLE STATUS BREAKDOWN ({preflightReport.lifecycleStats.totalChecked} Existing Records)
+                  </Typography>
+                  <Flex gap={2} wrap="wrap">
+                    <Badge backgroundColor="success100" textColor="success700">
+                      ✓ Published / Approved: {preflightReport.lifecycleStats.published}
+                    </Badge>
+                    {preflightReport.lifecycleStats.modified > 0 && (
+                      <Badge backgroundColor="primary100" textColor="primary700">
+                        📝 Modified (Unreviewed Revisions): {preflightReport.lifecycleStats.modified}
+                      </Badge>
+                    )}
+                    {preflightReport.lifecycleStats.draft > 0 && (
+                      <Badge backgroundColor="neutral200" textColor="neutral800">
+                        📄 Draft (Never Published): {preflightReport.lifecycleStats.draft}
+                      </Badge>
+                    )}
+                  </Flex>
+                </Box>
+              )}
+
               {/* Developer Server Execution Window Policy */}
               <Box padding={4} hasRadius marginBottom={4} background={executionWindow?.isBusinessHours ? 'warning100' : 'success100'}>
                 <Flex direction="column" gap={1}>
@@ -1205,6 +1248,115 @@ export default function CsvManagerTab() {
                 </Flex>
               </Box>
 
+              {/* Publishing Strategy Selection when Unreviewed Records are Selected */}
+              {publishOnImport && (preflightReport?.lifecycleStats?.unreviewedCount ?? 0) > 0 && (
+                <Box
+                  padding={4}
+                  background="neutral100"
+                  hasRadius
+                  marginBottom={4}
+                  style={{ border: '1px solid #d9d8ff' }}
+                >
+                  <Typography variant="sigma" textColor="neutral600" marginBottom={3} display="block">
+                    PUBLISHING STRATEGY &amp; GOVERNANCE CONSENT
+                  </Typography>
+                  <Flex direction="column" gap={3}>
+                    {/* Strategy 1: Safe Publishing (Recommended) */}
+                    <Box
+                      padding={3}
+                      hasRadius
+                      style={{
+                        border: publishStrategy === 'safe' ? '2px solid #4945ff' : '1px solid #eaeaef',
+                        backgroundColor: publishStrategy === 'safe' ? '#f0f0ff' : '#ffffff',
+                        cursor: 'pointer',
+                      }}
+                      onClick={() => {
+                        setPublishStrategy('safe');
+                        setUnreviewedConsent(false);
+                      }}
+                    >
+                      <Flex gap={2} alignItems="flex-start">
+                        <input
+                          type="radio"
+                          id="csv-strategy-safe"
+                          name="csvPublishStrategy"
+                          checked={publishStrategy === 'safe'}
+                          onChange={() => {
+                            setPublishStrategy('safe');
+                            setUnreviewedConsent(false);
+                          }}
+                          style={{ marginTop: 3 }}
+                        />
+                        <Box>
+                          <Typography fontWeight="bold" display="block">
+                            🛡️ Safe Publishing (Recommended)
+                          </Typography>
+                          <Typography variant="pi" textColor="neutral600">
+                            Only publish records that are already approved &amp; live ({preflightReport?.lifecycleStats?.published ?? 0} record{(preflightReport?.lifecycleStats?.published ?? 0) === 1 ? '' : 's'}). The {preflightReport?.lifecycleStats?.unreviewedCount ?? 0} unreviewed or draft record(s) will receive the CSV update in Draft mode without publishing unreviewed draft revisions to visitors.
+                          </Typography>
+                        </Box>
+                      </Flex>
+                    </Box>
+
+                    {/* Strategy 2: Publish All Selected */}
+                    <Box
+                      padding={3}
+                      hasRadius
+                      style={{
+                        border: publishStrategy === 'all' ? '2px solid #d02b20' : '1px solid #eaeaef',
+                        backgroundColor: publishStrategy === 'all' ? '#fff5f5' : '#ffffff',
+                        cursor: 'pointer',
+                      }}
+                      onClick={() => setPublishStrategy('all')}
+                    >
+                      <Flex gap={2} alignItems="flex-start">
+                        <input
+                          type="radio"
+                          id="csv-strategy-all"
+                          name="csvPublishStrategy"
+                          checked={publishStrategy === 'all'}
+                          onChange={() => setPublishStrategy('all')}
+                          style={{ marginTop: 3 }}
+                        />
+                        <Box>
+                          <Typography fontWeight="bold" textColor="danger700" display="block">
+                            ⚠️ Publish All Imported Records (Includes Unreviewed Drafts)
+                          </Typography>
+                          <Typography variant="pi" textColor="neutral600">
+                            Publish all affected records live to production immediately, pushing all pending unreviewed draft edits in the {preflightReport?.lifecycleStats?.unreviewedCount ?? 0} draft/modified record(s) live.
+                          </Typography>
+                        </Box>
+                      </Flex>
+                    </Box>
+
+                    {/* Mandatory Consent Checkbox for Force Publish All */}
+                    {publishStrategy === 'all' && (
+                      <Box
+                        padding={3}
+                        background="danger100"
+                        hasRadius
+                        style={{ border: '1px solid #f5c0b8' }}
+                      >
+                        <Flex gap={3} alignItems="flex-start">
+                          <Checkbox
+                            checked={unreviewedConsent}
+                            onValueChange={(checked: boolean) => setUnreviewedConsent(Boolean(checked))}
+                          />
+                          <Box style={{ cursor: 'pointer' }} onClick={() => setUnreviewedConsent(!unreviewedConsent)}>
+                            <Typography fontWeight="bold" textColor="danger700" display="block">
+                              Mandatory Risk Consent Required
+                            </Typography>
+                            <Typography variant="pi" textColor="danger700">
+                              I understand and explicitly consent that {preflightReport?.lifecycleStats?.unreviewedCount ?? 0} record(s) with unreviewed draft revisions or saved draft states will be published live to production visitors.
+                            </Typography>
+                          </Box>
+                        </Flex>
+                      </Box>
+                    )}
+                  </Flex>
+                </Box>
+              )}
+
               {/* Change Request / Release Notes */}
               <Box marginBottom={2}>
                 <TextInput
@@ -1218,66 +1370,75 @@ export default function CsvManagerTab() {
             </Box>
 
             {/* Modal Footer */}
-            <Box
-              padding={4}
-              background="neutral100"
-              style={{
-                borderTop: '1px solid rgba(120, 120, 150, 0.2)',
-                flexShrink: 0,
-                position: 'sticky',
-                bottom: 0,
-                zIndex: 20,
-                boxShadow: '0 -4px 16px rgba(0, 0, 0, 0.08)',
-              }}
-            >
-              <Flex justifyContent="space-between" alignItems="center" gap={3} style={{ width: '100%' }}>
-                <Button variant="tertiary" size="M" onClick={() => setShowConfirmModal(false)}>
-                  Cancel
-                </Button>
-                <Flex gap={2} wrap="wrap" justifyContent="flex-end" alignItems="center">
-                  {/* Maker-Checker Button */}
-                  <Button
-                    variant={executionWindow?.isBusinessHours ? 'default' : 'secondary'}
-                    size="M"
-                    onClick={() => submitBatchWithMode('maker_checker')}
-                    loading={submittingBatch}
-                  >
-                    Submit for Checker Approval
-                  </Button>
-
-                  {/* Scheduled Off-Peak Queue or Immediate Button */}
-                  {executionWindow?.isBusinessHours ? (
-                    <>
-                      <Button
-                        variant="secondary"
-                        size="M"
-                        onClick={() => submitBatchWithMode('queue_offpeak')}
-                        loading={submittingBatch}
-                      >
-                        Queue for Off-Peak ({executionWindow?.offPeakStartTime || '18:00'})
-                      </Button>
-                      <Button
-                        variant="danger-light"
-                        size="S"
-                        onClick={() => submitBatchWithMode('immediate', true)}
-                        loading={importing}
-                      >
-                        Force Run Now
-                      </Button>
-                    </>
-                  ) : (
-                    <Button
-                      variant="default"
-                      size="M"
-                      onClick={() => submitBatchWithMode('immediate')}
-                      loading={importing}
-                    >
-                      Confirm &amp; Execute Now
+            {(() => {
+              const isConsentRequired = publishOnImport && (preflightReport?.lifecycleStats?.unreviewedCount ?? 0) > 0 && publishStrategy === 'all' && !unreviewedConsent;
+              return (
+                <Box
+                  padding={4}
+                  background="neutral100"
+                  style={{
+                    borderTop: '1px solid rgba(120, 120, 150, 0.2)',
+                    flexShrink: 0,
+                    position: 'sticky',
+                    bottom: 0,
+                    zIndex: 20,
+                    boxShadow: '0 -4px 16px rgba(0, 0, 0, 0.08)',
+                  }}
+                >
+                  <Flex justifyContent="space-between" alignItems="center" gap={3} style={{ width: '100%' }}>
+                    <Button variant="tertiary" size="M" onClick={() => setShowConfirmModal(false)}>
+                      Cancel
                     </Button>
-                  )}
-                </Flex>
-              </Flex>
-            </Box>
+                    <Flex gap={2} wrap="wrap" justifyContent="flex-end" alignItems="center">
+                      {/* Maker-Checker Button */}
+                      <Button
+                        variant={executionWindow?.isBusinessHours ? 'default' : 'secondary'}
+                        size="M"
+                        onClick={() => submitBatchWithMode('maker_checker')}
+                        loading={submittingBatch}
+                        disabled={isConsentRequired}
+                      >
+                        Submit for Checker Approval
+                      </Button>
+
+                      {/* Scheduled Off-Peak Queue or Immediate Button */}
+                      {executionWindow?.isBusinessHours ? (
+                        <>
+                          <Button
+                            variant="secondary"
+                            size="M"
+                            onClick={() => submitBatchWithMode('queue_offpeak')}
+                            loading={submittingBatch}
+                            disabled={isConsentRequired}
+                          >
+                            Queue for Off-Peak ({executionWindow?.offPeakStartTime || '18:00'})
+                          </Button>
+                          <Button
+                            variant="danger-light"
+                            size="S"
+                            onClick={() => submitBatchWithMode('immediate', true)}
+                            loading={importing}
+                            disabled={isConsentRequired}
+                          >
+                            Force Run Now
+                          </Button>
+                        </>
+                      ) : (
+                        <Button
+                          variant="default"
+                          size="M"
+                          onClick={() => submitBatchWithMode('immediate')}
+                          loading={importing}
+                          disabled={isConsentRequired}
+                        >
+                          Confirm &amp; Execute Now
+                        </Button>
+                      )}
+                    </Flex>
+                  </Flex>
+                </Box>
+              );
+            })()}
           </Box>
         </div>
       )}
