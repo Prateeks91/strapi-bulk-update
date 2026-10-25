@@ -1983,9 +1983,45 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         const targetAttrSchema = isNestedAttr
           ? getLeafAttributeSchema(contentType, strapi.components, targetFilterAttr)
           : attrs[resolvedFilterAttr];
+        const isRelation = targetAttrSchema?.type === 'relation';
         const isStringLike = ['string', 'text', 'email', 'richtext', 'uid'].includes(targetAttrSchema?.type);
 
-        if (normOp === 'empty') {
+        if (isRelation) {
+          const targetUid = targetAttrSchema?.target;
+          const targetContentType = targetUid ? strapi.contentTypes[targetUid] : undefined;
+          const targetAttrs = targetContentType?.attributes || {};
+          const targetStringAttrs = Object.keys(targetAttrs).filter((k) =>
+            ['string', 'text', 'email', 'uid'].includes(targetAttrs[k]?.type)
+          );
+
+          if (normOp === 'empty') {
+            condition = { documentId: { $null: true } };
+          } else if (normOp === 'notempty') {
+            condition = { documentId: { $notNull: true } };
+          } else if (q !== '') {
+            const orConditions: any[] = [];
+            targetStringAttrs.slice(0, 5).forEach((k) => {
+              if (normOp === 'equals') {
+                orConditions.push({ [k]: { $eqi: q } });
+              } else if (normOp === 'startswith') {
+                orConditions.push({ [k]: { $startsWithi: q } });
+              } else if (normOp === 'endswith') {
+                orConditions.push({ [k]: { $endsWithi: q } });
+              } else if (normOp === 'notequals') {
+                orConditions.push({ [k]: { $ne: q } });
+              } else if (normOp === 'notcontains') {
+                orConditions.push({ [k]: { $notContainsi: q } });
+              } else {
+                orConditions.push({ [k]: { $containsi: q } });
+              }
+            });
+            orConditions.push({ documentId: { $eq: q } });
+            if (/^\d+$/.test(q)) {
+              orConditions.push({ id: { $eq: Number(q) } });
+            }
+            condition = orConditions.length === 1 ? orConditions[0] : { $or: orConditions };
+          }
+        } else if (normOp === 'empty') {
           condition = isStringLike ? { $or: [{ $null: true }, { $eq: '' }] } : { $null: true };
         } else if (normOp === 'notempty') {
           condition = isStringLike ? { $and: [{ $notNull: true }, { $ne: '' }] } : { $notNull: true };
@@ -2122,14 +2158,39 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           const passesDzFilter = (entry: any) => {
             const matches = getAllNestedValues(entry, targetFilterAttr);
             if (normOp === 'empty') {
-              return matches.length === 0 || matches.every((m) => m.value === undefined || m.value === null || String(m.value).trim() === '');
+              return matches.length === 0 || matches.every((m) => {
+                const v = m.value;
+                if (v === undefined || v === null) return true;
+                if (Array.isArray(v)) return v.length === 0;
+                if (typeof v === 'object') return Object.keys(v).length === 0;
+                return String(v).trim() === '';
+              });
             }
             if (normOp === 'notempty') {
-              return matches.some((m) => m.value !== undefined && m.value !== null && String(m.value).trim() !== '');
+              return matches.some((m) => {
+                const v = m.value;
+                if (v === undefined || v === null) return false;
+                if (Array.isArray(v)) return v.length > 0;
+                if (typeof v === 'object') return Object.keys(v).length > 0;
+                return String(v).trim() !== '';
+              });
             }
-            return matches.some((m) => {
-              if (m.value === undefined || m.value === null) return false;
-              const valStr = String(m.value).toLowerCase();
+
+            const testSingleValue = (v: any): boolean => {
+              if (v === undefined || v === null) return false;
+              if (Array.isArray(v)) return v.some(testSingleValue);
+              if (typeof v === 'object') {
+                return (
+                  testSingleValue(v.name) ||
+                  testSingleValue(v.title) ||
+                  testSingleValue(v.email) ||
+                  testSingleValue(v.username) ||
+                  testSingleValue(v.documentId) ||
+                  testSingleValue(v.id) ||
+                  testSingleValue(v.slug)
+                );
+              }
+              const valStr = String(v).toLowerCase();
               switch (normOp) {
                 case 'equals': return valStr === qVal;
                 case 'notequals': return valStr !== qVal;
@@ -2139,7 +2200,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
                 case 'endswith': return valStr.endsWith(qVal);
                 default: return true;
               }
-            });
+            };
+
+            return matches.some((m) => testSingleValue(m.value));
           };
 
           const matchedEntries = (rawEntries || []).filter(passesDzFilter);

@@ -1207,12 +1207,37 @@ const BulkUpdater: React.FC = () => {
     } catch {}
   };
 
+  const [searchRelationOptions, setSearchRelationOptions] = useState<Array<{ documentId: string; label: string }>>([]);
+  const [searchRelationOptionsLoading, setSearchRelationOptionsLoading] = useState<boolean>(false);
+
+  const fetchSearchRelationOptions = async (targetUid: string) => {
+    try {
+      setSearchRelationOptionsLoading(true);
+      const res = await get(`/bulk-updater/relation-options?targetUid=${encodeURIComponent(targetUid)}`);
+      if (res.data && res.data.success) {
+        setSearchRelationOptions(res.data.options || []);
+      }
+    } catch {
+      setSearchRelationOptions([]);
+    } finally {
+      setSearchRelationOptionsLoading(false);
+    }
+  };
+
   // Search Attribute (separate from update attribute)
   const [searchAttribute, setSearchAttribute] = useState<string>('');
   const [searchAttributeInput, setSearchAttributeInput] = useState<string>('');
   const [attributesMeta, setAttributesMeta] = useState<Record<string, { depth: number; type: string; component?: string; isRelation?: boolean }>>({});
 
   const effectiveSearchAttribute = searchAttribute || selectedAttribute;
+
+  useEffect(() => {
+    if (effectiveSearchAttribute && relationsMeta[effectiveSearchAttribute]) {
+      fetchSearchRelationOptions(relationsMeta[effectiveSearchAttribute].targetUid);
+    } else {
+      setSearchRelationOptions([]);
+    }
+  }, [effectiveSearchAttribute, relationsMeta]);
 
   // Target Value Filter state ("Find items with a certain value first")
   type FilterOperator = 'none' | 'empty' | 'not_empty' | 'equals' | 'contains' | 'starts_with';
@@ -1925,25 +1950,56 @@ const BulkUpdater: React.FC = () => {
       const isValEmpty =
         val === undefined ||
         val === null ||
+        (Array.isArray(val) && val.length === 0) ||
         displayStr.trim() === '' ||
         displayStr.trim().toLowerCase() === '(not set)' ||
         displayStr.trim().toLowerCase() === '(empty / not set)' ||
         displayStr.trim().toLowerCase() === '(empty / unlinked)';
 
-      switch (filterOperator) {
-        case 'empty':
-          return isValEmpty;
-        case 'not_empty':
-          return !isValEmpty;
-        case 'equals':
-          return !isValEmpty && displayStr.trim().toLowerCase() === filterQuery.trim().toLowerCase();
-        case 'contains':
-          return !isValEmpty && displayStr.toLowerCase().includes(filterQuery.trim().toLowerCase());
-        case 'starts_with':
-          return !isValEmpty && displayStr.trim().toLowerCase().startsWith(filterQuery.trim().toLowerCase());
-        default:
-          return true;
+      if (filterOperator === 'empty') return isValEmpty;
+      if (filterOperator === 'not_empty') return !isValEmpty;
+      if (isValEmpty) return false;
+
+      const q = filterQuery.trim().toLowerCase();
+      if (!q) return true;
+
+      const testString = (str: any): boolean => {
+        if (str === undefined || str === null) return false;
+        const s = String(str).trim().toLowerCase();
+        switch (filterOperator) {
+          case 'equals':
+            return s === q;
+          case 'contains':
+            return s.includes(q);
+          case 'starts_with':
+            return s.startsWith(q);
+          default:
+            return true;
+        }
+      };
+
+      const testEntityObject = (obj: any): boolean => {
+        if (!obj || typeof obj !== 'object') return false;
+        if (testString(obj.name)) return true;
+        if (testString(obj.title)) return true;
+        if (testString(obj.email)) return true;
+        if (testString(obj.username)) return true;
+        if (testString(obj.documentId)) return true;
+        if (testString(String(obj.id))) return true;
+        if (testString(obj.slug)) return true;
+        if (testString(formatDisplayValue(obj))) return true;
+        return false;
+      };
+
+      if (Array.isArray(val)) {
+        return val.some((item) => (typeof item === 'object' ? testEntityObject(item) : testString(item)));
       }
+
+      if (typeof val === 'object' && val !== null) {
+        if (testEntityObject(val)) return true;
+      }
+
+      return testString(displayStr);
     };
 
     if (filterOperator === 'empty') {
@@ -3148,13 +3204,43 @@ const BulkUpdater: React.FC = () => {
 
                   {/* Value query input if needed */}
                   {(filterOperator === 'equals' || filterOperator === 'contains' || filterOperator === 'starts_with') && (
-                    <Box style={{ flex: 1, minWidth: 180 }}>
-                      <TextInput
-                        label={effectiveSearchAttribute ? `Value for "${effectiveSearchAttribute}"` : 'Value to match'}
-                        placeholder="Type value to match..."
-                        value={filterQuery}
-                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFilterQuery(e.target.value)}
-                      />
+                    <Box style={{ flex: 1, minWidth: 200 }}>
+                      {effectiveSearchAttribute && relationsMeta[effectiveSearchAttribute] ? (
+                        <Field.Root>
+                          <Field.Label>{`Target ${relationsMeta[effectiveSearchAttribute].targetDisplayName} Relation`}</Field.Label>
+                          <Combobox
+                            autocomplete={{ type: 'list', filter: 'contains' }}
+                            placeholder={
+                              searchRelationOptionsLoading
+                                ? 'Loading entities...'
+                                : `Search & pick ${relationsMeta[effectiveSearchAttribute].targetDisplayName} or type text...`
+                            }
+                            value={filterQuery}
+                            onClear={() => setFilterQuery('')}
+                            onChange={(val: any) => {
+                              if (typeof val === 'string') {
+                                setFilterQuery(val);
+                              }
+                            }}
+                            onInputChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+                              setFilterQuery(e.target.value);
+                            }}
+                          >
+                            {searchRelationOptions.map((opt) => (
+                              <ComboboxOption key={opt.documentId} value={opt.label} textValue={opt.label}>
+                                {opt.label}
+                              </ComboboxOption>
+                            ))}
+                          </Combobox>
+                        </Field.Root>
+                      ) : (
+                        <TextInput
+                          label={effectiveSearchAttribute ? `Value for "${effectiveSearchAttribute}"` : 'Value to match'}
+                          placeholder="Type value to match..."
+                          value={filterQuery}
+                          onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFilterQuery(e.target.value)}
+                        />
+                      )}
                     </Box>
                   )}
 
