@@ -387,7 +387,23 @@ function getNestedExportValue(entry: any, path: string): any {
         .join('; ');
     }
 
-    current = current[part];
+    if (current && typeof current === 'object') {
+      if (current[part] !== undefined) {
+        current = current[part];
+      } else {
+        const camel = part.replace(/_([a-z0-9])/g, (_, l) => l.toUpperCase());
+        const snake = part.replace(/([A-Z])/g, '_$1').toLowerCase();
+        if (current[camel] !== undefined) {
+          current = current[camel];
+        } else if (current[snake] !== undefined) {
+          current = current[snake];
+        } else {
+          current = undefined;
+        }
+      }
+    } else {
+      current = undefined;
+    }
   }
 
   if (current === null || current === undefined) return '';

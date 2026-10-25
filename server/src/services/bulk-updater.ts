@@ -51,6 +51,81 @@ let staticSchemaCache: {
 } | null = null;
 
 /**
+ * Ensures consistent two-way mapping for timestamp aliases (updated_at <-> updatedAt,
+ * created_at <-> createdAt, published_at <-> publishedAt) so columns in any collection
+ * (such as st-feature with updated_at) are properly reflected regardless of source.
+ */
+export function formatEntryRecord(entry: any): any {
+  if (!entry || typeof entry !== 'object') return entry;
+  const formatted: any = {
+    id: entry.id,
+    documentId: entry.documentId,
+    ...entry,
+  };
+  if (entry.updatedAt !== undefined && formatted.updated_at === undefined) {
+    formatted.updated_at = entry.updatedAt;
+  }
+  if (entry.updated_at !== undefined && formatted.updatedAt === undefined) {
+    formatted.updatedAt = entry.updated_at;
+  }
+  if (entry.createdAt !== undefined && formatted.created_at === undefined) {
+    formatted.created_at = entry.createdAt;
+  }
+  if (entry.created_at !== undefined && formatted.createdAt === undefined) {
+    formatted.createdAt = entry.created_at;
+  }
+  if (entry.publishedAt !== undefined && formatted.published_at === undefined) {
+    formatted.published_at = entry.publishedAt;
+  }
+  if (entry.published_at !== undefined && formatted.publishedAt === undefined) {
+    formatted.publishedAt = entry.published_at;
+  }
+  return formatted;
+}
+
+/**
+ * Resolves a sort or filter field name against a content type schema,
+ * checking system timestamps (updatedAt <-> updated_at, createdAt <-> created_at, publishedAt <-> published_at),
+ * standard identifiers (id, documentId), and snake_case <-> camelCase attribute variants.
+ */
+export function resolveContentTypeField(contentType: any, field: string): string | null {
+  if (!field) return null;
+  const attrs = contentType?.attributes || {};
+  if (attrs[field]) return field;
+
+  // 1. System timestamp & identifier resolution
+  if (field === 'updated_at' || field === 'updatedAt') {
+    return attrs['updated_at'] ? 'updated_at' : 'updatedAt';
+  }
+  if (field === 'created_at' || field === 'createdAt') {
+    return attrs['created_at'] ? 'created_at' : 'createdAt';
+  }
+  if (field === 'published_at' || field === 'publishedAt') {
+    return attrs['published_at'] ? 'published_at' : 'publishedAt';
+  }
+  if (field === 'id' || field === 'documentId') {
+    return field;
+  }
+
+  // 2. snake_case -> camelCase
+  const camel = field.replace(/_([a-z0-9])/g, (_, l) => l.toUpperCase());
+  if (attrs[camel]) return camel;
+
+  // 3. camelCase -> snake_case
+  const snake = field.replace(/([A-Z])/g, '_$1').toLowerCase();
+  if (attrs[snake]) return snake;
+
+  // 4. Case-insensitive / underscore-insensitive match across attributes
+  const lower = field.toLowerCase().replace(/_/g, '');
+  const matched = Object.keys(attrs).find(
+    (k) => k.toLowerCase().replace(/_/g, '') === lower
+  );
+  if (matched) return matched;
+
+  return null;
+}
+
+/**
  * Builds a recursive Strapi 5 populate tree for deep nested components, relations, and media
  */
 export function buildDeepPopulate(
@@ -1736,11 +1811,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
               totalCount = 0;
             }
 
-            const formattedEntries = (entries || []).map((entry: any) => ({
-              id: entry.id,
-              documentId: entry.documentId,
-              ...entry,
-            }));
+            const formattedEntries = (entries || []).map(formatEntryRecord);
 
             modelsCache.set(uid, {
               signature,
@@ -1860,21 +1931,26 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       let isRootDz = false;
       let parts: string[] = [];
 
+      let resolvedFilterAttr = targetFilterAttr;
       if (targetFilterAttr) {
-        const parsed = parseDynamicZonePath(targetFilterAttr);
-        if (parsed.rootKey && contentType.attributes?.[parsed.rootKey]?.type === 'dynamiczone') {
-          isRootDz = true;
+        const resolvedField = resolveContentTypeField(contentType, targetFilterAttr);
+        if (resolvedField) {
+          resolvedFilterAttr = resolvedField;
           colHasAttribute = true;
-          isNestedAttr = true;
-          parts = parsed.cleanPath.split('.');
-        } else if (targetFilterAttr.includes('.') || targetFilterAttr.includes('[')) {
-          isNestedAttr = isDeepComponentField(contentType, strapi.components, targetFilterAttr);
-          if (isNestedAttr) {
+        } else {
+          const parsed = parseDynamicZonePath(targetFilterAttr);
+          if (parsed.rootKey && contentType.attributes?.[parsed.rootKey]?.type === 'dynamiczone') {
+            isRootDz = true;
             colHasAttribute = true;
+            isNestedAttr = true;
             parts = parsed.cleanPath.split('.');
+          } else if (targetFilterAttr.includes('.') || targetFilterAttr.includes('[')) {
+            isNestedAttr = isDeepComponentField(contentType, strapi.components, targetFilterAttr);
+            if (isNestedAttr) {
+              colHasAttribute = true;
+              parts = parsed.cleanPath.split('.');
+            }
           }
-        } else if (attrs[targetFilterAttr]) {
-          colHasAttribute = true;
         }
       }
 
@@ -1906,7 +1982,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
         const targetAttrSchema = isNestedAttr
           ? getLeafAttributeSchema(contentType, strapi.components, targetFilterAttr)
-          : attrs[targetFilterAttr];
+          : attrs[resolvedFilterAttr];
         const isStringLike = ['string', 'text', 'email', 'richtext', 'uid'].includes(targetAttrSchema?.type);
 
         if (normOp === 'empty') {
@@ -1948,13 +2024,13 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           } else {
             if (normOp === 'empty' && isStringLike) {
               filters.$or = [
-                { [targetFilterAttr]: { $null: true } },
-                { [targetFilterAttr]: { $eq: '' } },
+                { [resolvedFilterAttr]: { $null: true } },
+                { [resolvedFilterAttr]: { $eq: '' } },
               ];
             } else if (normOp === 'notempty' && isStringLike) {
-              filters[targetFilterAttr] = { $notNull: true, $ne: '' };
+              filters[resolvedFilterAttr] = { $notNull: true, $ne: '' };
             } else {
-              filters[targetFilterAttr] = condition;
+              filters[resolvedFilterAttr] = condition;
             }
           }
         }
@@ -2001,7 +2077,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           displayName: contentType.info?.displayName || uid,
           isSingleType: true,
           draftAndPublish: Boolean(contentType.options?.draftAndPublish),
-          entries: singleDoc ? [singleDoc] : [],
+          entries: singleDoc ? [formatEntryRecord(singleDoc)] : [],
           pagination: {
             page: 1,
             pageSize: 1,
@@ -2018,8 +2094,13 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           } else {
             sortClause['createdAt'] = 'desc';
           }
-        } else if (sortField && contentType.attributes?.[sortField]) {
-          sortClause[sortField] = sortOrder;
+        } else if (sortField) {
+          const resolvedField = resolveContentTypeField(contentType, sortField);
+          if (resolvedField) {
+            sortClause[resolvedField] = sortOrder;
+          } else {
+            sortClause['createdAt'] = 'desc';
+          }
         } else {
           sortClause['createdAt'] = 'desc';
         }
@@ -2070,11 +2151,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
             displayName: contentType.info?.displayName || uid,
             isSingleType: false,
             draftAndPublish: Boolean(contentType.options?.draftAndPublish),
-            entries: paginatedEntries.map((entry: any) => ({
-              id: entry.id,
-              documentId: entry.documentId,
-              ...entry,
-            })),
+            entries: paginatedEntries.map(formatEntryRecord),
             pagination: {
               page: currentPage,
               pageSize: limit,
@@ -2105,11 +2182,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
             displayName: contentType.info?.displayName || uid,
             isSingleType: false,
             draftAndPublish: Boolean(contentType.options?.draftAndPublish),
-            entries: (entries || []).map((entry: any) => ({
-              id: entry.id,
-              documentId: entry.documentId,
-              ...entry,
-            })),
+            entries: (entries || []).map(formatEntryRecord),
             pagination: {
               page: currentPage,
               pageSize: limit,

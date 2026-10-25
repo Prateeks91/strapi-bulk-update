@@ -229,7 +229,7 @@ export function getAllNestedValues(
   const parts = parsed.cleanPath.split('.');
   const [head, ...tail] = parts;
 
-  const rootTarget = obj[head];
+  const rootTarget = getPropertyValue(obj, head);
 
   // If rootTarget is an Array (Dynamic Zone or Repeatable Component)
   if (Array.isArray(rootTarget)) {
@@ -273,6 +273,44 @@ export function getAllNestedValues(
 }
 
 /**
+ * Robust property value resolver:
+ * Matches direct key, snake_case <-> camelCase aliases (e.g. updated_at <-> updatedAt, created_at <-> createdAt),
+ * and case-insensitive fallback.
+ */
+export function getPropertyValue(target: any, key: string): any {
+  if (!target || typeof target !== 'object' || !key) return undefined;
+
+  // 1. Direct match
+  if (target[key] !== undefined && target[key] !== null) return target[key];
+
+  // 2. snake_case -> camelCase (e.g. updated_at -> updatedAt, created_at -> createdAt)
+  const camelKey = key.replace(/_([a-z0-9])/g, (_, letter) => letter.toUpperCase());
+  if (target[camelKey] !== undefined && target[camelKey] !== null) return target[camelKey];
+
+  // 3. camelCase -> snake_case (e.g. updatedAt -> updated_at, createdAt -> created_at)
+  const snakeKey = key.replace(/([A-Z])/g, '_$1').toLowerCase();
+  if (target[snakeKey] !== undefined && target[snakeKey] !== null) return target[snakeKey];
+
+  // 4. Case-insensitive / underscore-insensitive match
+  const lowerKey = key.toLowerCase();
+  const lowerNoUnderscore = lowerKey.replace(/_/g, '');
+  const matchedKey = Object.keys(target).find((k) => {
+    const kLower = k.toLowerCase();
+    return kLower === lowerKey || kLower.replace(/_/g, '') === lowerNoUnderscore;
+  });
+  if (matchedKey && target[matchedKey] !== undefined && target[matchedKey] !== null) {
+    return target[matchedKey];
+  }
+
+  // 5. Fallback: check key presence
+  if (key in target) return target[key];
+  if (camelKey in target) return target[camelKey];
+  if (snakeKey in target) return target[snakeKey];
+
+  return undefined;
+}
+
+/**
  * Safely resolves a nested dot-notation property across objects and dynamic zone / repeatable component arrays.
  */
 export function getNestedValue(obj: any, path: string): any {
@@ -294,13 +332,13 @@ export function getNestedValue(obj: any, path: string): any {
         const item = current[idx];
         if (parsed.targetIndex !== undefined && idx !== parsed.targetIndex) continue;
         if (parsed.targetComponentUid && item?.__component !== parsed.targetComponentUid) continue;
-        const found = extract(item?.[head], tail);
+        const found = extract(getPropertyValue(item, head), tail);
         if (found !== undefined && found !== null) return found;
       }
       return undefined;
     }
 
-    return extract(current[head], tail);
+    return extract(getPropertyValue(current, head), tail);
   }
 
   return extract(obj, parts);
@@ -337,25 +375,63 @@ export function getAvailableColumnsForCollection(
       return;
     }
     let formattedLabel = attr;
-    const bracketMatch = attr.match(/^([^.[]+)\[([^\]]+)\]\.(.+)$/);
-    if (bracketMatch) {
-      const root = bracketMatch[1].charAt(0).toUpperCase() + bracketMatch[1].slice(1);
-      const comp = formatComponentName(bracketMatch[2]);
-      const sub = bracketMatch[3].split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
-      formattedLabel = `${root} [${comp}] > ${sub}`;
-    } else if (attr.includes('.')) {
-      formattedLabel = attr.split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
+    if (attr === 'updated_at' || attr === 'updatedAt') {
+      formattedLabel = 'Updated At';
+    } else if (attr === 'created_at' || attr === 'createdAt') {
+      formattedLabel = 'Created At';
+    } else if (attr === 'published_at' || attr === 'publishedAt') {
+      formattedLabel = 'Published At';
     } else {
-      formattedLabel = attr.charAt(0).toUpperCase() + attr.slice(1);
+      const bracketMatch = attr.match(/^([^.[]+)\[([^\]]+)\]\.(.+)$/);
+      if (bracketMatch) {
+        const root = bracketMatch[1].charAt(0).toUpperCase() + bracketMatch[1].slice(1);
+        const comp = formatComponentName(bracketMatch[2]);
+        const sub = bracketMatch[3].split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
+        formattedLabel = `${root} [${comp}] > ${sub}`;
+      } else if (attr.includes('.')) {
+        formattedLabel = attr.split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
+      } else {
+        formattedLabel = attr.replace(/_/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase());
+      }
     }
 
     cols.push({
       key: `attr_${attr}`,
       label: formattedLabel,
       sortable: !col.isSingleType,
-      defaultVisible: ['department', 'email', 'location'].includes(attr),
+      defaultVisible: ['department', 'email', 'location', 'updated_at', 'updatedAt'].includes(attr),
     });
   });
+
+  // Ensure system timestamp columns are available to show/hide in the column picker if not already present
+  const hasUpdatedAt = candidateAttrs.some((a) => a === 'updatedAt' || a === 'updated_at');
+  const hasCreatedAt = candidateAttrs.some((a) => a === 'createdAt' || a === 'created_at');
+  const hasPublishedAt = candidateAttrs.some((a) => a === 'publishedAt' || a === 'published_at');
+
+  if (!hasUpdatedAt) {
+    cols.push({
+      key: 'attr_updatedAt',
+      label: 'Updated At',
+      sortable: !col.isSingleType,
+      defaultVisible: false,
+    });
+  }
+  if (!hasCreatedAt) {
+    cols.push({
+      key: 'attr_createdAt',
+      label: 'Created At',
+      sortable: !col.isSingleType,
+      defaultVisible: false,
+    });
+  }
+  if (!hasPublishedAt && col.draftAndPublish) {
+    cols.push({
+      key: 'attr_publishedAt',
+      label: 'Published At',
+      sortable: !col.isSingleType,
+      defaultVisible: false,
+    });
+  }
 
   // Dedicated search attribute column if searchAttribute differs from selectedAttribute
   if (searchAttribute && searchAttribute !== selectedAttribute) {
@@ -414,6 +490,165 @@ export function getAvailableColumnsForCollection(
   return cols;
 }
 
+export interface SortOptionItem {
+  field: string;
+  order: 'asc' | 'desc';
+  label: string;
+  columnLabel: string;
+  group: 'timestamps' | 'system' | 'attributes';
+}
+
+/**
+ * Returns a human-friendly display label of the active sort state.
+ */
+export function getActiveSortLabel(
+  currentSort: { field: string; order: 'asc' | 'desc' },
+  col: CollectionModel
+): string {
+  const f = currentSort.field;
+  const o = currentSort.order;
+  const dir = o === 'asc' ? '▲' : '▼';
+  if (f === 'updatedAt' || f === 'updated_at') {
+    return `Updated: ${o === 'desc' ? 'Newest' : 'Oldest'} ${dir}`;
+  }
+  if (f === 'createdAt' || f === 'created_at') {
+    return `Created: ${o === 'desc' ? 'Newest' : 'Oldest'} ${dir}`;
+  }
+  if (f === 'publishedAt' || f === 'published_at') {
+    return `Published: ${o === 'desc' ? 'Newest' : 'Oldest'} ${dir}`;
+  }
+  if (f === 'id') {
+    return `ID: ${o === 'desc' ? 'Highest' : 'Lowest'} ${dir}`;
+  }
+  let attrLabel = f;
+  if (f.includes('.')) {
+    attrLabel = f.split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
+  } else {
+    attrLabel = f.replace(/_/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase());
+  }
+  return `${attrLabel} (${o === 'asc' ? 'A → Z' : 'Z → A'} ${dir})`;
+}
+
+/**
+ * Generates a complete, searchable list of all sortable columns and directions for a collection.
+ */
+export function getSortOptionsForCollection(
+  col: CollectionModel,
+  selectedAttribute: string,
+  searchAttribute?: string
+): SortOptionItem[] {
+  const options: SortOptionItem[] = [];
+
+  // 1. Timestamps (Newest / Oldest)
+  const hasCustomUpdatedAt = col.attributes?.includes('updated_at');
+  const updatedField = hasCustomUpdatedAt ? 'updated_at' : 'updatedAt';
+  options.push({
+    field: updatedField,
+    order: 'desc',
+    label: 'Updated At (Newest First ↓)',
+    columnLabel: 'Updated At',
+    group: 'timestamps',
+  });
+  options.push({
+    field: updatedField,
+    order: 'asc',
+    label: 'Updated At (Oldest First ↑)',
+    columnLabel: 'Updated At',
+    group: 'timestamps',
+  });
+
+  const hasCustomCreatedAt = col.attributes?.includes('created_at');
+  const createdField = hasCustomCreatedAt ? 'created_at' : 'createdAt';
+  options.push({
+    field: createdField,
+    order: 'desc',
+    label: 'Created At (Newest First ↓)',
+    columnLabel: 'Created At',
+    group: 'timestamps',
+  });
+  options.push({
+    field: createdField,
+    order: 'asc',
+    label: 'Created At (Oldest First ↑)',
+    columnLabel: 'Created At',
+    group: 'timestamps',
+  });
+
+  if (col.draftAndPublish) {
+    const hasCustomPublishedAt = col.attributes?.includes('published_at');
+    const publishedField = hasCustomPublishedAt ? 'published_at' : 'publishedAt';
+    options.push({
+      field: publishedField,
+      order: 'desc',
+      label: 'Published At (Newest First ↓)',
+      columnLabel: 'Published At',
+      group: 'timestamps',
+    });
+    options.push({
+      field: publishedField,
+      order: 'asc',
+      label: 'Published At (Oldest First ↑)',
+      columnLabel: 'Published At',
+      group: 'timestamps',
+    });
+  }
+
+  // 2. System Identifiers
+  options.push({
+    field: 'id',
+    order: 'desc',
+    label: 'Entry ID (Highest First ↓)',
+    columnLabel: 'ID',
+    group: 'system',
+  });
+  options.push({
+    field: 'id',
+    order: 'asc',
+    label: 'Entry ID (Lowest First ↑)',
+    columnLabel: 'ID',
+    group: 'system',
+  });
+
+  // 3. Collection Attributes
+  const systemKeywords = [
+    'createdat',
+    'created_at',
+    'updatedat',
+    'updated_at',
+    'publishedat',
+    'published_at',
+    'id',
+    'documentid',
+  ];
+  const attrs = (col.attributes || []).filter((a) => !systemKeywords.includes(a.toLowerCase()));
+
+  attrs.forEach((attr) => {
+    let formattedLabel = attr;
+    if (attr.includes('.')) {
+      formattedLabel = attr.split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
+    } else {
+      formattedLabel = attr.replace(/_/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase());
+    }
+
+    options.push({
+      field: attr,
+      order: 'asc',
+      label: `${formattedLabel} (A → Z / Lowest ↑)`,
+      columnLabel: formattedLabel,
+      group: 'attributes',
+    });
+    options.push({
+      field: attr,
+      order: 'desc',
+      label: `${formattedLabel} (Z → A / Highest ↓)`,
+      columnLabel: formattedLabel,
+      group: 'attributes',
+    });
+  });
+
+  return options;
+}
+
 /**
  * Flat helper: Renders table header cell without nested JSX.
  */
@@ -434,10 +669,18 @@ function renderHeaderCell(
   }
 
   const isCurrentSorted =
-    (colDef.key === 'identifier' && (currentSort.field === 'name' || currentSort.field === 'title')) ||
+    (colDef.key === 'identifier' && (currentSort.field === 'name' || currentSort.field === 'title' || currentSort.field === 'id')) ||
     (colDef.key === 'search_attr' && currentSort.field === searchAttribute) ||
     (colDef.key === 'target_attr' && currentSort.field === selectedAttribute) ||
-    (colDef.key.startsWith('attr_') && currentSort.field === colDef.key.replace('attr_', ''));
+    (colDef.key.startsWith('attr_') && (
+      currentSort.field === colDef.key.replace('attr_', '') ||
+      (currentSort.field === 'updatedAt' && colDef.key === 'attr_updated_at') ||
+      (currentSort.field === 'updated_at' && colDef.key === 'attr_updatedAt') ||
+      (currentSort.field === 'createdAt' && colDef.key === 'attr_created_at') ||
+      (currentSort.field === 'created_at' && colDef.key === 'attr_createdAt') ||
+      (currentSort.field === 'publishedAt' && colDef.key === 'attr_published_at') ||
+      (currentSort.field === 'published_at' && colDef.key === 'attr_publishedAt')
+    ));
 
   const sortArrow = isCurrentSorted ? (currentSort.order === 'asc' ? '▲' : '▼') : '⇅';
 
@@ -474,11 +717,20 @@ function renderHeaderCell(
 }
 
 /**
- * Flat helper: Formats attribute values, gracefully handling relation objects and arrays.
+ * Flat helper: Formats attribute values, gracefully handling timestamps, relation objects, and arrays.
  */
 export function formatDisplayValue(val: any): string {
   if (val === undefined || val === null || val === '') {
     return '(empty / not set)';
+  }
+  if (val instanceof Date) {
+    return isNaN(val.getTime()) ? '(invalid date)' : val.toLocaleString();
+  }
+  if (typeof val === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(val)) {
+    const d = new Date(val);
+    if (!isNaN(d.getTime())) {
+      return d.toLocaleString();
+    }
   }
   if (Array.isArray(val)) {
     if (val.length === 0) return '(empty / unlinked)';
@@ -1005,6 +1257,8 @@ const BulkUpdater: React.FC = () => {
   const [collectionColumnVisibility, setCollectionColumnVisibility] = useState<Record<string, string[]>>({});
   const [openColumnPickerUid, setOpenColumnPickerUid] = useState<string | null>(null);
   const [columnSearchTerm, setColumnSearchTerm] = useState<string>('');
+  const [openSortPickerUid, setOpenSortPickerUid] = useState<string | null>(null);
+  const [sortSearchTerm, setSortSearchTerm] = useState<string>('');
 
   const toggleColumn = (colUid: string, colKey: string, availableCols: ColumnDef[]) => {
     setCollectionColumnVisibility((prev) => {
@@ -3067,46 +3321,135 @@ const BulkUpdater: React.FC = () => {
 
                       <Flex gap={3} alignItems="center" wrap="wrap">
                         {!col.isSingleType && (
-                          <Flex gap={2} alignItems="center">
-                            <Typography variant="pi" textColor="neutral600">
-                              Sort:
-                            </Typography>
-                            <Box style={{ width: 190 }}>
-                              <SingleSelect
-                                size="S"
-                                value={`${currentSort.field}:${currentSort.order}`}
-                                onChange={(val) => {
-                                  const [f, o] = String(val).split(':');
-                                  handleCollectionSortChange(col.uid, f, o as 'asc' | 'desc');
+                          <Box style={{ position: 'relative', display: 'inline-block' }}>
+                            <Button
+                              variant={openSortPickerUid === col.uid ? 'secondary' : 'tertiary'}
+                              size="S"
+                              onClick={() => {
+                                setOpenSortPickerUid(openSortPickerUid === col.uid ? null : col.uid);
+                                setSortSearchTerm('');
+                                if (openColumnPickerUid === col.uid) setOpenColumnPickerUid(null);
+                              }}
+                            >
+                              <Flex gap={1} alignItems="center">
+                                <Typography variant="pi" textColor="neutral600" fontWeight="bold">
+                                  Sort:
+                                </Typography>
+                                <Typography variant="pi" fontWeight="semiBold">
+                                  {getActiveSortLabel(currentSort, col)}
+                                </Typography>
+                              </Flex>
+                            </Button>
+
+                            {openSortPickerUid === col.uid && (
+                              <Box
+                                style={{
+                                  position: 'absolute',
+                                  top: 'calc(100% + 6px)',
+                                  left: 0,
+                                  zIndex: 220,
+                                  width: 330,
+                                  maxHeight: 440,
+                                  background: '#ffffff',
+                                  borderRadius: 8,
+                                  boxShadow: '0 10px 25px rgba(33, 33, 52, 0.18)',
+                                  border: '1px solid #dcdce4',
+                                  padding: 12,
+                                  display: 'flex',
+                                  flexDirection: 'column',
+                                  gap: 8,
                                 }}
                               >
-                                <SingleSelectOption value="createdAt:desc">Created: Newest</SingleSelectOption>
-                                <SingleSelectOption value="createdAt:asc">Created: Oldest</SingleSelectOption>
-                                {hasAttr && (
-                                  <>
-                                    <SingleSelectOption value={`${selectedAttribute}:asc`}>
-                                      {selectedAttribute} (A &rarr; Z)
-                                    </SingleSelectOption>
-                                    <SingleSelectOption value={`${selectedAttribute}:desc`}>
-                                      {selectedAttribute} (Z &rarr; A)
-                                    </SingleSelectOption>
-                                  </>
-                                )}
-                                {col.attributes.includes('name') && (
-                                  <>
-                                    <SingleSelectOption value="name:asc">Name (A &rarr; Z)</SingleSelectOption>
-                                    <SingleSelectOption value="name:desc">Name (Z &rarr; A)</SingleSelectOption>
-                                  </>
-                                )}
-                                {col.attributes.includes('title') && (
-                                  <>
-                                    <SingleSelectOption value="title:asc">Title (A &rarr; Z)</SingleSelectOption>
-                                    <SingleSelectOption value="title:desc">Title (Z &rarr; A)</SingleSelectOption>
-                                  </>
-                                )}
-                              </SingleSelect>
-                            </Box>
-                          </Flex>
+                                <Flex justifyContent="space-between" alignItems="center">
+                                  <Typography variant="pi" fontWeight="bold">
+                                    Sort by Column
+                                  </Typography>
+                                  <Button
+                                    variant="ghost"
+                                    size="S"
+                                    onClick={() => setOpenSortPickerUid(null)}
+                                    style={{ padding: '2px 6px', height: 'auto', minWidth: 'unset' }}
+                                  >
+                                    ✕
+                                  </Button>
+                                </Flex>
+
+                                <TextInput
+                                  size="S"
+                                  placeholder="Search columns to sort..."
+                                  value={sortSearchTerm}
+                                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSortSearchTerm(e.target.value)}
+                                />
+
+                                <Box
+                                  style={{
+                                    maxHeight: 320,
+                                    overflowY: 'auto',
+                                    display: 'flex',
+                                    flexDirection: 'column',
+                                    gap: 4,
+                                  }}
+                                >
+                                  {getSortOptionsForCollection(col, selectedAttribute, searchAttribute)
+                                    .filter((opt) => {
+                                      if (!sortSearchTerm.trim()) return true;
+                                      const term = sortSearchTerm.toLowerCase().trim();
+                                      return opt.label.toLowerCase().includes(term) || opt.field.toLowerCase().includes(term);
+                                    })
+                                    .map((opt) => {
+                                      const isSelected =
+                                        (currentSort.field === opt.field ||
+                                          (currentSort.field === 'updatedAt' && opt.field === 'updated_at') ||
+                                          (currentSort.field === 'updated_at' && opt.field === 'updatedAt') ||
+                                          (currentSort.field === 'createdAt' && opt.field === 'created_at') ||
+                                          (currentSort.field === 'created_at' && opt.field === 'createdAt')
+                                        ) && currentSort.order === opt.order;
+
+                                      return (
+                                        <Box
+                                          key={`${opt.field}:${opt.order}`}
+                                          onClick={() => {
+                                            handleCollectionSortChange(col.uid, opt.field, opt.order);
+                                            setOpenSortPickerUid(null);
+                                            setSortSearchTerm('');
+                                          }}
+                                          style={{
+                                            padding: '6px 10px',
+                                            borderRadius: 6,
+                                            cursor: 'pointer',
+                                            background: isSelected ? 'rgba(73, 69, 255, 0.12)' : 'transparent',
+                                            border: isSelected ? '1px solid #4945ff' : '1px solid transparent',
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            justifyContent: 'space-between',
+                                            transition: 'background 0.15s ease',
+                                          }}
+                                          onMouseEnter={(e) => {
+                                            if (!isSelected) e.currentTarget.style.background = '#f6f6f9';
+                                          }}
+                                          onMouseLeave={(e) => {
+                                            if (!isSelected) e.currentTarget.style.background = 'transparent';
+                                          }}
+                                        >
+                                          <Typography
+                                            variant="omega"
+                                            fontWeight={isSelected ? 'bold' : 'normal'}
+                                            textColor={isSelected ? 'primary700' : 'neutral800'}
+                                          >
+                                            {opt.label}
+                                          </Typography>
+                                          {isSelected && (
+                                            <Badge size="S" backgroundColor="primary100" textColor="primary700">
+                                              Active
+                                            </Badge>
+                                          )}
+                                        </Box>
+                                      );
+                                    })}
+                                </Box>
+                              </Box>
+                            )}
+                          </Box>
                         )}
 
                         {/* Searchable Columns Dropdown Popover */}
@@ -3118,6 +3461,7 @@ const BulkUpdater: React.FC = () => {
                             onClick={() => {
                               setOpenColumnPickerUid(openColumnPickerUid === col.uid ? null : col.uid);
                               setColumnSearchTerm('');
+                              if (openSortPickerUid === col.uid) setOpenSortPickerUid(null);
                             }}
                           >
                             Columns ({activeColumns.filter((c) => !c.isPermanent).length}/{availableColumns.filter((c) => !c.isPermanent).length})
