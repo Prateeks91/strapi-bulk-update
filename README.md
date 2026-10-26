@@ -47,6 +47,7 @@ Strapi allows editing entries individually or applying bulk actions within a sin
 - 👥 **Enterprise Maker-Checker Governance**:
   - Two-person rule: Makers propose bulk changes; authorized Checkers review detailed diffs before approval and execution.
   - Interactive Approvals Queue tab with status tracking (`PENDING`, `APPROVED`, `REJECTED`, `EXECUTED`).
+  - **4-Eyes Bulk Review Modal**: Side-by-side before & after diff inspector, itemized row-level change tracking, change KPI metrics breakdown (total, updates, creates, unchanged, skipped), and one-click offline CSV diff report export for compliance sign-off.
 - 🕒 **Timezone-Aware Off-Peak Scheduling**:
   - Configured at server init time via `config/plugins.ts`.
   - Server strictly enforces timezone evaluation via native `Intl.DateTimeFormat`.
@@ -238,6 +239,8 @@ All routes are mounted under `/bulk-updater` and protected by Strapi Admin authe
 | `GET` | `/bulk-updater/relation-options?targetUid=...` | Fetches relation candidate records for target content types. |
 | `POST` | `/bulk-updater/batch-update` | Submits or queues a bulk update payload. |
 | `GET` | `/bulk-updater/pending-batches` | Returns list of pending maker-checker batches and off-peak queues. |
+| `GET` | `/bulk-updater/batches/:batchId/diffs` | Retrieves itemized before/after entry diffs and KPI metrics for Checker review. |
+| `GET` | `/bulk-updater/batches/:batchId/diffs/export` | Exports itemized batch diffs as an offline CSV report for compliance audit. |
 | `POST` | `/bulk-updater/pending-batches/:id/approve` | Approves a pending batch (Checker action). |
 | `POST` | `/bulk-updater/pending-batches/:id/reject` | Rejects a pending batch with reason notes. |
 | `POST` | `/bulk-updater/pending-batches/:id/execute` | Executes an approved or off-peak queued batch. |
