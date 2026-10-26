@@ -3070,9 +3070,14 @@ const BulkUpdater: React.FC = () => {
                     <Field.Label>Target Collection Type</Field.Label>
                     <Combobox
                       key={`top-col-${selectedCollectionUid}`}
-                      autocomplete="none"
-                      placeholder="Select Collection Type..."
+                      autocomplete={{ type: 'list', filter: 'contains' }}
+                      placeholder="Search Collection Type..."
                       value={selectedCollectionUid || undefined}
+                      clearLabel="Clear collection selection"
+                      onClear={() => handleCollectionChange('')}
+                      onFocus={(e: React.FocusEvent<HTMLInputElement>) => {
+                        e.target.select();
+                      }}
                       onChange={(val: any) => {
                         if (val && typeof val === 'string') {
                           handleCollectionChange(val);
@@ -3204,13 +3209,16 @@ const BulkUpdater: React.FC = () => {
                       <Field.Label>Search Attribute</Field.Label>
                       <Combobox
                         key={`search-attr-${selectedCollectionUid}`}
-                        autocomplete="none"
+                        autocomplete={{ type: 'list', filter: 'contains' }}
                         placeholder={searchAttribute || `Same as Update (${selectedAttribute || 'None'})`}
                         value={searchAttribute || '__default__'}
                         clearLabel="Reset search attribute"
                         onClear={() => {
                           handleSearchAttributeChange('');
                           setSearchAttributeSearch('');
+                        }}
+                        onFocus={(e: React.FocusEvent<HTMLInputElement>) => {
+                          e.target.select();
                         }}
                         onInputChange={(e: React.ChangeEvent<HTMLInputElement>) => {
                           setSearchAttributeSearch(e.target.value);
@@ -4096,13 +4104,16 @@ const BulkUpdater: React.FC = () => {
                   <Field.Label>Attribute to Update</Field.Label>
                   <Combobox
                     key={`update-attr-${selectedCollectionUid}`}
-                    autocomplete="none"
+                    autocomplete={{ type: 'list', filter: 'contains' }}
                     placeholder="Search attribute by name or relation..."
                     value={selectedAttribute || undefined}
                     clearLabel="Clear attribute selection"
                     onClear={() => {
                       handleAttributeChange('');
                       setAttributeSearch('');
+                    }}
+                    onFocus={(e: React.FocusEvent<HTMLInputElement>) => {
+                      e.target.select();
                     }}
                     onInputChange={(e: React.ChangeEvent<HTMLInputElement>) => {
                       setAttributeSearch(e.target.value);

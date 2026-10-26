@@ -17,6 +17,8 @@ import {
   Alert,
   Checkbox,
   TextInput,
+  Combobox,
+  ComboboxOption,
 } from '@strapi/design-system';
 import { Download, Upload, ArrowClockwise, Check, ChevronLeft, ChevronRight, Eye } from '@strapi/icons';
 import { parseCsv, extractDocId } from '../utils/csvParser';
@@ -473,22 +475,35 @@ export default function CsvManagerTab() {
               <Typography variant="pi" fontWeight="bold" textColor="neutral800" marginBottom={2}>
                 Target Collection Type
               </Typography>
-              <SingleSelect
-                value={selectedUid}
-                onChange={(val: string) => {
-                  setSelectedUid(val);
+              <Combobox
+                key={`csv-col-${selectedUid}`}
+                value={selectedUid || undefined}
+                autocomplete={{ type: 'list', filter: 'contains' }}
+                placeholder="Search & select a collection..."
+                disabled={loadingCollections}
+                clearLabel="Clear collection selection"
+                onClear={() => {
+                  setSelectedUid('');
                   setImportResult(null);
                   setImportProgress(null);
                 }}
-                disabled={loadingCollections}
-                placeholder="Select a collection..."
+                onFocus={(e: React.FocusEvent<HTMLInputElement>) => {
+                  e.target.select();
+                }}
+                onChange={(val: any) => {
+                  if (val && typeof val === 'string') {
+                    setSelectedUid(val);
+                    setImportResult(null);
+                    setImportProgress(null);
+                  }
+                }}
               >
                 {collections.map((col) => (
-                  <SingleSelectOption key={col.uid} value={col.uid}>
+                  <ComboboxOption key={col.uid} value={col.uid} textValue={`${col.displayName} (${col.uid})`}>
                     {col.displayName} ({col.totalEntries ?? 0} records)
-                  </SingleSelectOption>
+                  </ComboboxOption>
                 ))}
-              </SingleSelect>
+              </Combobox>
             </Box>
 
             <Button
