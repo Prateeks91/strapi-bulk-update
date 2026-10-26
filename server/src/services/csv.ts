@@ -522,6 +522,27 @@ async function findExistingDocument(
   return null;
 }
 
+/**
+ * Recursively deep merges two component objects while preserving array values and existing properties.
+ */
+function deepMergeComponent(existingVal: any, newVal: any): any {
+  if (!existingVal || typeof existingVal !== 'object' || Array.isArray(existingVal)) {
+    return newVal;
+  }
+  if (!newVal || typeof newVal !== 'object' || Array.isArray(newVal)) {
+    return newVal;
+  }
+  const merged = { ...existingVal };
+  for (const k of Object.keys(newVal)) {
+    if (newVal[k] && typeof newVal[k] === 'object' && !Array.isArray(newVal[k])) {
+      merged[k] = deepMergeComponent(existingVal[k], newVal[k]);
+    } else if (newVal[k] !== undefined) {
+      merged[k] = newVal[k];
+    }
+  }
+  return merged;
+}
+
 export async function processCsvRows(
   strapi: Core.Strapi,
   ct: any,
@@ -577,32 +598,96 @@ export async function processCsvRows(
       if (SYSTEM_FIELD_KEYS.has(normalizedKey)) continue;
 
       if (key.includes('.')) {
-        const [parent, child] = key.split('.');
-        const parentDef = attrs[parent];
-        if (parentDef?.type === 'component' && !parentDef.repeatable && parentDef.component) {
-          const comp = strapi.components[parentDef.component];
-          const childDef = comp?.attributes?.[child];
-          if (childDef) {
-            if (!payload[parent]) payload[parent] = {};
-            let val: any = rawVal;
-            if (rawVal === '' || rawVal === null || rawVal === undefined) {
-              val = null;
-            } else if (childDef.type === 'integer' || childDef.type === 'biginteger') {
-              const parsedInt = parseInt(rawVal, 10);
-              val = isNaN(parsedInt) ? null : parsedInt;
-            } else if (childDef.type === 'float' || childDef.type === 'decimal') {
-              const parsedFloat = parseFloat(rawVal);
-              val = isNaN(parsedFloat) ? null : parsedFloat;
-            } else if (childDef.type === 'boolean') {
-              val = rawVal.toLowerCase() === 'true' || rawVal === '1';
-            } else if (childDef.type === 'json') {
-              try {
-                val = JSON.parse(rawVal);
-              } catch {
-                val = rawVal;
-              }
+        const parts = key.split('.');
+        let currentAttrs = attrs;
+        let currentTarget = payload;
+        let validPath = true;
+
+        for (let pIdx = 0; pIdx < parts.length; pIdx++) {
+          const part = parts[pIdx];
+          const isLeaf = pIdx === parts.length - 1;
+
+          if (isLeaf) {
+            let leafDef = currentAttrs[part];
+            if (!leafDef) {
+              const match = Object.keys(currentAttrs).find(
+                (k) => k.toLowerCase() === part.toLowerCase() || k.toLowerCase() === part.toLowerCase().replace(/\s+/g, '')
+              );
+              if (match) leafDef = currentAttrs[match];
             }
-            payload[parent][child] = val;
+            if (!leafDef) {
+              validPath = false;
+              break;
+            }
+
+            // Cast and assign leaf value
+            if (rawVal === '' || rawVal === null || rawVal === undefined) {
+              // Never set null for repeatable components, relations, or dynamic zones
+              if (leafDef.type !== 'dynamiczone' && !(leafDef.type === 'component' && leafDef.repeatable) && leafDef.type !== 'relation') {
+                currentTarget[part] = null;
+              }
+            } else if (leafDef.type === 'integer' || leafDef.type === 'biginteger') {
+              const parsedInt = parseInt(rawVal, 10);
+              currentTarget[part] = isNaN(parsedInt) ? null : parsedInt;
+            } else if (leafDef.type === 'float' || leafDef.type === 'decimal') {
+              const parsedFloat = parseFloat(rawVal);
+              currentTarget[part] = isNaN(parsedFloat) ? null : parsedFloat;
+            } else if (leafDef.type === 'boolean') {
+              currentTarget[part] = rawVal.toLowerCase() === 'true' || rawVal === '1';
+            } else if (leafDef.type === 'json') {
+              try {
+                currentTarget[part] = JSON.parse(rawVal);
+              } catch {
+                currentTarget[part] = rawVal;
+              }
+            } else if (leafDef.type === 'component' && leafDef.repeatable) {
+              try {
+                const parsed = JSON.parse(rawVal);
+                if (Array.isArray(parsed)) {
+                  currentTarget[part] = parsed;
+                }
+              } catch {}
+            } else if (leafDef.type === 'relation') {
+              try {
+                const parsed = JSON.parse(rawVal);
+                if (Array.isArray(parsed) || (typeof parsed === 'object' && parsed !== null)) {
+                  currentTarget[part] = parsed;
+                } else if (isValidDocId(rawVal)) {
+                  currentTarget[part] = rawVal;
+                }
+              } catch {
+                if (isValidDocId(rawVal)) {
+                  currentTarget[part] = rawVal;
+                }
+              }
+            } else {
+              currentTarget[part] = rawVal;
+            }
+          } else {
+            // Intermediate segment
+            let compDef = currentAttrs[part];
+            if (!compDef) {
+              const match = Object.keys(currentAttrs).find(
+                (k) => k.toLowerCase() === part.toLowerCase() || k.toLowerCase() === part.toLowerCase().replace(/\s+/g, '')
+              );
+              if (match) compDef = currentAttrs[match];
+            }
+
+            if (compDef?.type === 'component' && !compDef.repeatable && compDef.component) {
+              const comp = strapi.components[compDef.component];
+              if (!comp?.attributes) {
+                validPath = false;
+                break;
+              }
+              if (!currentTarget[part] || typeof currentTarget[part] !== 'object' || Array.isArray(currentTarget[part])) {
+                currentTarget[part] = {};
+              }
+              currentTarget = currentTarget[part];
+              currentAttrs = comp.attributes;
+            } else {
+              validPath = false;
+              break;
+            }
           }
         }
         continue;
@@ -746,7 +831,7 @@ export async function processCsvRows(
         const mergedPayload = { ...payload };
         for (const key of Object.keys(payload)) {
           if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
-            mergedPayload[key] = { ...((existing as any)[key] || {}), ...payload[key] };
+            mergedPayload[key] = deepMergeComponent((existing as any)[key], payload[key]);
           }
         }
 
@@ -825,7 +910,7 @@ export async function processCsvRows(
           const mergedPayload = { ...payload };
           for (const key of Object.keys(payload)) {
             if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
-              mergedPayload[key] = { ...((existing as any)[key] || {}), ...payload[key] };
+              mergedPayload[key] = deepMergeComponent((existing as any)[key], payload[key]);
             }
           }
 
@@ -939,7 +1024,7 @@ export async function processCsvRows(
           const mergedPayload = { ...payload };
           for (const key of Object.keys(payload)) {
             if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
-              mergedPayload[key] = { ...((existing as any)[key] || {}), ...payload[key] };
+              mergedPayload[key] = deepMergeComponent((existing as any)[key], payload[key]);
             }
           }
 
