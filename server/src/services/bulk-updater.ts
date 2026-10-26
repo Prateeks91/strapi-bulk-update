@@ -2008,7 +2008,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
               } else if (normOp === 'endswith') {
                 orConditions.push({ [k]: { $endsWithi: q } });
               } else if (normOp === 'notequals') {
-                orConditions.push({ [k]: { $ne: q } });
+                orConditions.push({ [k]: { $nei: q } });
               } else if (normOp === 'notcontains') {
                 orConditions.push({ [k]: { $notContainsi: q } });
               } else {
@@ -2026,12 +2026,22 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         } else if (normOp === 'notempty') {
           condition = isStringLike ? { $and: [{ $notNull: true }, { $ne: '' }] } : { $notNull: true };
         } else if (q !== '') {
+          let typedVal: any = q;
+          const isNumeric = ['integer', 'biginteger', 'float', 'decimal', 'number'].includes(targetAttrSchema?.type);
+          const isBoolean = targetAttrSchema?.type === 'boolean';
+          if (isNumeric && /^-?\d+(\.\d+)?$/.test(q)) {
+            typedVal = Number(q);
+          } else if (isBoolean) {
+            if (q.toLowerCase() === 'true') typedVal = true;
+            else if (q.toLowerCase() === 'false') typedVal = false;
+          }
+
           switch (normOp) {
             case 'equals':
-              condition = { $containsi: q };
+              condition = isStringLike ? { $eqi: q } : { $eq: typedVal };
               break;
             case 'notequals':
-              condition = { $notContainsi: q };
+              condition = isStringLike ? { $nei: q } : { $ne: typedVal };
               break;
             case 'contains':
               condition = { $containsi: q };
@@ -2040,10 +2050,10 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
               condition = { $notContainsi: q };
               break;
             case 'startswith':
-              condition = { $startsWith: q };
+              condition = { $startsWithi: q };
               break;
             case 'endswith':
-              condition = { $endsWith: q };
+              condition = { $endsWithi: q };
               break;
           }
         }
@@ -2190,7 +2200,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
                   testSingleValue(v.slug)
                 );
               }
-              const valStr = String(v).toLowerCase();
+              const valStr = String(v).trim().toLowerCase();
               switch (normOp) {
                 case 'equals': return valStr === qVal;
                 case 'notequals': return valStr !== qVal;

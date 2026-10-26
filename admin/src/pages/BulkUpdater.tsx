@@ -1999,7 +1999,7 @@ const BulkUpdater: React.FC = () => {
       }
 
       if (typeof val === 'object' && val !== null) {
-        if (testEntityObject(val)) return true;
+        return testEntityObject(val);
       }
 
       return testString(displayStr);
