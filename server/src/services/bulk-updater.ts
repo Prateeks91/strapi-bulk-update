@@ -3435,6 +3435,223 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
     },
 
     /**
+     * Inspect batch changes item-by-item for Maker-Checker 4-Eyes review
+     */
+    async getPendingBatchDiffs(batchId: string) {
+      if (!batchId) throw new Error('batchId is required');
+      const batch = pendingBatches.get(batchId);
+      if (!batch) {
+        throw new Error(`Pending batch "${batchId}" not found.`);
+      }
+
+      let previewRes: any = null;
+
+      if (batch.payload?.action === 'csv_import' || batch.id.startsWith('csv_')) {
+        const csvService = strapi.plugin('bulk-updater').service('csv');
+        previewRes = await csvService.previewCsvBatch(
+          batch.payload.uid,
+          batch.payload.rows || [],
+          batch.payload.options || {}
+        );
+      } else if (batch.payload?.action === 'publish') {
+        const selectedEntries = batch.payload.selectedEntries || [];
+        const selectedCollections = batch.payload.selectedCollections || [];
+        const targetsMap = new Map<string, { uid: string; documentId: string }>();
+
+        for (const colUid of selectedCollections) {
+          if (!strapi.contentTypes[colUid]) continue;
+          const entries = await (strapi.documents(colUid as any) as any).findMany();
+          for (const entry of (entries || []) as any[]) {
+            targetsMap.set(`${colUid}@@@${entry.documentId}`, { uid: colUid, documentId: entry.documentId });
+          }
+        }
+
+        for (const item of selectedEntries) {
+          if (!item.uid || !item.documentId) continue;
+          targetsMap.set(`${item.uid}@@@${item.documentId}`, { uid: item.uid, documentId: item.documentId });
+        }
+
+        const diffs: any[] = [];
+        let willUpdate = 0;
+        let unchanged = 0;
+
+        for (const target of targetsMap.values()) {
+          const ct = strapi.contentTypes[target.uid];
+          const displayName = ct?.info?.displayName || target.uid;
+          try {
+            const doc: any = await (strapi.documents(target.uid as any) as any).findOne({
+              documentId: target.documentId,
+            });
+            const label = doc ? doc.title || doc.name || doc.slug || doc.documentId : target.documentId;
+            const isLive = Boolean(doc?.publishedAt) && doc?.status !== 'modified';
+            const currentStatus = isLive ? 'published' : (doc?.status === 'modified' ? 'modified draft' : 'draft');
+            const hasChange = !isLive;
+            if (hasChange) willUpdate++;
+            else unchanged++;
+
+            diffs.push({
+              uid: target.uid,
+              collectionName: displayName,
+              documentId: target.documentId,
+              label,
+              attribute: 'status',
+              oldValue: currentStatus,
+              newValue: 'published',
+              oldDisplay: currentStatus,
+              newDisplay: 'published live',
+              hasChange,
+              status: hasChange ? 'will_update' : 'unchanged',
+              action: 'publish',
+              message: hasChange ? 'Record will be published live' : 'Already published live',
+            });
+          } catch (err: any) {
+            diffs.push({
+              uid: target.uid,
+              collectionName: displayName,
+              documentId: target.documentId,
+              label: target.documentId,
+              attribute: 'status',
+              oldValue: null,
+              newValue: null,
+              oldDisplay: '—',
+              newDisplay: '—',
+              hasChange: false,
+              status: 'will_skip',
+              action: 'skip',
+              message: `Error inspecting document: ${err.message}`,
+            });
+          }
+        }
+
+        previewRes = {
+          success: true,
+          summary: {
+            total: targetsMap.size,
+            willUpdate,
+            willCreate: 0,
+            unchanged,
+            skipped: 0,
+          },
+          diffs,
+        };
+      } else {
+        // Standard Bulk Update
+        const preview = await this.previewBatch({
+          attribute: batch.payload.attribute,
+          value: batch.payload.value,
+          selectedEntries: batch.payload.selectedEntries,
+          selectedCollections: batch.payload.selectedCollections,
+          isRegex: batch.payload.isRegex,
+          regexPattern: batch.payload.regexPattern,
+        });
+
+        previewRes = {
+          success: true,
+          summary: {
+            total: preview.summary?.total ?? 0,
+            willUpdate: preview.summary?.willUpdate ?? 0,
+            willCreate: 0,
+            unchanged: preview.summary?.unchanged ?? 0,
+            skipped: preview.summary?.skipped ?? 0,
+          },
+          diffs: (preview.diffs || []).map((d: any) => ({
+            ...d,
+            action: 'update',
+          })),
+        };
+      }
+
+      return {
+        success: true,
+        batchId: batch.id,
+        createdAt: batch.createdAt,
+        createdBy: batch.createdBy,
+        makerNotes: batch.makerNotes,
+        batchSummary: batch.summary,
+        payload: {
+          action: batch.payload?.action || 'bulk_update',
+          attribute: batch.payload?.attribute,
+          value: batch.payload?.value,
+          publishOnApproval: batch.summary?.publishOnApproval,
+          publishStrategy: batch.summary?.publishStrategy,
+        },
+        summary: previewRes.summary,
+        diffs: previewRes.diffs,
+      };
+    },
+
+    /**
+     * Export batch diffs to CSV for offline audit review
+     */
+    async getPendingBatchDiffsCsv(batchId: string) {
+      const data = await this.getPendingBatchDiffs(batchId);
+
+      function escapeVal(val: any): string {
+        if (val === null || val === undefined) return '';
+        let str = typeof val === 'object' ? JSON.stringify(val) : String(val);
+        str = str.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        if (/^[=+@-]$/.test(str.charAt(0))) {
+          str = `'${str}`;
+        }
+        if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+          return `"${str.replace(/"/g, '""')}"`;
+        }
+        return str;
+      }
+
+      const headers = [
+        'Batch ID',
+        'Action',
+        'Collection UID',
+        'Collection Name',
+        'Document ID',
+        'Record Identifier',
+        'Attribute Name',
+        'Original Value (Before)',
+        'Proposed Value (After)',
+        'Change Status',
+        'Details / Message',
+      ];
+
+      const rows: string[] = [headers.join(',')];
+
+      for (const diff of data.diffs || []) {
+        const row = [
+          escapeVal(data.batchId),
+          escapeVal(diff.action || 'update'),
+          escapeVal(diff.uid),
+          escapeVal(diff.collectionName),
+          escapeVal(diff.documentId),
+          escapeVal(diff.label),
+          escapeVal(diff.attribute),
+          escapeVal(diff.oldDisplay ?? diff.oldValue),
+          escapeVal(diff.newDisplay ?? diff.newValue),
+          escapeVal(
+            diff.status === 'will_update'
+              ? 'Will Update'
+              : diff.status === 'will_create'
+              ? 'Will Create'
+              : diff.status === 'unchanged'
+              ? 'Unchanged'
+              : 'Skipped'
+          ),
+          escapeVal(diff.message),
+        ];
+        rows.push(row.join(','));
+      }
+
+      const safeBatchId = batchId.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const filename = `pending_batch_review_${safeBatchId}_${new Date().toISOString().slice(0, 10)}.csv`;
+
+      return {
+        success: true,
+        filename,
+        csvContent: '\uFEFF' + rows.join('\r\n') + '\r\n',
+        count: data.diffs?.length || 0,
+      };
+    },
+
+    /**
      * Get recent batch jobs for the processing dashboard
      */
     async getRecentBatches() {

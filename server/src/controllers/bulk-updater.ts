@@ -176,6 +176,30 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     }
   },
 
+  async getPendingBatchDiffs(ctx: any) {
+    try {
+      const { batchId } = ctx.params;
+      const service = strapi.plugin('bulk-updater').service('bulkUpdater');
+      const result = await service.getPendingBatchDiffs(batchId);
+      ctx.body = result;
+    } catch (err: any) {
+      ctx.status = err.message?.includes('not found') ? 404 : 500;
+      ctx.body = { success: false, error: err.message };
+    }
+  },
+
+  async exportPendingBatchDiffs(ctx: any) {
+    try {
+      const { batchId } = ctx.params;
+      const service = strapi.plugin('bulk-updater').service('bulkUpdater');
+      const result = await service.getPendingBatchDiffsCsv(batchId);
+      ctx.body = result;
+    } catch (err: any) {
+      ctx.status = err.message?.includes('not found') ? 404 : 500;
+      ctx.body = { success: false, error: err.message };
+    }
+  },
+
   async getRecentBatches(ctx: any) {
     try {
       const service = strapi.plugin('bulk-updater').service('bulkUpdater');
