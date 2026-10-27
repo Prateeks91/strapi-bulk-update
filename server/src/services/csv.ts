@@ -522,6 +522,261 @@ async function findExistingDocument(
   return null;
 }
 
+/**
+ * Recursively deep merges two component objects while preserving array values and existing properties.
+ */
+function deepMergeComponent(existingVal: any, newVal: any): any {
+  if (!existingVal || typeof existingVal !== 'object' || Array.isArray(existingVal)) {
+    return newVal;
+  }
+  if (!newVal || typeof newVal !== 'object' || Array.isArray(newVal)) {
+    return newVal;
+  }
+  const merged = { ...existingVal };
+  for (const k of Object.keys(newVal)) {
+    if (newVal[k] && typeof newVal[k] === 'object' && !Array.isArray(newVal[k])) {
+      merged[k] = deepMergeComponent(existingVal[k], newVal[k]);
+    } else if (newVal[k] !== undefined) {
+      merged[k] = newVal[k];
+    }
+  }
+  return merged;
+}
+
+/**
+ * Transforms and casts row CSV columns into Strapi schema field types,
+ * supporting nested components (dot-notation), relations, dynamic zones, and primitive types.
+ */
+export function parseRowToPayload(
+  strapi: Core.Strapi,
+  attrs: any,
+  row: Record<string, string>
+): Record<string, any> {
+  const payload: Record<string, any> = {};
+
+  for (const [key, rawVal] of Object.entries(row)) {
+    const normalizedKey = key.toLowerCase().replace(/[\s_-]/g, '');
+    if (SYSTEM_FIELD_KEYS.has(normalizedKey)) continue;
+
+    if (key.includes('.')) {
+      const parts = key.split('.');
+      let currentAttrs = attrs;
+      let currentTarget = payload;
+      let validPath = true;
+
+      for (let pIdx = 0; pIdx < parts.length; pIdx++) {
+        const part = parts[pIdx];
+        const isLeaf = pIdx === parts.length - 1;
+
+        if (isLeaf) {
+          let leafDef = currentAttrs[part];
+          if (!leafDef) {
+            const match = Object.keys(currentAttrs).find(
+              (k) => k.toLowerCase() === part.toLowerCase() || k.toLowerCase() === part.toLowerCase().replace(/\s+/g, '')
+            );
+            if (match) leafDef = currentAttrs[match];
+          }
+          if (!leafDef) {
+            validPath = false;
+            break;
+          }
+
+          // Cast and assign leaf value
+          if (rawVal === '' || rawVal === null || rawVal === undefined) {
+            if (leafDef.type !== 'dynamiczone' && !(leafDef.type === 'component' && leafDef.repeatable) && leafDef.type !== 'relation') {
+              currentTarget[part] = null;
+            }
+          } else if (leafDef.type === 'integer' || leafDef.type === 'biginteger') {
+            const parsedInt = parseInt(rawVal, 10);
+            currentTarget[part] = isNaN(parsedInt) ? null : parsedInt;
+          } else if (leafDef.type === 'float' || leafDef.type === 'decimal') {
+            const parsedFloat = parseFloat(rawVal);
+            currentTarget[part] = isNaN(parsedFloat) ? null : parsedFloat;
+          } else if (leafDef.type === 'boolean') {
+            currentTarget[part] = rawVal.toLowerCase() === 'true' || rawVal === '1';
+          } else if (leafDef.type === 'json') {
+            try {
+              currentTarget[part] = JSON.parse(rawVal);
+            } catch {
+              currentTarget[part] = rawVal;
+            }
+          } else if (leafDef.type === 'component' && leafDef.repeatable) {
+            try {
+              const parsed = JSON.parse(rawVal);
+              if (Array.isArray(parsed)) {
+                currentTarget[part] = parsed;
+              }
+            } catch {}
+          } else if (leafDef.type === 'relation') {
+            try {
+              const parsed = JSON.parse(rawVal);
+              if (Array.isArray(parsed) || (typeof parsed === 'object' && parsed !== null)) {
+                currentTarget[part] = parsed;
+              } else if (isValidDocId(rawVal)) {
+                currentTarget[part] = rawVal;
+              }
+            } catch {
+              if (isValidDocId(rawVal)) {
+                currentTarget[part] = rawVal;
+              }
+            }
+          } else {
+            currentTarget[part] = rawVal;
+          }
+        } else {
+          // Intermediate segment
+          let compDef = currentAttrs[part];
+          if (!compDef) {
+            const match = Object.keys(currentAttrs).find(
+              (k) => k.toLowerCase() === part.toLowerCase() || k.toLowerCase() === part.toLowerCase().replace(/\s+/g, '')
+            );
+            if (match) compDef = currentAttrs[match];
+          }
+
+          if (compDef?.type === 'component' && !compDef.repeatable && compDef.component) {
+            const comp = strapi.components[compDef.component];
+            if (!comp?.attributes) {
+              validPath = false;
+              break;
+            }
+            if (!currentTarget[part] || typeof currentTarget[part] !== 'object' || Array.isArray(currentTarget[part])) {
+              currentTarget[part] = {};
+            }
+            currentTarget = currentTarget[part];
+            currentAttrs = comp.attributes;
+          } else {
+            validPath = false;
+            break;
+          }
+        }
+      }
+      continue;
+    }
+
+    let attrDef = attrs[key];
+    if (!attrDef) {
+      const matchKey = Object.keys(attrs).find(
+        (k) => k.toLowerCase() === key.toLowerCase() || k.toLowerCase() === key.toLowerCase().replace(/\s+/g, '')
+      );
+      if (matchKey) {
+        attrDef = attrs[matchKey];
+      }
+    }
+    if (!attrDef) continue; // Skip unknown columns
+
+    if (rawVal === '' || rawVal === null || rawVal === undefined) {
+      if (attrDef.type !== 'dynamiczone' && !(attrDef.type === 'component' && attrDef.repeatable)) {
+        payload[key] = null;
+      }
+      continue;
+    }
+
+    switch (attrDef.type) {
+      case 'integer':
+      case 'biginteger': {
+        const parsedInt = parseInt(rawVal, 10);
+        payload[key] = isNaN(parsedInt) ? null : parsedInt;
+        break;
+      }
+      case 'float':
+      case 'decimal': {
+        const parsedFloat = parseFloat(rawVal);
+        payload[key] = isNaN(parsedFloat) ? null : parsedFloat;
+        break;
+      }
+      case 'boolean':
+        payload[key] = rawVal.toLowerCase() === 'true' || rawVal === '1';
+        break;
+      case 'json':
+        try {
+          payload[key] = JSON.parse(rawVal);
+        } catch {
+          payload[key] = rawVal;
+        }
+        break;
+      case 'dynamiczone': {
+        try {
+          const parsed = JSON.parse(rawVal);
+          if (
+            Array.isArray(parsed) &&
+            parsed.every((item) => item && typeof item === 'object' && typeof item.__component === 'string')
+          ) {
+            payload[key] = parsed;
+          }
+        } catch {}
+        break;
+      }
+      case 'component': {
+        if (attrDef.repeatable) {
+          try {
+            const parsed = JSON.parse(rawVal);
+            if (Array.isArray(parsed) && parsed.every((item) => item && typeof item === 'object')) {
+              payload[key] = parsed;
+            }
+          } catch {}
+        } else {
+          try {
+            const parsed = JSON.parse(rawVal);
+            if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+              payload[key] = parsed;
+            }
+          } catch {}
+        }
+        break;
+      }
+      case 'relation': {
+        try {
+          const parsed = JSON.parse(rawVal);
+          if (Array.isArray(parsed) || (typeof parsed === 'object' && parsed !== null)) {
+            payload[key] = parsed;
+            break;
+          }
+        } catch {}
+
+        if (isValidDocId(rawVal)) {
+          payload[key] = rawVal;
+        } else if (rawVal.includes(';') || rawVal.includes(',')) {
+          const parts = rawVal.split(/[;,]/).map((s) => s.trim()).filter(Boolean);
+          if (parts.length > 0 && parts.every((p) => isValidDocId(p))) {
+            payload[key] = parts;
+          }
+        }
+        break;
+      }
+      case 'media': {
+        if (/^\d+$/.test(rawVal.trim())) {
+          payload[key] = parseInt(rawVal.trim(), 10);
+        } else {
+          try {
+            const parsed = JSON.parse(rawVal);
+            if (typeof parsed === 'number' || typeof parsed === 'object') {
+              payload[key] = parsed;
+            }
+          } catch {}
+        }
+        break;
+      }
+      default:
+        payload[key] = rawVal;
+    }
+  }
+
+  return payload;
+}
+
+function formatValueDisplay(val: any): string {
+  if (val === null || val === undefined) return '(empty)';
+  if (typeof val === 'object') {
+    try {
+      return JSON.stringify(val);
+    } catch {
+      return String(val);
+    }
+  }
+  const s = String(val).trim();
+  return s === '' ? '(empty)' : s;
+}
+
 export async function processCsvRows(
   strapi: Core.Strapi,
   ct: any,
@@ -569,155 +824,7 @@ export async function processCsvRows(
       } catch {}
     }
 
-    const payload: Record<string, any> = {};
-
-    // Transform and cast row columns to schema field types
-    for (const [key, rawVal] of Object.entries(row)) {
-      const normalizedKey = key.toLowerCase().replace(/[\s_-]/g, '');
-      if (SYSTEM_FIELD_KEYS.has(normalizedKey)) continue;
-
-      if (key.includes('.')) {
-        const [parent, child] = key.split('.');
-        const parentDef = attrs[parent];
-        if (parentDef?.type === 'component' && !parentDef.repeatable && parentDef.component) {
-          const comp = strapi.components[parentDef.component];
-          const childDef = comp?.attributes?.[child];
-          if (childDef) {
-            if (!payload[parent]) payload[parent] = {};
-            let val: any = rawVal;
-            if (rawVal === '' || rawVal === null || rawVal === undefined) {
-              val = null;
-            } else if (childDef.type === 'integer' || childDef.type === 'biginteger') {
-              const parsedInt = parseInt(rawVal, 10);
-              val = isNaN(parsedInt) ? null : parsedInt;
-            } else if (childDef.type === 'float' || childDef.type === 'decimal') {
-              const parsedFloat = parseFloat(rawVal);
-              val = isNaN(parsedFloat) ? null : parsedFloat;
-            } else if (childDef.type === 'boolean') {
-              val = rawVal.toLowerCase() === 'true' || rawVal === '1';
-            } else if (childDef.type === 'json') {
-              try {
-                val = JSON.parse(rawVal);
-              } catch {
-                val = rawVal;
-              }
-            }
-            payload[parent][child] = val;
-          }
-        }
-        continue;
-      }
-
-      let attrDef = attrs[key];
-      if (!attrDef) {
-        const matchKey = Object.keys(attrs).find(
-          (k) => k.toLowerCase() === key.toLowerCase() || k.toLowerCase() === key.toLowerCase().replace(/\s+/g, '')
-        );
-        if (matchKey) {
-          attrDef = attrs[matchKey];
-        }
-      }
-      if (!attrDef) continue; // Skip unknown columns
-
-      if (rawVal === '' || rawVal === null || rawVal === undefined) {
-        // Do not overwrite dynamiczone or repeatable component with null unless explicitly desired
-        if (attrDef.type !== 'dynamiczone' && !(attrDef.type === 'component' && attrDef.repeatable)) {
-          payload[key] = null;
-        }
-        continue;
-      }
-
-      switch (attrDef.type) {
-        case 'integer':
-        case 'biginteger': {
-          const parsedInt = parseInt(rawVal, 10);
-          payload[key] = isNaN(parsedInt) ? null : parsedInt;
-          break;
-        }
-        case 'float':
-        case 'decimal': {
-          const parsedFloat = parseFloat(rawVal);
-          payload[key] = isNaN(parsedFloat) ? null : parsedFloat;
-          break;
-        }
-        case 'boolean':
-          payload[key] = rawVal.toLowerCase() === 'true' || rawVal === '1';
-          break;
-        case 'json':
-          try {
-            payload[key] = JSON.parse(rawVal);
-          } catch {
-            payload[key] = rawVal;
-          }
-          break;
-        case 'dynamiczone': {
-          try {
-            const parsed = JSON.parse(rawVal);
-            if (
-              Array.isArray(parsed) &&
-              parsed.every((item) => item && typeof item === 'object' && typeof item.__component === 'string')
-            ) {
-              payload[key] = parsed;
-            }
-          } catch {
-            // Summary text or unparseable format from export: omit
-          }
-          break;
-        }
-        case 'component': {
-          if (attrDef.repeatable) {
-            try {
-              const parsed = JSON.parse(rawVal);
-              if (Array.isArray(parsed) && parsed.every((item) => item && typeof item === 'object')) {
-                payload[key] = parsed;
-              }
-            } catch {}
-          } else {
-            try {
-              const parsed = JSON.parse(rawVal);
-              if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
-                payload[key] = parsed;
-              }
-            } catch {}
-          }
-          break;
-        }
-        case 'relation': {
-          try {
-            const parsed = JSON.parse(rawVal);
-            if (Array.isArray(parsed) || (typeof parsed === 'object' && parsed !== null)) {
-              payload[key] = parsed;
-              break;
-            }
-          } catch {}
-
-          if (isValidDocId(rawVal)) {
-            payload[key] = rawVal;
-          } else if (rawVal.includes(';') || rawVal.includes(',')) {
-            const parts = rawVal.split(/[;,]/).map((s) => s.trim()).filter(Boolean);
-            if (parts.length > 0 && parts.every((p) => isValidDocId(p))) {
-              payload[key] = parts;
-            }
-          }
-          break;
-        }
-        case 'media': {
-          if (/^\d+$/.test(rawVal.trim())) {
-            payload[key] = parseInt(rawVal.trim(), 10);
-          } else {
-            try {
-              const parsed = JSON.parse(rawVal);
-              if (typeof parsed === 'number' || typeof parsed === 'object') {
-                payload[key] = parsed;
-              }
-            } catch {}
-          }
-          break;
-        }
-        default:
-          payload[key] = rawVal;
-      }
-    }
+    const payload = parseRowToPayload(strapi, attrs, row);
 
     try {
       if (mode === 'update') {
@@ -746,7 +853,7 @@ export async function processCsvRows(
         const mergedPayload = { ...payload };
         for (const key of Object.keys(payload)) {
           if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
-            mergedPayload[key] = { ...((existing as any)[key] || {}), ...payload[key] };
+            mergedPayload[key] = deepMergeComponent((existing as any)[key], payload[key]);
           }
         }
 
@@ -776,7 +883,7 @@ export async function processCsvRows(
 
         const isApproved = isDraftAndPublish && Boolean(existing?.publishedAt) && existing?.status !== 'modified';
         const shouldPublish = isDraftAndPublish && Boolean(publish) && (
-          publishStrategy === 'all' ? true : isApproved
+          publishStrategy === 'all' || options.unreviewedConsent ? true : isApproved
         );
 
         if (shouldPublish) {
@@ -825,7 +932,7 @@ export async function processCsvRows(
           const mergedPayload = { ...payload };
           for (const key of Object.keys(payload)) {
             if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
-              mergedPayload[key] = { ...((existing as any)[key] || {}), ...payload[key] };
+              mergedPayload[key] = deepMergeComponent((existing as any)[key], payload[key]);
             }
           }
 
@@ -839,7 +946,7 @@ export async function processCsvRows(
 
           const isApproved = isDraftAndPublish && Boolean(existing?.publishedAt) && existing?.status !== 'modified';
           const shouldPublish = isDraftAndPublish && Boolean(publish) && (
-            publishStrategy === 'all' ? true : isApproved
+            publishStrategy === 'all' || options.unreviewedConsent ? true : isApproved
           );
 
           if (shouldPublish) {
@@ -886,7 +993,7 @@ export async function processCsvRows(
 
         const newDocId = created?.documentId || docId;
         const shouldPublishNew = isDraftAndPublish && Boolean(publish) && (
-          publishStrategy === 'all' ? true : false
+          publishStrategy === 'all' || options.unreviewedConsent ? true : false
         );
 
         if (shouldPublishNew && newDocId) {
@@ -939,7 +1046,7 @@ export async function processCsvRows(
           const mergedPayload = { ...payload };
           for (const key of Object.keys(payload)) {
             if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
-              mergedPayload[key] = { ...((existing as any)[key] || {}), ...payload[key] };
+              mergedPayload[key] = deepMergeComponent((existing as any)[key], payload[key]);
             }
           }
 
@@ -953,7 +1060,7 @@ export async function processCsvRows(
 
           const isApproved = isDraftAndPublish && Boolean(existing?.publishedAt) && existing?.status !== 'modified';
           const shouldPublish = isDraftAndPublish && Boolean(publish) && (
-            publishStrategy === 'all' ? true : isApproved
+            publishStrategy === 'all' || options.unreviewedConsent ? true : isApproved
           );
 
           if (shouldPublish) {
@@ -1001,7 +1108,7 @@ export async function processCsvRows(
 
         const newDocId = created?.documentId || docId;
         const shouldPublishNew = isDraftAndPublish && Boolean(publish) && (
-          publishStrategy === 'all' ? true : false
+          publishStrategy === 'all' || options.unreviewedConsent ? true : false
         );
 
         if (shouldPublishNew && newDocId) {
@@ -1938,6 +2045,201 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       warnings: warnings.slice(0, 100),
       totalErrorCount: errors.length,
       totalWarningCount: warnings.length,
+    };
+  },
+
+  /**
+   * Previews CSV batch changes item-by-item without mutating the database.
+   * Compares proposed CSV rows against existing documents to compute exact diffs for Maker-Checker review.
+   */
+  async previewCsvBatch(
+    uid: string,
+    rows: Array<Record<string, string>>,
+    options: {
+      mode?: 'auto' | 'update' | 'create_or_override';
+      publish?: boolean;
+      publishStrategy?: 'safe' | 'all';
+      unreviewedConsent?: boolean;
+    } = {}
+  ) {
+    const ct = strapi.contentTypes[uid];
+    if (!ct) {
+      throw new Error(`Content type "${uid}" not found`);
+    }
+
+    const attrs = ct.attributes || {};
+    const { mode = 'auto' } = options;
+
+    const diffs: any[] = [];
+    let willUpdateCount = 0;
+    let willCreateCount = 0;
+    let unchangedCount = 0;
+    let skippedCount = 0;
+
+    for (let i = 0; i < rows.length; i++) {
+      const rowNumber = i + 2;
+      const row = rows[i];
+      let docId = extractDocId(row);
+      const rowLocale = extractLocale(row);
+
+      // Handle singleType
+      if (ct.kind === 'singleType' && !docId) {
+        try {
+          const findSingleArgs: any = {};
+          if (rowLocale) findSingleArgs.locale = rowLocale;
+          const singleDoc = await (strapi.documents(uid as any) as any).findFirst(findSingleArgs);
+          if (singleDoc?.documentId) {
+            docId = singleDoc.documentId;
+          }
+        } catch {}
+      }
+
+      // Check existing document
+      let existing: any = null;
+      if (docId) {
+        existing = await findExistingDocument(strapi, uid, docId, rowLocale);
+      }
+
+      if (mode === 'update' && (!docId || !existing)) {
+        skippedCount++;
+        diffs.push({
+          uid,
+          collectionName: ct.info?.displayName || uid,
+          documentId: docId || `(Row #${rowNumber})`,
+          label: `Row #${rowNumber}`,
+          attribute: '(record)',
+          oldValue: null,
+          newValue: null,
+          oldDisplay: '—',
+          newDisplay: '—',
+          hasChange: false,
+          status: 'will_skip',
+          action: 'skip',
+          message: !docId ? 'Missing documentId in update mode' : `Document "${docId}" not found in database`,
+        });
+        continue;
+      }
+
+      const payload = parseRowToPayload(strapi, attrs, row);
+
+      if (existing) {
+        const resolvedDocId = existing.documentId || docId;
+        const entryLabel = existing.title || existing.name || existing.slug || `Entry #${resolvedDocId}`;
+        let rowHasChanges = false;
+        const payloadKeys = Object.keys(payload);
+
+        if (payloadKeys.length === 0) {
+          unchangedCount++;
+          diffs.push({
+            uid,
+            collectionName: ct.info?.displayName || uid,
+            documentId: resolvedDocId,
+            label: entryLabel,
+            attribute: '(no fields)',
+            oldValue: null,
+            newValue: null,
+            oldDisplay: '—',
+            newDisplay: '—',
+            hasChange: false,
+            status: 'unchanged',
+            action: 'update',
+            message: 'No modified attributes in CSV row',
+          });
+        } else {
+          for (const attrKey of payloadKeys) {
+            const oldVal = (existing as any)?.[attrKey] ?? null;
+            let newVal = payload[attrKey];
+            if (attrs[attrKey]?.type === 'component' && typeof newVal === 'object' && newVal !== null) {
+              newVal = deepMergeComponent((existing as any)[attrKey], newVal);
+            }
+
+            const oldDisplay = formatValueDisplay(oldVal);
+            const newDisplay = formatValueDisplay(newVal);
+            const hasChange = String(oldVal ?? '') !== String(newVal ?? '');
+
+            if (hasChange) {
+              rowHasChanges = true;
+            }
+
+            diffs.push({
+              uid,
+              collectionName: ct.info?.displayName || uid,
+              documentId: resolvedDocId,
+              label: entryLabel,
+              attribute: attrKey,
+              oldValue: oldVal,
+              newValue: newVal,
+              oldDisplay,
+              newDisplay,
+              hasChange,
+              status: hasChange ? 'will_update' : 'unchanged',
+              action: 'update',
+              message: hasChange ? `Will update "${attrKey}" from CSV` : `Already matches CSV value`,
+            });
+          }
+
+          if (rowHasChanges) {
+            willUpdateCount++;
+          } else {
+            unchangedCount++;
+          }
+        }
+      } else {
+        // New record to create
+        willCreateCount++;
+        const resolvedDocId = docId || `(Auto-generated)`;
+        const entryLabel = payload.title || payload.name || payload.slug || `New Entry (Row #${rowNumber})`;
+        const payloadKeys = Object.keys(payload);
+
+        if (payloadKeys.length === 0) {
+          diffs.push({
+            uid,
+            collectionName: ct.info?.displayName || uid,
+            documentId: resolvedDocId,
+            label: entryLabel,
+            attribute: '(all fields)',
+            oldValue: null,
+            newValue: null,
+            oldDisplay: '(new entry)',
+            newDisplay: '(empty record)',
+            hasChange: true,
+            status: 'will_create',
+            action: 'create',
+            message: 'Will create new record',
+          });
+        } else {
+          for (const attrKey of payloadKeys) {
+            const newVal = payload[attrKey];
+            diffs.push({
+              uid,
+              collectionName: ct.info?.displayName || uid,
+              documentId: resolvedDocId,
+              label: entryLabel,
+              attribute: attrKey,
+              oldValue: null,
+              newValue: newVal,
+              oldDisplay: '(new entry)',
+              newDisplay: formatValueDisplay(newVal),
+              hasChange: true,
+              status: 'will_create',
+              action: 'create',
+              message: `Will create new record with attribute "${attrKey}"`,
+            });
+          }
+        }
+      }
+    }
+
+    return {
+      success: true,
+      summary: {
+        total: rows.length,
+        willUpdate: willUpdateCount,
+        willCreate: willCreateCount,
+        unchanged: unchangedCount,
+        skipped: skippedCount,
+      },
+      diffs,
     };
   },
 

@@ -27,6 +27,7 @@ import ValidationRulesTab from './ValidationRulesTab';
 import CsvManagerTab from './CsvManagerTab';
 import ProcessingDashboardModal from '../components/ProcessingDashboardModal';
 import BulkUpdatePreviewModal from '../components/BulkUpdatePreviewModal';
+import CheckerReviewModal from '../components/CheckerReviewModal';
 import { isAbortError } from '../utils/isAbortError';
 
 interface Entry {
@@ -1110,6 +1111,8 @@ const BulkUpdater: React.FC = () => {
   const [pendingBatchesLoading, setPendingBatchesLoading] = useState<boolean>(false);
   const [approvingBatchId, setApprovingBatchId] = useState<string | null>(null);
   const [rejectingBatchId, setRejectingBatchId] = useState<string | null>(null);
+  const [inspectingPendingBatch, setInspectingPendingBatch] = useState<PendingBatch | null>(null);
+  const [exportingPendingBatchId, setExportingPendingBatchId] = useState<string | null>(null);
   const [makerNotesInput, setMakerNotesInput] = useState<string>('');
   const [publishOnApproval, setPublishOnApproval] = useState<boolean>(true);
   const [publishStrategy, setPublishStrategy] = useState<'safe' | 'all'>('safe');
@@ -1960,21 +1963,21 @@ const BulkUpdater: React.FC = () => {
       if (filterOperator === 'not_empty') return !isValEmpty;
       if (isValEmpty) return false;
 
-      const q = (filterQuery || '').toLowerCase();
+      const q = filterQuery || '';
       if (!q) return true;
 
       const testString = (str: any): boolean => {
         if (str === undefined || str === null) return false;
-        const s = String(str).toLowerCase();
+        const value = String(str);
         switch (filterOperator) {
           case 'equals':
-            return s === q;
+            return value === q;
           case 'contains':
-            return s.includes(q);
+            return value.toLowerCase().includes(q.toLowerCase());
           case 'starts_with':
-            return s.startsWith(q);
+            return value.toLowerCase().startsWith(q.toLowerCase());
           default:
-            return true;
+            return false;
         }
       };
 
@@ -1996,7 +1999,7 @@ const BulkUpdater: React.FC = () => {
       }
 
       if (typeof val === 'object' && val !== null) {
-        if (testEntityObject(val)) return true;
+        return testEntityObject(val);
       }
 
       return testString(displayStr);
@@ -2663,6 +2666,7 @@ const BulkUpdater: React.FC = () => {
           type: 'success',
           message: res.data.message || `Batch ${batchId} approved and executed successfully!`,
         });
+        setInspectingPendingBatch(null);
         await fetchPendingBatches();
         await fetchAuditHistory();
         await fetchModels();
@@ -2683,8 +2687,11 @@ const BulkUpdater: React.FC = () => {
   };
 
   // Checker Rejects Batch
-  const handleRejectBatch = async (batchId: string) => {
-    const reason = window.prompt('Enter reason for rejection:', 'Does not meet release criteria') || 'Rejected by Checker';
+  const handleRejectBatch = async (batchId: string, customReason?: string) => {
+    const reason =
+      customReason ||
+      window.prompt('Enter reason for rejection:', 'Does not meet release criteria') ||
+      'Rejected by Checker';
     try {
       setRejectingBatchId(batchId);
       const res = await post(`/bulk-updater/batches/${batchId}/reject`, { reason });
@@ -2693,6 +2700,7 @@ const BulkUpdater: React.FC = () => {
           type: 'info',
           message: `Batch ${batchId} rejected: ${reason}`,
         });
+        setInspectingPendingBatch(null);
         await fetchPendingBatches();
       } else {
         toggleNotification({
@@ -2707,6 +2715,44 @@ const BulkUpdater: React.FC = () => {
       });
     } finally {
       setRejectingBatchId(null);
+    }
+  };
+
+  // Export Pending Batch Diffs to CSV
+  const handleExportPendingBatch = async (batchId: string) => {
+    try {
+      setExportingPendingBatchId(batchId);
+      const res = await get(`/bulk-updater/batches/${batchId}/diffs/export`);
+      if (res.data && res.data.success && res.data.csvContent) {
+        const safeContent = res.data.csvContent.startsWith('\uFEFF')
+          ? res.data.csvContent
+          : '\uFEFF' + res.data.csvContent;
+        const blob = new Blob([safeContent], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.setAttribute('download', res.data.filename || `batch_${batchId}_review.csv`);
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+        toggleNotification({
+          type: 'success',
+          message: `Exported ${res.data.count || ''} batch diffs to CSV.`,
+        });
+      } else {
+        toggleNotification({
+          type: 'danger',
+          message: 'Failed to export batch diffs to CSV.',
+        });
+      }
+    } catch (err: any) {
+      toggleNotification({
+        type: 'danger',
+        message: err.message || 'Error exporting batch diffs.',
+      });
+    } finally {
+      setExportingPendingBatchId(null);
     }
   };
 
@@ -3024,9 +3070,14 @@ const BulkUpdater: React.FC = () => {
                     <Field.Label>Target Collection Type</Field.Label>
                     <Combobox
                       key={`top-col-${selectedCollectionUid}`}
-                      autocomplete="none"
-                      placeholder="Select Collection Type..."
+                      autocomplete={{ type: 'list', filter: 'contains' }}
+                      placeholder="Search Collection Type..."
                       value={selectedCollectionUid || undefined}
+                      clearLabel="Clear collection selection"
+                      onClear={() => handleCollectionChange('')}
+                      onFocus={(e: React.FocusEvent<HTMLInputElement>) => {
+                        e.target.select();
+                      }}
                       onChange={(val: any) => {
                         if (val && typeof val === 'string') {
                           handleCollectionChange(val);
@@ -3158,13 +3209,16 @@ const BulkUpdater: React.FC = () => {
                       <Field.Label>Search Attribute</Field.Label>
                       <Combobox
                         key={`search-attr-${selectedCollectionUid}`}
-                        autocomplete="none"
+                        autocomplete={{ type: 'list', filter: 'contains' }}
                         placeholder={searchAttribute || `Same as Update (${selectedAttribute || 'None'})`}
                         value={searchAttribute || '__default__'}
                         clearLabel="Reset search attribute"
                         onClear={() => {
                           handleSearchAttributeChange('');
                           setSearchAttributeSearch('');
+                        }}
+                        onFocus={(e: React.FocusEvent<HTMLInputElement>) => {
+                          e.target.select();
                         }}
                         onInputChange={(e: React.ChangeEvent<HTMLInputElement>) => {
                           setSearchAttributeSearch(e.target.value);
@@ -4050,13 +4104,16 @@ const BulkUpdater: React.FC = () => {
                   <Field.Label>Attribute to Update</Field.Label>
                   <Combobox
                     key={`update-attr-${selectedCollectionUid}`}
-                    autocomplete="none"
+                    autocomplete={{ type: 'list', filter: 'contains' }}
                     placeholder="Search attribute by name or relation..."
                     value={selectedAttribute || undefined}
                     clearLabel="Clear attribute selection"
                     onClear={() => {
                       handleAttributeChange('');
                       setAttributeSearch('');
+                    }}
+                    onFocus={(e: React.FocusEvent<HTMLInputElement>) => {
+                      e.target.select();
                     }}
                     onInputChange={(e: React.ChangeEvent<HTMLInputElement>) => {
                       setAttributeSearch(e.target.value);
@@ -4570,6 +4627,23 @@ const BulkUpdater: React.FC = () => {
                         </Td>
                         <Td style={{ textAlign: 'right' }}>
                           <Flex gap={2} justifyContent="flex-end">
+                            <Button
+                              size="S"
+                              variant="secondary"
+                              startIcon={<Eye />}
+                              onClick={() => setInspectingPendingBatch(batch)}
+                            >
+                              Review Changes
+                            </Button>
+                            <Button
+                              size="S"
+                              variant="tertiary"
+                              startIcon={<Download />}
+                              onClick={() => handleExportPendingBatch(batch.id)}
+                              loading={exportingPendingBatchId === batch.id}
+                            >
+                              Export CSV
+                            </Button>
                             {batch.status === 'pending_approval' && (
                               <>
                                 <Button
@@ -5582,6 +5656,17 @@ const BulkUpdater: React.FC = () => {
         batchId={dashboardBatchId}
         initialJob={dashboardJob}
         isSubmitting={isSubmittingBatch}
+      />
+
+      {/* Checker 4-Eyes Review Modal */}
+      <CheckerReviewModal
+        isOpen={Boolean(inspectingPendingBatch)}
+        onClose={() => setInspectingPendingBatch(null)}
+        batch={inspectingPendingBatch}
+        onApprove={handleApproveBatch}
+        onReject={handleRejectBatch}
+        approving={Boolean(inspectingPendingBatch && approvingBatchId === inspectingPendingBatch.id)}
+        rejecting={Boolean(inspectingPendingBatch && rejectingBatchId === inspectingPendingBatch.id)}
       />
     </Box>
   );

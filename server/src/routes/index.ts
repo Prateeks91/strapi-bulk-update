@@ -108,6 +108,22 @@ export default {
       },
       {
         method: 'GET',
+        path: '/batches/:batchId/diffs',
+        handler: 'bulkUpdater.getPendingBatchDiffs',
+        config: {
+          policies: [],
+        },
+      },
+      {
+        method: 'GET',
+        path: '/batches/:batchId/diffs/export',
+        handler: 'bulkUpdater.exportPendingBatchDiffs',
+        config: {
+          policies: [],
+        },
+      },
+      {
+        method: 'GET',
         path: '/audit/history',
         handler: 'audit.getHistory',
         config: {

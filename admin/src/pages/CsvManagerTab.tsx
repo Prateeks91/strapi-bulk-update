@@ -17,6 +17,8 @@ import {
   Alert,
   Checkbox,
   TextInput,
+  Combobox,
+  ComboboxOption,
 } from '@strapi/design-system';
 import { Download, Upload, ArrowClockwise, Check, ChevronLeft, ChevronRight, Eye } from '@strapi/icons';
 import { parseCsv, extractDocId } from '../utils/csvParser';
@@ -102,8 +104,8 @@ export default function CsvManagerTab() {
   const [showConfirmModal, setShowConfirmModal] = useState<boolean>(false);
   const [makerNotesInput, setMakerNotesInput] = useState<string>('');
   const [submittingBatch, setSubmittingBatch] = useState<boolean>(false);
-  const [publishStrategy, setPublishStrategy] = useState<'safe' | 'all'>('safe');
-  const [unreviewedConsent, setUnreviewedConsent] = useState<boolean>(false);
+  const [publishStrategy, setPublishStrategy] = useState<'safe' | 'all'>('all');
+  const [unreviewedConsent, setUnreviewedConsent] = useState<boolean>(true);
 
   useEffect(() => {
     fetchInitialData();
@@ -473,22 +475,35 @@ export default function CsvManagerTab() {
               <Typography variant="pi" fontWeight="bold" textColor="neutral800" marginBottom={2}>
                 Target Collection Type
               </Typography>
-              <SingleSelect
-                value={selectedUid}
-                onChange={(val: string) => {
-                  setSelectedUid(val);
+              <Combobox
+                key={`csv-col-${selectedUid}`}
+                value={selectedUid || undefined}
+                autocomplete={{ type: 'list', filter: 'contains' }}
+                placeholder="Search & select a collection..."
+                disabled={loadingCollections}
+                clearLabel="Clear collection selection"
+                onClear={() => {
+                  setSelectedUid('');
                   setImportResult(null);
                   setImportProgress(null);
                 }}
-                disabled={loadingCollections}
-                placeholder="Select a collection..."
+                onFocus={(e: React.FocusEvent<HTMLInputElement>) => {
+                  e.target.select();
+                }}
+                onChange={(val: any) => {
+                  if (val && typeof val === 'string') {
+                    setSelectedUid(val);
+                    setImportResult(null);
+                    setImportProgress(null);
+                  }
+                }}
               >
                 {collections.map((col) => (
-                  <SingleSelectOption key={col.uid} value={col.uid}>
+                  <ComboboxOption key={col.uid} value={col.uid} textValue={`${col.displayName} (${col.uid})`}>
                     {col.displayName} ({col.totalEntries ?? 0} records)
-                  </SingleSelectOption>
+                  </ComboboxOption>
                 ))}
-              </SingleSelect>
+              </Combobox>
             </Box>
 
             <Button
@@ -595,7 +610,13 @@ export default function CsvManagerTab() {
               </Typography>
               <Checkbox
                 checked={publishOnImport}
-                onValueChange={(val: boolean) => setPublishOnImport(val)}
+                onValueChange={(val: boolean) => {
+                  setPublishOnImport(val);
+                  if (val) {
+                    setPublishStrategy('all');
+                    setUnreviewedConsent(true);
+                  }
+                }}
               >
                 Auto-publish on import
               </Checkbox>
@@ -881,8 +902,13 @@ export default function CsvManagerTab() {
                     size="L"
                     startIcon={<Check />}
                     onClick={() => {
-                      setPublishStrategy('safe');
-                      setUnreviewedConsent(false);
+                      if (publishOnImport) {
+                        setPublishStrategy('all');
+                        setUnreviewedConsent(true);
+                      } else {
+                        setPublishStrategy('safe');
+                        setUnreviewedConsent(false);
+                      }
                       setShowConfirmModal(true);
                     }}
                     loading={importing || submittingBatch}
@@ -1248,8 +1274,8 @@ export default function CsvManagerTab() {
                 </Flex>
               </Box>
 
-              {/* Publishing Strategy Selection when Unreviewed Records are Selected */}
-              {publishOnImport && (preflightReport?.lifecycleStats?.unreviewedCount ?? 0) > 0 && (
+              {/* Publishing Strategy Selection when Auto-Publish is Enabled */}
+              {publishOnImport && (
                 <Box
                   padding={4}
                   background="neutral100"
@@ -1258,10 +1284,47 @@ export default function CsvManagerTab() {
                   style={{ border: '1px solid #d9d8ff' }}
                 >
                   <Typography variant="sigma" textColor="neutral600" marginBottom={3} display="block">
-                    PUBLISHING STRATEGY &amp; GOVERNANCE CONSENT
+                    PUBLISHING STRATEGY &amp; GOVERNANCE
                   </Typography>
                   <Flex direction="column" gap={3}>
-                    {/* Strategy 1: Safe Publishing (Recommended) */}
+                    {/* Strategy 1: Publish All (Default for Auto-Publish) */}
+                    <Box
+                      padding={3}
+                      hasRadius
+                      style={{
+                        border: publishStrategy === 'all' ? '2px solid #4945ff' : '1px solid #eaeaef',
+                        backgroundColor: publishStrategy === 'all' ? '#f0f0ff' : '#ffffff',
+                        cursor: 'pointer',
+                      }}
+                      onClick={() => {
+                        setPublishStrategy('all');
+                        setUnreviewedConsent(true);
+                      }}
+                    >
+                      <Flex gap={2} alignItems="flex-start">
+                        <input
+                          type="radio"
+                          id="csv-strategy-all"
+                          name="csvPublishStrategy"
+                          checked={publishStrategy === 'all'}
+                          onChange={() => {
+                            setPublishStrategy('all');
+                            setUnreviewedConsent(true);
+                          }}
+                          style={{ marginTop: 3 }}
+                        />
+                        <Box>
+                          <Typography fontWeight="bold" textColor="primary700" display="block">
+                            🚀 Publish All Imported Records Live (Immediate)
+                          </Typography>
+                          <Typography variant="pi" textColor="neutral600">
+                            Publish all affected records live to production immediately upon import execution.
+                          </Typography>
+                        </Box>
+                      </Flex>
+                    </Box>
+
+                    {/* Strategy 2: Safe Publishing */}
                     <Box
                       padding={3}
                       hasRadius
@@ -1289,70 +1352,14 @@ export default function CsvManagerTab() {
                         />
                         <Box>
                           <Typography fontWeight="bold" display="block">
-                            🛡️ Safe Publishing (Recommended)
+                            🛡️ Safe Publishing (Only Publish Pre-Approved Live Records)
                           </Typography>
                           <Typography variant="pi" textColor="neutral600">
-                            Only publish records that are already approved &amp; live ({preflightReport?.lifecycleStats?.published ?? 0} record{(preflightReport?.lifecycleStats?.published ?? 0) === 1 ? '' : 's'}). The {preflightReport?.lifecycleStats?.unreviewedCount ?? 0} unreviewed or draft record(s) will receive the CSV update in Draft mode without publishing unreviewed draft revisions to visitors.
+                            Only publish records that are already approved &amp; live. Any unreviewed or draft records will receive the CSV update in Draft mode without publishing to visitors.
                           </Typography>
                         </Box>
                       </Flex>
                     </Box>
-
-                    {/* Strategy 2: Publish All Selected */}
-                    <Box
-                      padding={3}
-                      hasRadius
-                      style={{
-                        border: publishStrategy === 'all' ? '2px solid #d02b20' : '1px solid #eaeaef',
-                        backgroundColor: publishStrategy === 'all' ? '#fff5f5' : '#ffffff',
-                        cursor: 'pointer',
-                      }}
-                      onClick={() => setPublishStrategy('all')}
-                    >
-                      <Flex gap={2} alignItems="flex-start">
-                        <input
-                          type="radio"
-                          id="csv-strategy-all"
-                          name="csvPublishStrategy"
-                          checked={publishStrategy === 'all'}
-                          onChange={() => setPublishStrategy('all')}
-                          style={{ marginTop: 3 }}
-                        />
-                        <Box>
-                          <Typography fontWeight="bold" textColor="danger700" display="block">
-                            ⚠️ Publish All Imported Records (Includes Unreviewed Drafts)
-                          </Typography>
-                          <Typography variant="pi" textColor="neutral600">
-                            Publish all affected records live to production immediately, pushing all pending unreviewed draft edits in the {preflightReport?.lifecycleStats?.unreviewedCount ?? 0} draft/modified record(s) live.
-                          </Typography>
-                        </Box>
-                      </Flex>
-                    </Box>
-
-                    {/* Mandatory Consent Checkbox for Force Publish All */}
-                    {publishStrategy === 'all' && (
-                      <Box
-                        padding={3}
-                        background="danger100"
-                        hasRadius
-                        style={{ border: '1px solid #f5c0b8' }}
-                      >
-                        <Flex gap={3} alignItems="flex-start">
-                          <Checkbox
-                            checked={unreviewedConsent}
-                            onValueChange={(checked: boolean) => setUnreviewedConsent(Boolean(checked))}
-                          />
-                          <Box style={{ cursor: 'pointer' }} onClick={() => setUnreviewedConsent(!unreviewedConsent)}>
-                            <Typography fontWeight="bold" textColor="danger700" display="block">
-                              Mandatory Risk Consent Required
-                            </Typography>
-                            <Typography variant="pi" textColor="danger700">
-                              I understand and explicitly consent that {preflightReport?.lifecycleStats?.unreviewedCount ?? 0} record(s) with unreviewed draft revisions or saved draft states will be published live to production visitors.
-                            </Typography>
-                          </Box>
-                        </Flex>
-                      </Box>
-                    )}
                   </Flex>
                 </Box>
               )}
