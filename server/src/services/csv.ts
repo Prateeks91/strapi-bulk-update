@@ -1357,30 +1357,42 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     // Apply attribute condition filter with nested component support
     if (attribute && filterOperator && filterOperator !== 'none') {
       const isNested = attribute.includes('.');
+      const attrDef = isNested ? undefined : ct.attributes?.[attribute];
+      const isString = attrDef ? ['string', 'text', 'email', 'richtext', 'uid', 'enumeration'].includes(attrDef.type) : true;
       if (filterOperator === 'empty') {
         if (isNested) {
           const [parent, child] = attribute.split('.');
-          filters[parent] = { [child]: { $null: true } };
+          filters[parent] = { [child]: { $or: [{ $null: true }, { $eq: '' }] } };
+        } else if (isString) {
+          filters.$or = [{ [attribute]: { $null: true } }, { [attribute]: { $eq: '' } }];
         } else {
           filters[attribute] = { $null: true };
         }
       } else if (filterOperator === 'not_empty') {
         if (isNested) {
           const [parent, child] = attribute.split('.');
-          filters[parent] = { [child]: { $notNull: true } };
+          filters[parent] = { [child]: { $notNull: true, $ne: '' } };
+        } else if (isString) {
+          filters[attribute] = { $notNull: true, $ne: '' };
         } else {
           filters[attribute] = { $notNull: true };
         }
       } else if (filterQuery !== undefined && filterQuery !== '') {
         const opMap: Record<string, string> = {
-          equals: '$eq',
-          notEquals: '$ne',
-          contains: '$containsi',
-          notContains: '$notContainsi',
-          startsWith: '$startsWith',
-          endsWith: '$endsWith',
+          equals: isString ? '$eqi' : '$eq',
+          notequals: isString ? '$nei' : '$ne',
+          notEquals: isString ? '$nei' : '$ne',
+          contains: isString ? '$containsi' : '$eq',
+          notcontains: isString ? '$notContainsi' : '$ne',
+          notContains: isString ? '$notContainsi' : '$ne',
+          starts_with: isString ? '$startsWithi' : '$startsWith',
+          startswith: isString ? '$startsWithi' : '$startsWith',
+          startsWith: isString ? '$startsWithi' : '$startsWith',
+          ends_with: isString ? '$endsWithi' : '$endsWith',
+          endswith: isString ? '$endsWithi' : '$endsWith',
+          endsWith: isString ? '$endsWithi' : '$endsWith',
         };
-        const strapiOp = opMap[filterOperator] || '$eq';
+        const strapiOp = opMap[filterOperator] || (isString ? '$eqi' : '$eq');
         if (isNested) {
           const [parent, child] = attribute.split('.');
           filters[parent] = { [child]: { [strapiOp]: filterQuery } };

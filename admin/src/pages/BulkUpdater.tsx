@@ -1953,31 +1953,31 @@ const BulkUpdater: React.FC = () => {
       const isValEmpty =
         val === undefined ||
         val === null ||
+        (typeof val === 'string' && val === '') ||
         (Array.isArray(val) && val.length === 0) ||
-        displayStr.trim() === '' ||
-        displayStr.trim().toLowerCase() === '(not set)' ||
-        displayStr.trim().toLowerCase() === '(empty / not set)' ||
-        displayStr.trim().toLowerCase() === '(empty / unlinked)';
+        displayStr === '(empty / not set)' ||
+        displayStr === '(empty / unlinked)' ||
+        displayStr === '(not set)';
 
       if (filterOperator === 'empty') return isValEmpty;
       if (filterOperator === 'not_empty') return !isValEmpty;
       if (isValEmpty) return false;
 
-      const q = filterQuery.trim().toLowerCase();
+      const q = filterQuery || '';
       if (!q) return true;
 
       const testString = (str: any): boolean => {
         if (str === undefined || str === null) return false;
-        const s = String(str).trim().toLowerCase();
+        const value = String(str);
         switch (filterOperator) {
           case 'equals':
-            return s === q;
+            return value === q;
           case 'contains':
-            return s.includes(q);
+            return value.toLowerCase().includes(q.toLowerCase());
           case 'starts_with':
-            return s.startsWith(q);
+            return value.toLowerCase().startsWith(q.toLowerCase());
           default:
-            return true;
+            return false;
         }
       };
 

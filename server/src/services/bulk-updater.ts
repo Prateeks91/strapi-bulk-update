@@ -1569,6 +1569,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         isRunnerRunning = false;
       }
     }, 30000);
+    if (runnerInterval && typeof runnerInterval.unref === 'function') {
+      runnerInterval.unref();
+    }
   }
 
   return {
@@ -1978,13 +1981,13 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         }
 
         let condition: any = undefined;
-        const q = (filterQuery || '').trim();
+        const q = filterQuery !== undefined && filterQuery !== null ? String(filterQuery) : '';
 
         const targetAttrSchema = isNestedAttr
           ? getLeafAttributeSchema(contentType, strapi.components, targetFilterAttr)
           : attrs[resolvedFilterAttr];
         const isRelation = targetAttrSchema?.type === 'relation';
-        const isStringLike = ['string', 'text', 'email', 'richtext', 'uid'].includes(targetAttrSchema?.type);
+        const isStringLike = ['string', 'text', 'email', 'richtext', 'uid', 'enumeration'].includes(targetAttrSchema?.type);
 
         if (isRelation) {
           const targetUid = targetAttrSchema?.target;
@@ -2002,7 +2005,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
             const orConditions: any[] = [];
             targetStringAttrs.slice(0, 5).forEach((k) => {
               if (normOp === 'equals') {
-                orConditions.push({ [k]: { $eqi: q } });
+                orConditions.push({ [k]: { $eq: q } });
               } else if (normOp === 'startswith') {
                 orConditions.push({ [k]: { $startsWithi: q } });
               } else if (normOp === 'endswith') {
@@ -2038,16 +2041,16 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
           switch (normOp) {
             case 'equals':
-              condition = isStringLike ? { $eqi: q } : { $eq: typedVal };
+              condition = { $eq: isStringLike ? q : typedVal };
               break;
             case 'notequals':
               condition = isStringLike ? { $nei: q } : { $ne: typedVal };
               break;
             case 'contains':
-              condition = { $containsi: q };
+              condition = isStringLike ? { $containsi: q } : { $eq: q };
               break;
             case 'notcontains':
-              condition = { $notContainsi: q };
+              condition = isStringLike ? { $notContainsi: q } : { $ne: q };
               break;
             case 'startswith':
               condition = { $startsWithi: q };
@@ -2163,7 +2166,11 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           }
 
           const rawEntries = await strapi.documents(uid as any).findMany(findManyArgs);
-          const qVal = (filterQuery || '').trim().toLowerCase();
+          const qVal = filterQuery !== undefined && filterQuery !== null
+                        ? String(filterQuery)
+                        : '';
+
+          const normalizedQuery = qVal.trim().toLowerCase();
 
           const passesDzFilter = (entry: any) => {
             const matches = getAllNestedValues(entry, targetFilterAttr);
@@ -2171,18 +2178,20 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
               return matches.length === 0 || matches.every((m) => {
                 const v = m.value;
                 if (v === undefined || v === null) return true;
+                if (typeof v === 'string') return v === '';
                 if (Array.isArray(v)) return v.length === 0;
                 if (typeof v === 'object') return Object.keys(v).length === 0;
-                return String(v).trim() === '';
+                return false;
               });
             }
             if (normOp === 'notempty') {
               return matches.some((m) => {
                 const v = m.value;
                 if (v === undefined || v === null) return false;
+                if (typeof v === 'string') return v !== '';
                 if (Array.isArray(v)) return v.length > 0;
                 if (typeof v === 'object') return Object.keys(v).length > 0;
-                return String(v).trim() !== '';
+                return true;
               });
             }
 
@@ -2200,15 +2209,23 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
                   testSingleValue(v.slug)
                 );
               }
-              const valStr = String(v).trim().toLowerCase();
+              const valStr = String(v);
+
               switch (normOp) {
-                case 'equals': return valStr === qVal;
-                case 'notequals': return valStr !== qVal;
-                case 'contains': return valStr.includes(qVal);
-                case 'notcontains': return !valStr.includes(qVal);
-                case 'startswith': return valStr.startsWith(qVal);
-                case 'endswith': return valStr.endsWith(qVal);
-                default: return true;
+                case 'equals':
+                  return valStr === qVal;
+                case 'notequals':
+                  return valStr.trim().toLowerCase() !== normalizedQuery;
+                case 'contains':
+                  return valStr.trim().toLowerCase().includes(normalizedQuery);
+                case 'notcontains':
+                  return !valStr.trim().toLowerCase().includes(normalizedQuery);
+                case 'startswith':
+                  return valStr.trim().toLowerCase().startsWith(normalizedQuery);
+                case 'endswith':
+                  return valStr.trim().toLowerCase().endsWith(normalizedQuery);
+                default:
+                  return true;
               }
             };
 
