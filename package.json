@@ -1,6 +1,6 @@
 {
   "name": "strapi-plugin-bulk-updater",
-  "version": "1.5.2",
+  "version": "1.5.3",
   "description": "Enterprise bulk updater for Strapi v5: arbitrary-depth nested component traversal & deep merging, safe repeatable component CSV import (hreflangs, SEO, relations), full relational search attribute filtering with query pushdown and dedicated target relation comboboxes, searchable column sorting with full schema attributes and timestamp direction toggles, robust updated_at and custom attribute mapping, safe publishing governance with explicit unreviewed draft consent guardrails, lifecycle status breakdown (Draft, Modified, Published), large dataset CSV streaming (>10,000 records), chunked batch import engine eliminating HTTP 413 errors, multi-instance dynamic zone block display with selective block updating, bracket-scoped component targeting, collection-scoped quota rules, combined structured & rich-text heading enforcement, native Content History snapshots, RFC-4180 multiline CSV parser, bulk publish, maker-checker governance, off-peak scheduling, and 3-tier audit rollback.",
   "strapi": {
     "displayName": "Bulk Attribute & Relation Updater",
