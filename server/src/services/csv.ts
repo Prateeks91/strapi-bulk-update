@@ -164,6 +164,13 @@ const LIFECYCLE_STATUS_WORDS = new Set([
   'modified',
   'supported',
   'ignored',
+  'editing',
+  'in review',
+  'in_review',
+  'ready to publish',
+  'ready_to_publish',
+  'null',
+  'undefined',
 ]);
 
 export function isValidDocId(val: any): boolean {
@@ -202,16 +209,101 @@ export function extractDocId(row: Record<string, any>): string {
 
 export function extractLocale(row: Record<string, any>): string | undefined {
   if (!row || typeof row !== 'object') return undefined;
-  const candidates = [row.locale, row.Locale, row['locale'], row['Locale']];
+  const candidates = [
+    row.locale,
+    row.Locale,
+    row['locale'],
+    row['Locale'],
+    row.strapi_locale,
+    row['strapi_locale'],
+  ];
   for (const c of candidates) {
     if (c !== undefined && c !== null) {
       const str = String(c).trim();
-      if (str && str.toLowerCase() !== 'null' && str.toLowerCase() !== 'undefined') {
+      if (
+        str &&
+        str.toLowerCase() !== 'null' &&
+        str.toLowerCase() !== 'undefined' &&
+        str.toLowerCase() !== '[null]' &&
+        str.toLowerCase() !== '""'
+      ) {
         return str;
       }
     }
   }
   return undefined;
+}
+
+export function getEffectiveLocale(ct: any, rowLocale?: string): string | undefined {
+  if (!ct?.pluginOptions?.i18n?.localized) {
+    return undefined;
+  }
+  if (!rowLocale) {
+    return undefined;
+  }
+  const trimmed = rowLocale.trim();
+  if (
+    !trimmed ||
+    trimmed.toLowerCase() === 'null' ||
+    trimmed.toLowerCase() === 'undefined' ||
+    trimmed.toLowerCase() === '[null]' ||
+    trimmed.toLowerCase() === '""'
+  ) {
+    return undefined;
+  }
+  return trimmed;
+}
+
+export function isRowInEditingStage(row: Record<string, any>): boolean {
+  if (!row || typeof row !== 'object') return false;
+  const candidates = [
+    row.strapi_stage,
+    row['strapi_stage'],
+    row.strapiStage,
+    row['Strapi Stage'],
+    row['strapi-stage'],
+    row.stage,
+    row.Stage,
+    row.status,
+    row.Status,
+  ];
+  for (const c of candidates) {
+    if (c !== undefined && c !== null) {
+      let stageName = '';
+      if (typeof c === 'object') {
+        stageName = String(c.name || c.title || c.status || c.documentId || c.id || '').trim();
+      } else if (typeof c === 'string') {
+        const trimmed = c.trim();
+        if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+          try {
+            const parsed = JSON.parse(trimmed);
+            if (typeof parsed === 'object' && parsed !== null) {
+              stageName = String(parsed.name || parsed.title || parsed.status || parsed.documentId || parsed.id || '').trim();
+            }
+          } catch {}
+        }
+        if (!stageName) {
+          stageName = trimmed;
+        }
+      } else {
+        stageName = String(c).trim();
+      }
+
+      if (stageName) {
+        const s = stageName.toLowerCase();
+        if (
+          s === 'editing' ||
+          s === 'in review' ||
+          s === 'in_review' ||
+          s === 'pending review' ||
+          s === 'pending_review'
+        ) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
 }
 
 export function extractDetailedErrorMessage(err: any): string {
@@ -408,6 +500,11 @@ function getNestedExportValue(entry: any, path: string): any {
 
   if (current === null || current === undefined) return '';
 
+  // If Strapi 5 Blocks rich-text editor data (array of block nodes)
+  if (Array.isArray(current) && current.length > 0 && current[0]?.type && Array.isArray(current[0]?.children)) {
+    return JSON.stringify(current);
+  }
+
   // If Media object
   if (typeof current === 'object' && current.url) {
     return current.url;
@@ -415,8 +512,11 @@ function getNestedExportValue(entry: any, path: string): any {
 
   // If Relation object
   if (typeof current === 'object' && !Array.isArray(current)) {
-    if (current.documentId || current.name || current.title) {
-      return current.name || current.title || current.documentId;
+    if (current.name && (current.locale === null || !current.documentId)) {
+      return current.name;
+    }
+    if (current.documentId || current.id || current.name || current.title) {
+      return current.documentId || current.id || current.name || current.title;
     }
   }
 
@@ -426,7 +526,8 @@ function getNestedExportValue(entry: any, path: string): any {
       .map((item) => {
         if (!item) return '';
         if (typeof item === 'object') {
-          return item.name || item.title || item.documentId || JSON.stringify(item);
+          if (item.url) return item.url;
+          return item.documentId || item.id || item.name || item.title || JSON.stringify(item);
         }
         return String(item);
       })
@@ -487,6 +588,12 @@ const SYSTEM_FIELD_KEYS = new Set([
   'localizations',
   'locale',
   'status',
+  'strapistage',
+  'strapi_stage',
+  'strapiassignee',
+  'strapi_assignee',
+  'strapistatus',
+  'strapi_status',
 ]);
 
 async function findExistingDocument(
@@ -496,13 +603,28 @@ async function findExistingDocument(
   docLocale?: string
 ): Promise<any> {
   if (!targetDocId) return null;
+  const ct = strapi.contentTypes[uid];
+  const effectiveLocale = getEffectiveLocale(ct, docLocale);
+
   try {
     const queryArgs: any = { documentId: targetDocId };
-    if (docLocale) queryArgs.locale = docLocale;
+    if (effectiveLocale) queryArgs.locale = effectiveLocale;
     const found = await (strapi.documents(uid as any) as any).findOne(queryArgs);
     if (found) return found;
   } catch {
     // Strapi 5 throws NotFoundError if documentId does not exist
+  }
+
+  if (ct?.pluginOptions?.i18n?.localized && !effectiveLocale) {
+    try {
+      const list = await (strapi.documents(uid as any) as any).findMany({
+        filters: { documentId: targetDocId },
+        limit: 1,
+      });
+      if (list && list.length > 0) return list[0];
+    } catch {
+      // Ignore
+    }
   }
 
   if (/^\d+$/.test(targetDocId)) {
@@ -511,7 +633,7 @@ async function findExistingDocument(
         filters: { id: parseInt(targetDocId, 10) },
         limit: 1,
       };
-      if (docLocale) queryArgs.locale = docLocale;
+      if (effectiveLocale) queryArgs.locale = effectiveLocale;
       const list = await (strapi.documents(uid as any) as any).findMany(queryArgs);
       if (list && list.length > 0) return list[0];
     } catch {
@@ -543,6 +665,147 @@ function deepMergeComponent(existingVal: any, newVal: any): any {
   return merged;
 }
 
+
+export function parseNumberValue(rawVal: string, isInteger: boolean): number | null {
+  const cleanStr = String(rawVal).replace(/[$€£,\s]/g, '');
+  if (isInteger) {
+    const n = parseInt(cleanStr, 10);
+    return isNaN(n) ? null : n;
+  } else {
+    const f = parseFloat(cleanStr);
+    return isNaN(f) ? null : f;
+  }
+}
+
+export function parseBooleanValue(rawVal: string): boolean {
+  const s = String(rawVal).trim().toLowerCase();
+  return s === 'true' || s === '1' || s === 'yes' || s === 'y' || s === 'on';
+}
+
+export function parseBlocksValue(rawVal: string): any {
+  try {
+    const parsed = JSON.parse(rawVal);
+    if (Array.isArray(parsed)) {
+      return parsed;
+    }
+  } catch {}
+  const trimmed = String(rawVal).trim();
+  if (!trimmed) return [];
+  return [{ type: 'paragraph', children: [{ type: 'text', text: trimmed }] }];
+}
+
+export function parseEnumValue(rawVal: string, allowedValues?: string[]): string {
+  const trimmed = String(rawVal).trim();
+  if (Array.isArray(allowedValues) && allowedValues.length > 0) {
+    const match = allowedValues.find((v) => v.toLowerCase() === trimmed.toLowerCase());
+    if (match) return match;
+  }
+  return trimmed;
+}
+
+export function parseRelationValue(rawVal: any, relationType?: string): any {
+  const isToMany = relationType ? relationType.toLowerCase().endsWith('many') : false;
+  if (rawVal === null || rawVal === undefined) return isToMany ? [] : null;
+
+  let parsed: any = rawVal;
+  if (typeof rawVal === 'string') {
+    const trimmed = rawVal.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {}
+    }
+  }
+
+  // Handle stage object or single relation object: { name: "Editing", locale: null, ... }
+  if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+    if (parsed.name && (parsed.locale === null || LIFECYCLE_STATUS_WORDS.has(String(parsed.name).trim().toLowerCase()))) {
+      return isToMany ? [] : null;
+    }
+    const docId = parsed.documentId || parsed.id || null;
+    if (docId && isValidDocId(String(docId).trim())) {
+      const validStr = String(docId).trim();
+      return isToMany ? [validStr] : validStr;
+    }
+    return isToMany ? [] : null;
+  }
+
+  if (Array.isArray(parsed)) {
+    const ids = parsed
+      .map((item: any) => {
+        if (typeof item === 'object' && item !== null) {
+          if (item.name && (item.locale === null || LIFECYCLE_STATUS_WORDS.has(String(item.name).trim().toLowerCase()))) {
+            return null;
+          }
+          const id = item.documentId || item.id;
+          return id && isValidDocId(String(id).trim()) ? String(id).trim() : null;
+        }
+        return isValidDocId(String(item).trim()) ? String(item).trim() : null;
+      })
+      .filter(Boolean);
+    return isToMany ? ids : (ids[0] || null);
+  }
+
+  if (typeof rawVal === 'string') {
+    if (rawVal.includes(';') || rawVal.includes(',')) {
+      const parts = rawVal
+        .split(/[;,]/)
+        .map((s) => s.trim())
+        .filter((p) => isValidDocId(p));
+      return isToMany ? parts : (parts[0] || null);
+    }
+
+    const trimmed = rawVal.trim();
+    if (isValidDocId(trimmed)) {
+      return isToMany ? [trimmed] : trimmed;
+    }
+  }
+
+  return isToMany ? [] : null;
+}
+
+export function parseMediaValue(rawVal: string, isMultiple = false): any {
+  const trimmed = String(rawVal).trim();
+  if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        const ids = parsed
+          .map((item: any) => (typeof item === 'object' && item !== null ? item.id || item.documentId : item))
+          .filter(Boolean);
+        return isMultiple ? ids : (ids[0] || null);
+      }
+      if (typeof parsed === 'number') {
+        return isMultiple ? [parsed] : parsed;
+      }
+      if (typeof parsed === 'object' && parsed !== null) {
+        const id = parsed.id || parsed.documentId || parsed;
+        return isMultiple ? [id] : id;
+      }
+    } catch {}
+  }
+
+  if (rawVal.includes(';') || rawVal.includes(',')) {
+    const parts = rawVal
+      .split(/[;,]/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((s) => (/^\d+$/.test(s) ? parseInt(s, 10) : s));
+    return isMultiple ? parts : (parts[0] || null);
+  }
+
+  if (/^\d+$/.test(trimmed)) {
+    const numId = parseInt(trimmed, 10);
+    return isMultiple ? [numId] : numId;
+  }
+
+  if (isValidDocId(trimmed)) {
+    return isMultiple ? [trimmed] : trimmed;
+  }
+
+  return isMultiple ? [] : null;
+}
+
 /**
  * Transforms and casts row CSV columns into Strapi schema field types,
  * supporting nested components (dot-notation), relations, dynamic zones, and primitive types.
@@ -559,6 +822,8 @@ export function parseRowToPayload(
     if (SYSTEM_FIELD_KEYS.has(normalizedKey)) continue;
 
     if (key.includes('.')) {
+      const topPart = key.split('.')[0].toLowerCase().replace(/[\s_-]/g, '');
+      if (SYSTEM_FIELD_KEYS.has(topPart)) continue;
       const parts = key.split('.');
       let currentAttrs = attrs;
       let currentTarget = payload;
@@ -583,17 +848,41 @@ export function parseRowToPayload(
 
           // Cast and assign leaf value
           if (rawVal === '' || rawVal === null || rawVal === undefined) {
-            if (leafDef.type !== 'dynamiczone' && !(leafDef.type === 'component' && leafDef.repeatable) && leafDef.type !== 'relation') {
+            if (
+              leafDef.type !== 'dynamiczone' &&
+              !(leafDef.type === 'component' && leafDef.repeatable) &&
+              leafDef.type !== 'relation' &&
+              leafDef.type !== 'password'
+            ) {
               currentTarget[part] = null;
             }
           } else if (leafDef.type === 'integer' || leafDef.type === 'biginteger') {
-            const parsedInt = parseInt(rawVal, 10);
-            currentTarget[part] = isNaN(parsedInt) ? null : parsedInt;
+            currentTarget[part] = parseNumberValue(rawVal, true);
           } else if (leafDef.type === 'float' || leafDef.type === 'decimal') {
-            const parsedFloat = parseFloat(rawVal);
-            currentTarget[part] = isNaN(parsedFloat) ? null : parsedFloat;
+            currentTarget[part] = parseNumberValue(rawVal, false);
           } else if (leafDef.type === 'boolean') {
-            currentTarget[part] = rawVal.toLowerCase() === 'true' || rawVal === '1';
+            currentTarget[part] = parseBooleanValue(rawVal);
+          } else if (leafDef.type === 'blocks') {
+            currentTarget[part] = parseBlocksValue(rawVal);
+          } else if (leafDef.type === 'enumeration') {
+            currentTarget[part] = parseEnumValue(rawVal, leafDef.enum);
+          } else if (leafDef.type === 'relation') {
+            currentTarget[part] = parseRelationValue(rawVal, leafDef.relation);
+          } else if (leafDef.type === 'media') {
+            currentTarget[part] = parseMediaValue(rawVal, Boolean(leafDef.multiple));
+          } else if (
+            leafDef.type === 'date' ||
+            leafDef.type === 'time' ||
+            leafDef.type === 'datetime' ||
+            leafDef.type === 'timestamp'
+          ) {
+            currentTarget[part] = String(rawVal).trim() || null;
+          } else if (leafDef.type === 'email' || leafDef.type === 'uid') {
+            currentTarget[part] = String(rawVal).trim();
+          } else if (leafDef.type === 'password') {
+            if (String(rawVal).trim()) {
+              currentTarget[part] = String(rawVal).trim();
+            }
           } else if (leafDef.type === 'json') {
             try {
               currentTarget[part] = JSON.parse(rawVal);
@@ -607,19 +896,6 @@ export function parseRowToPayload(
                 currentTarget[part] = parsed;
               }
             } catch {}
-          } else if (leafDef.type === 'relation') {
-            try {
-              const parsed = JSON.parse(rawVal);
-              if (Array.isArray(parsed) || (typeof parsed === 'object' && parsed !== null)) {
-                currentTarget[part] = parsed;
-              } else if (isValidDocId(rawVal)) {
-                currentTarget[part] = rawVal;
-              }
-            } catch {
-              if (isValidDocId(rawVal)) {
-                currentTarget[part] = rawVal;
-              }
-            }
           } else {
             currentTarget[part] = rawVal;
           }
@@ -663,9 +939,17 @@ export function parseRowToPayload(
       }
     }
     if (!attrDef) continue; // Skip unknown columns
+    if (attrDef?.target?.includes('review-workflow') || attrDef?.target === 'admin::review-workflow-stage') {
+      continue;
+    }
 
     if (rawVal === '' || rawVal === null || rawVal === undefined) {
-      if (attrDef.type !== 'dynamiczone' && !(attrDef.type === 'component' && attrDef.repeatable)) {
+      if (
+        attrDef.type !== 'dynamiczone' &&
+        !(attrDef.type === 'component' && attrDef.repeatable) &&
+        attrDef.type !== 'relation' &&
+        attrDef.type !== 'password'
+      ) {
         payload[key] = null;
       }
       continue;
@@ -673,19 +957,42 @@ export function parseRowToPayload(
 
     switch (attrDef.type) {
       case 'integer':
-      case 'biginteger': {
-        const parsedInt = parseInt(rawVal, 10);
-        payload[key] = isNaN(parsedInt) ? null : parsedInt;
+      case 'biginteger':
+        payload[key] = parseNumberValue(rawVal, true);
         break;
-      }
       case 'float':
-      case 'decimal': {
-        const parsedFloat = parseFloat(rawVal);
-        payload[key] = isNaN(parsedFloat) ? null : parsedFloat;
+      case 'decimal':
+        payload[key] = parseNumberValue(rawVal, false);
         break;
-      }
       case 'boolean':
-        payload[key] = rawVal.toLowerCase() === 'true' || rawVal === '1';
+        payload[key] = parseBooleanValue(rawVal);
+        break;
+      case 'blocks':
+        payload[key] = parseBlocksValue(rawVal);
+        break;
+      case 'enumeration':
+        payload[key] = parseEnumValue(rawVal, attrDef.enum);
+        break;
+      case 'relation':
+        payload[key] = parseRelationValue(rawVal, attrDef.relation);
+        break;
+      case 'media':
+        payload[key] = parseMediaValue(rawVal, Boolean(attrDef.multiple));
+        break;
+      case 'date':
+      case 'time':
+      case 'datetime':
+      case 'timestamp':
+        payload[key] = String(rawVal).trim() || null;
+        break;
+      case 'email':
+      case 'uid':
+        payload[key] = String(rawVal).trim();
+        break;
+      case 'password':
+        if (String(rawVal).trim()) {
+          payload[key] = String(rawVal).trim();
+        }
         break;
       case 'json':
         try {
@@ -718,38 +1025,6 @@ export function parseRowToPayload(
           try {
             const parsed = JSON.parse(rawVal);
             if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
-              payload[key] = parsed;
-            }
-          } catch {}
-        }
-        break;
-      }
-      case 'relation': {
-        try {
-          const parsed = JSON.parse(rawVal);
-          if (Array.isArray(parsed) || (typeof parsed === 'object' && parsed !== null)) {
-            payload[key] = parsed;
-            break;
-          }
-        } catch {}
-
-        if (isValidDocId(rawVal)) {
-          payload[key] = rawVal;
-        } else if (rawVal.includes(';') || rawVal.includes(',')) {
-          const parts = rawVal.split(/[;,]/).map((s) => s.trim()).filter(Boolean);
-          if (parts.length > 0 && parts.every((p) => isValidDocId(p))) {
-            payload[key] = parts;
-          }
-        }
-        break;
-      }
-      case 'media': {
-        if (/^\d+$/.test(rawVal.trim())) {
-          payload[key] = parseInt(rawVal.trim(), 10);
-        } else {
-          try {
-            const parsed = JSON.parse(rawVal);
-            if (typeof parsed === 'number' || typeof parsed === 'object') {
               payload[key] = parsed;
             }
           } catch {}
@@ -811,12 +1086,14 @@ export async function processCsvRows(
 
     let docId = extractDocId(row);
     const rowLocale = extractLocale(row);
+    const effectiveLocale = getEffectiveLocale(ct, rowLocale);
+    const isEditing = isRowInEditingStage(row);
 
     // If singleType and no documentId provided in row, auto-detect existing single document
     if (ct.kind === 'singleType' && !docId) {
       try {
         const findSingleArgs: any = {};
-        if (rowLocale) findSingleArgs.locale = rowLocale;
+        if (effectiveLocale) findSingleArgs.locale = effectiveLocale;
         const singleDoc = await (strapi.documents(uid as any) as any).findFirst(findSingleArgs);
         if (singleDoc?.documentId) {
           docId = singleDoc.documentId;
@@ -837,7 +1114,7 @@ export async function processCsvRows(
           continue;
         }
 
-        const existing = await findExistingDocument(strapi, uid, docId, rowLocale);
+        const existing = await findExistingDocument(strapi, uid, docId, effectiveLocale);
 
         if (!existing) {
           stats.skipped++;
@@ -877,19 +1154,19 @@ export async function processCsvRows(
           documentId: resolvedDocId,
           data: mergedPayload,
         };
-        if (rowLocale) updateArgs.locale = rowLocale;
+        if (effectiveLocale) updateArgs.locale = effectiveLocale;
 
         await (strapi.documents(uid as any) as any).update(updateArgs);
 
-        const isApproved = isDraftAndPublish && Boolean(existing?.publishedAt) && existing?.status !== 'modified';
-        const shouldPublish = isDraftAndPublish && Boolean(publish) && (
+        const isApproved = !isEditing && isDraftAndPublish && Boolean(existing?.publishedAt) && existing?.status !== 'modified';
+        const shouldPublish = !isEditing && isDraftAndPublish && Boolean(publish) && (
           publishStrategy === 'all' || options.unreviewedConsent ? true : isApproved
         );
 
         if (shouldPublish) {
           try {
             const pubArgs: any = { documentId: resolvedDocId };
-            if (rowLocale) pubArgs.locale = rowLocale;
+            if (effectiveLocale) pubArgs.locale = effectiveLocale;
             await (strapi.documents(uid as any) as any).publish(pubArgs);
           } catch (pubErr) {
             strapi.log.warn(`[bulk-updater] Auto-publish failed for ${resolvedDocId}:`, pubErr);
@@ -901,7 +1178,9 @@ export async function processCsvRows(
             uid,
             documentId: resolvedDocId,
             userId: user?.id,
-            statusOverride: shouldPublish ? 'published' : (isDraftAndPublish ? 'draft' : undefined),
+            statusOverride: shouldPublish
+              ? 'published'
+              : (isDraftAndPublish ? (existing?.publishedAt ? 'modified' : 'draft') : undefined),
           });
         } catch {}
 
@@ -924,7 +1203,7 @@ export async function processCsvRows(
       } else if (mode === 'create_or_override') {
         let existing: any = null;
         if (docId) {
-          existing = await findExistingDocument(strapi, uid, docId, rowLocale);
+          existing = await findExistingDocument(strapi, uid, docId, effectiveLocale);
         }
 
         if (existing) {
@@ -940,19 +1219,19 @@ export async function processCsvRows(
             documentId: resolvedDocId,
             data: mergedPayload,
           };
-          if (rowLocale) updateArgs.locale = rowLocale;
+          if (effectiveLocale) updateArgs.locale = effectiveLocale;
 
           await (strapi.documents(uid as any) as any).update(updateArgs);
 
-          const isApproved = isDraftAndPublish && Boolean(existing?.publishedAt) && existing?.status !== 'modified';
-          const shouldPublish = isDraftAndPublish && Boolean(publish) && (
+          const isApproved = !isEditing && isDraftAndPublish && Boolean(existing?.publishedAt) && existing?.status !== 'modified';
+          const shouldPublish = !isEditing && isDraftAndPublish && Boolean(publish) && (
             publishStrategy === 'all' || options.unreviewedConsent ? true : isApproved
           );
 
           if (shouldPublish) {
             try {
               const pubArgs: any = { documentId: resolvedDocId };
-              if (rowLocale) pubArgs.locale = rowLocale;
+              if (effectiveLocale) pubArgs.locale = effectiveLocale;
               await (strapi.documents(uid as any) as any).publish(pubArgs);
             } catch (pubErr) {
               strapi.log.warn(`[bulk-updater] Auto-publish failed for ${resolvedDocId}:`, pubErr);
@@ -964,7 +1243,9 @@ export async function processCsvRows(
               uid,
               documentId: resolvedDocId,
               userId: user?.id,
-              statusOverride: shouldPublish ? 'published' : (isDraftAndPublish ? 'draft' : undefined),
+              statusOverride: shouldPublish
+                ? 'published'
+                : (isDraftAndPublish ? (existing?.publishedAt ? 'modified' : 'draft') : undefined),
             });
           } catch {}
 
@@ -988,18 +1269,18 @@ export async function processCsvRows(
         }
 
         const createArgs: any = { data: payload };
-        if (rowLocale) createArgs.locale = rowLocale;
+        if (effectiveLocale) createArgs.locale = effectiveLocale;
         const created: any = await strapi.documents(uid as any).create(createArgs);
 
         const newDocId = created?.documentId || docId;
-        const shouldPublishNew = isDraftAndPublish && Boolean(publish) && (
+        const shouldPublishNew = !isEditing && isDraftAndPublish && Boolean(publish) && (
           publishStrategy === 'all' || options.unreviewedConsent ? true : false
         );
 
         if (shouldPublishNew && newDocId) {
           try {
             const pubArgs: any = { documentId: newDocId };
-            if (rowLocale) pubArgs.locale = rowLocale;
+            if (effectiveLocale) pubArgs.locale = effectiveLocale;
             await (strapi.documents(uid as any) as any).publish(pubArgs);
           } catch (pubErr) {
             strapi.log.warn(`[bulk-updater] Auto-publish failed for ${newDocId}:`, pubErr);
@@ -1038,7 +1319,7 @@ export async function processCsvRows(
         // Default: Smart Auto-Detect ('auto')
         let existing: any = null;
         if (docId) {
-          existing = await findExistingDocument(strapi, uid, docId, rowLocale);
+          existing = await findExistingDocument(strapi, uid, docId, effectiveLocale);
         }
 
         if (existing) {
@@ -1054,19 +1335,19 @@ export async function processCsvRows(
             documentId: resolvedDocId,
             data: mergedPayload,
           };
-          if (rowLocale) updateArgs.locale = rowLocale;
+          if (effectiveLocale) updateArgs.locale = effectiveLocale;
 
           await (strapi.documents(uid as any) as any).update(updateArgs);
 
-          const isApproved = isDraftAndPublish && Boolean(existing?.publishedAt) && existing?.status !== 'modified';
-          const shouldPublish = isDraftAndPublish && Boolean(publish) && (
+          const isApproved = !isEditing && isDraftAndPublish && Boolean(existing?.publishedAt) && existing?.status !== 'modified';
+          const shouldPublish = !isEditing && isDraftAndPublish && Boolean(publish) && (
             publishStrategy === 'all' || options.unreviewedConsent ? true : isApproved
           );
 
           if (shouldPublish) {
             try {
               const pubArgs: any = { documentId: resolvedDocId };
-              if (rowLocale) pubArgs.locale = rowLocale;
+              if (effectiveLocale) pubArgs.locale = effectiveLocale;
               await (strapi.documents(uid as any) as any).publish(pubArgs);
             } catch (pubErr) {
               strapi.log.warn(`[bulk-updater] Auto-publish failed for ${resolvedDocId}:`, pubErr);
@@ -1078,7 +1359,9 @@ export async function processCsvRows(
               uid,
               documentId: resolvedDocId,
               userId: user?.id,
-              statusOverride: shouldPublish ? 'published' : (isDraftAndPublish ? 'draft' : undefined),
+              statusOverride: shouldPublish
+                ? 'published'
+                : (isDraftAndPublish ? (existing?.publishedAt ? 'modified' : 'draft') : undefined),
             });
           } catch {}
 
@@ -1103,18 +1386,18 @@ export async function processCsvRows(
 
         // Missing docId OR provided docId does not exist in DB -> create new
         const createArgs: any = { data: payload };
-        if (rowLocale) createArgs.locale = rowLocale;
+        if (effectiveLocale) createArgs.locale = effectiveLocale;
         const created: any = await strapi.documents(uid as any).create(createArgs);
 
         const newDocId = created?.documentId || docId;
-        const shouldPublishNew = isDraftAndPublish && Boolean(publish) && (
+        const shouldPublishNew = !isEditing && isDraftAndPublish && Boolean(publish) && (
           publishStrategy === 'all' || options.unreviewedConsent ? true : false
         );
 
         if (shouldPublishNew && newDocId) {
           try {
             const pubArgs: any = { documentId: newDocId };
-            if (rowLocale) pubArgs.locale = rowLocale;
+            if (effectiveLocale) pubArgs.locale = effectiveLocale;
             await (strapi.documents(uid as any) as any).publish(pubArgs);
           } catch (pubErr) {
             strapi.log.warn(`[bulk-updater] Auto-publish failed for ${newDocId}:`, pubErr);
@@ -1877,20 +2160,22 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       const row = rows[i];
       const docId = extractDocId(row);
       const rowLocale = extractLocale(row);
+      const effectiveLocale = getEffectiveLocale(ct, rowLocale);
+      const isEditing = isRowInEditingStage(row);
       let rowHasError = false;
 
       // 1. Document Existence Check
       let existing: any = null;
       if (docId) {
-        existing = await findExistingDocument(strapi, uid, docId, rowLocale);
+        existing = await findExistingDocument(strapi, uid, docId, effectiveLocale);
       }
 
       if (existing && isDraftAndPublish) {
         lifecycleStats.totalChecked++;
-        const isApproved = Boolean(existing.publishedAt) && existing.status !== 'modified';
+        const isApproved = !isEditing && Boolean(existing.publishedAt) && existing.status !== 'modified';
         if (isApproved) {
           lifecycleStats.published++;
-        } else if (existing.status === 'modified') {
+        } else if (existing.status === 'modified' || (existing.publishedAt && isEditing)) {
           lifecycleStats.modified++;
           lifecycleStats.unreviewedCount++;
         } else {
@@ -2069,12 +2354,13 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       const row = rows[i];
       let docId = extractDocId(row);
       const rowLocale = extractLocale(row);
+      const effectiveLocale = getEffectiveLocale(ct, rowLocale);
 
       // Handle singleType
       if (ct.kind === 'singleType' && !docId) {
         try {
           const findSingleArgs: any = {};
-          if (rowLocale) findSingleArgs.locale = rowLocale;
+          if (effectiveLocale) findSingleArgs.locale = effectiveLocale;
           const singleDoc = await (strapi.documents(uid as any) as any).findFirst(findSingleArgs);
           if (singleDoc?.documentId) {
             docId = singleDoc.documentId;
@@ -2085,7 +2371,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       // Check existing document
       let existing: any = null;
       if (docId) {
-        existing = await findExistingDocument(strapi, uid, docId, rowLocale);
+        existing = await findExistingDocument(strapi, uid, docId, effectiveLocale);
       }
 
       if (mode === 'update' && (!docId || !existing)) {
