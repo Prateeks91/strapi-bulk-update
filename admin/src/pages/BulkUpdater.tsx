@@ -1646,9 +1646,6 @@ const BulkUpdater: React.FC = () => {
     return selectedCol ? [selectedCol] : [];
   }, [selectedCol]);
 
-  const [attributeSearch, setAttributeSearch] = useState('');
-  const [searchAttributeSearch, setSearchAttributeSearch] = useState('');
-
   const getAttrDepth = (attr: string): number =>
     attributesMeta[attr]?.depth ?? (attr.includes('.') ? attr.split('.').length - 1 : 0);
 
@@ -1661,67 +1658,25 @@ const BulkUpdater: React.FC = () => {
     return availableColAttributes.filter((attr) => getAttrDepth(attr) <= componentDepth);
   }, [availableColAttributes, componentDepth, attributesMeta]);
 
-  // Filtered attributes for Update Attribute combobox (handles camelCase, dot-notation, relations)
-  const filteredAttributes = useMemo(() => {
-    const q = attributeSearch.toLowerCase().trim();
-    if (!q || q === (selectedAttribute || '').toLowerCase().trim()) {
-      return depthFilteredAttributes;
-    }
-    const cleanQ = q.replace(/[^a-z0-9]/g, '');
-
-    return depthFilteredAttributes.filter((attr) => {
-      const lower = attr.toLowerCase();
-      const cleanLower = lower.replace(/[^a-z0-9]/g, '');
-      const rel = relationsMeta[attr];
-      const relTarget = (rel?.targetDisplayName || '').toLowerCase();
-
-      return (
-        lower.includes(q) ||
-        cleanLower.includes(cleanQ) ||
-        relTarget.includes(q)
-      );
-    });
-  }, [depthFilteredAttributes, attributeSearch, selectedAttribute, relationsMeta]);
-
-  // Filtered attributes for Search Attribute combobox
-  const filteredSearchAttributes = useMemo(() => {
-    const q = searchAttributeSearch.toLowerCase().trim();
-    if (!q || q === (searchAttribute || '').toLowerCase().trim()) {
-      return depthFilteredAttributes;
-    }
-    const cleanQ = q.replace(/[^a-z0-9]/g, '');
-
-    return depthFilteredAttributes.filter((attr) => {
-      const lower = attr.toLowerCase();
-      const cleanLower = lower.replace(/[^a-z0-9]/g, '');
-      const rel = relationsMeta[attr];
-      const relTarget = (rel?.targetDisplayName || '').toLowerCase();
-
-      return (
-        lower.includes(q) ||
-        cleanLower.includes(cleanQ) ||
-        relTarget.includes(q)
-      );
-    });
-  }, [depthFilteredAttributes, searchAttributeSearch, searchAttribute, relationsMeta]);
-
   // Memoized Combobox options for Update Attribute
   const memoizedComboboxOptions = useMemo(() => {
-    if (filteredAttributes.length === 0) {
+    if (depthFilteredAttributes.length === 0) {
       return (
-        <ComboboxOption value="__none__" disabled textValue="No matching attributes found">
+        <ComboboxOption value="__none__" disabled textValue="No attributes available">
           <Typography variant="pi" textColor="neutral600">
-            No matching attributes found for "{attributeSearch}" (Depth L{componentDepth})
+            No attributes available for this collection type (Depth L{componentDepth})
           </Typography>
         </ComboboxOption>
       );
     }
 
-    return filteredAttributes.map((attr) => {
+    return depthFilteredAttributes.map((attr) => {
       const rel = relationsMeta[attr];
       const depth = getAttrDepth(attr);
+      const badgeText = rel ? `relation ${rel.targetDisplayName}` : depth > 0 ? `L${depth} component` : '';
+      const textValue = badgeText ? `${attr} ${badgeText}` : attr;
       return (
-        <ComboboxOption key={attr} value={attr} textValue={attr}>
+        <ComboboxOption key={attr} value={attr} textValue={textValue}>
           <Flex justifyContent="space-between" alignItems="center" width="100%" gap={2}>
             <Typography variant="omega" fontWeight={attr === selectedAttribute ? 'bold' : 'regular'}>
               {attr}
@@ -1739,7 +1694,7 @@ const BulkUpdater: React.FC = () => {
         </ComboboxOption>
       );
     });
-  }, [filteredAttributes, relationsMeta, selectedAttribute, attributeSearch, componentDepth, attributesMeta]);
+  }, [depthFilteredAttributes, relationsMeta, selectedAttribute, componentDepth, attributesMeta]);
 
   // Memoized Combobox options for Search Attribute (in Section 2)
   const memoizedSearchComboboxOptions = useMemo(() => {
@@ -1747,7 +1702,7 @@ const BulkUpdater: React.FC = () => {
       <>
         <ComboboxOption
           value="__default__"
-          textValue={`Same as Update Attribute (${selectedAttribute || 'None'})`}
+          textValue={`Same as Update Attribute (${selectedAttribute || 'None'}) default`}
         >
           <Flex justifyContent="space-between" alignItems="center" width="100%" gap={2}>
             <Typography variant="omega" fontStyle="italic" textColor="neutral600">
@@ -1758,11 +1713,13 @@ const BulkUpdater: React.FC = () => {
             </Badge>
           </Flex>
         </ComboboxOption>
-        {filteredSearchAttributes.map((attr) => {
+        {depthFilteredAttributes.map((attr) => {
           const rel = relationsMeta[attr];
           const depth = getAttrDepth(attr);
+          const badgeText = rel ? `relation ${rel.targetDisplayName}` : depth > 0 ? `L${depth} component` : '';
+          const textValue = badgeText ? `${attr} ${badgeText}` : attr;
           return (
-            <ComboboxOption key={`search_${attr}`} value={attr} textValue={attr}>
+            <ComboboxOption key={`search_${attr}`} value={attr} textValue={textValue}>
               <Flex justifyContent="space-between" alignItems="center" width="100%" gap={2}>
                 <Typography variant="omega" fontWeight={attr === searchAttribute ? 'bold' : 'regular'}>
                   {attr}
@@ -1782,7 +1739,7 @@ const BulkUpdater: React.FC = () => {
         })}
       </>
     );
-  }, [filteredSearchAttributes, relationsMeta, searchAttribute, selectedAttribute, componentDepth, attributesMeta]);
+  }, [depthFilteredAttributes, relationsMeta, searchAttribute, selectedAttribute, componentDepth, attributesMeta]);
 
   const handleSearchAttributeChange = (newAttr: string) => {
     const finalAttr = newAttr === '__default__' ? '' : newAttr;
@@ -2005,7 +1962,6 @@ const BulkUpdater: React.FC = () => {
 
   const clearFilter = () => {
     setSearchAttribute('');
-    setSearchAttributeSearch('');
     setFilterOperator('none');
     setFilterQuery('');
     setEntrySearch('');
@@ -3167,25 +3123,13 @@ const BulkUpdater: React.FC = () => {
                         placeholder={searchAttribute || `Same as Update (${selectedAttribute || 'None'})`}
                         value={searchAttribute || '__default__'}
                         clearLabel="Reset search attribute"
-                        onClear={() => {
-                          handleSearchAttributeChange('');
-                          setSearchAttributeSearch('');
-                        }}
+                        onClear={() => handleSearchAttributeChange('')}
                         onFocus={(e: React.FocusEvent<HTMLInputElement>) => {
                           e.target.select();
-                        }}
-                        onInputChange={(e: React.ChangeEvent<HTMLInputElement>) => {
-                          setSearchAttributeSearch(e.target.value);
-                        }}
-                        onOpenChange={(isOpen: boolean) => {
-                          if (!isOpen) {
-                            setSearchAttributeSearch('');
-                          }
                         }}
                         onChange={(val: any) => {
                           if (val && typeof val === 'string' && val !== '__none__') {
                             handleSearchAttributeChange(val);
-                            setSearchAttributeSearch('');
                           }
                         }}
                       >
@@ -4063,27 +4007,15 @@ const BulkUpdater: React.FC = () => {
                     placeholder="Search attribute by name or relation..."
                     value={selectedAttribute || undefined}
                     clearLabel="Clear attribute selection"
-                    onClear={() => {
-                      handleAttributeChange('');
-                      setAttributeSearch('');
-                    }}
+                    onClear={() => handleAttributeChange('')}
                     onFocus={(e: React.FocusEvent<HTMLInputElement>) => {
                       e.target.select();
-                    }}
-                    onInputChange={(e: React.ChangeEvent<HTMLInputElement>) => {
-                      setAttributeSearch(e.target.value);
-                    }}
-                    onOpenChange={(isOpen: boolean) => {
-                      if (!isOpen) {
-                        setAttributeSearch('');
-                      }
                     }}
                     loading={loading && attributes.length === 0}
                     loadingMessage="Discovering schema attributes..."
                     onChange={(val: any) => {
                       if (val && typeof val === 'string' && val !== '__none__') {
                         handleAttributeChange(val);
-                        setAttributeSearch('');
                       }
                     }}
                   >
