@@ -40,10 +40,10 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         ctx.set('Cache-Control', 'private, no-cache');
       }
 
-      ctx.body = { success: true, ...data };
+      ctx.body = { success: true, status: 'success', ...data };
     } catch (err: any) {
       ctx.status = 500;
-      ctx.body = { success: false, error: err.message };
+      ctx.body = { success: false, status: 'error', error: err.message };
     }
   },
 
