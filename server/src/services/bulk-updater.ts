@@ -60,6 +60,7 @@ export function formatEntryRecord(entry: any): any {
   const formatted: any = {
     id: entry.id,
     documentId: entry.documentId,
+    status: entry.status !== undefined ? entry.status : undefined,
     ...entry,
   };
   if (entry.updatedAt !== undefined && formatted.updated_at === undefined) {
@@ -81,6 +82,156 @@ export function formatEntryRecord(entry: any): any {
     formatted.publishedAt = entry.published_at;
   }
   return formatted;
+}
+
+/**
+ * Resolves each entry's lifecycle status against the Strapi v5 Document Service.
+ * - For non-draftAndPublish collections: returns 'published' for all entries.
+ * - For draftAndPublish collections: executes a single batched query for the published
+ *   counterparts corresponding to the draft entries (using documentId as primary canonical
+ *   identifier, falling back to slug only if present in schema).
+ * - Distinguishes:
+ *     'draft': no published counterpart exists.
+ *     'published': published counterpart exists and draft has not been modified since publication.
+ *     'modified': published counterpart exists and draft updatedAt is strictly newer than published updatedAt / publishedAt.
+ *     'unknown': ambiguous or missing required identifier, or publication query failure.
+ * Ensures zero N+1 queries.
+ */
+export async function populateDocumentLifecycleStatus(
+  strapi: any,
+  uid: string,
+  entries: any[]
+): Promise<any[]> {
+  if (!entries || !Array.isArray(entries) || entries.length === 0) {
+    return entries;
+  }
+
+  const contentType = strapi?.contentTypes?.[uid];
+  if (!contentType) {
+    return entries;
+  }
+
+  const hasDraftAndPublish = Boolean(contentType.options?.draftAndPublish);
+  if (!hasDraftAndPublish) {
+    for (const entry of entries) {
+      if (entry && typeof entry === 'object') {
+        entry.status = 'published';
+      }
+    }
+    return entries;
+  }
+
+  const hasSlugInSchema = Boolean(contentType.attributes?.slug);
+  const docIds: string[] = [];
+  const slugs: string[] = [];
+
+  for (const entry of entries) {
+    if (!entry || typeof entry !== 'object') continue;
+
+    if (entry.documentId) {
+      docIds.push(String(entry.documentId));
+    } else if (hasSlugInSchema && entry.slug) {
+      slugs.push(String(entry.slug));
+    } else {
+      entry.status = 'unknown';
+    }
+  }
+
+  if (docIds.length === 0 && slugs.length === 0) {
+    return entries;
+  }
+
+  let filterClause: any;
+  if (docIds.length > 0 && slugs.length > 0) {
+    filterClause = {
+      $or: [
+        { documentId: { $in: docIds } },
+        { slug: { $in: slugs } },
+      ],
+    };
+  } else if (docIds.length > 0) {
+    filterClause = { documentId: { $in: docIds } };
+  } else {
+    filterClause = { slug: { $in: slugs } };
+  }
+
+  const queryFields = ['documentId', 'updatedAt', 'publishedAt'];
+  if (hasSlugInSchema) {
+    queryFields.push('slug');
+  }
+
+  let publishedRecords: any[] = [];
+  try {
+    const docService = strapi?.documents?.(uid as any);
+    if (docService?.findMany) {
+      publishedRecords = await docService.findMany({
+        status: 'published',
+        filters: filterClause,
+        fields: queryFields,
+        limit: Math.max(entries.length, 100),
+      });
+    }
+  } catch (err: any) {
+    strapi?.log?.warn?.(`[bulk-updater] Failed to fetch published status for ${uid}: ${err?.message || err}`);
+    for (const entry of entries) {
+      if (entry && typeof entry === 'object' && entry.status !== 'unknown') {
+        entry.status = 'unknown';
+      }
+    }
+    return entries;
+  }
+
+  const publishedByDocId = new Map<string, any>();
+  const publishedBySlug = new Map<string, any>();
+
+  for (const pub of (publishedRecords || [])) {
+    if (pub?.documentId) {
+      publishedByDocId.set(String(pub.documentId), pub);
+    }
+    if (pub?.slug && hasSlugInSchema) {
+      publishedBySlug.set(String(pub.slug), pub);
+    }
+  }
+
+  for (const entry of entries) {
+    if (!entry || typeof entry !== 'object') continue;
+    if (entry.status === 'unknown') continue;
+
+    const pub =
+      (entry.documentId && publishedByDocId.get(String(entry.documentId))) ||
+      (hasSlugInSchema && entry.slug && publishedBySlug.get(String(entry.slug)));
+
+    if (!pub) {
+      entry.status = 'draft';
+      entry.publishedAt = null;
+      entry.published_at = null;
+    } else {
+      entry.publishedAt = pub.publishedAt || pub.published_at || null;
+      entry.published_at = entry.publishedAt;
+
+      const draftUpdatedTime = new Date(entry.updatedAt || entry.updated_at || 0).getTime();
+      const pubUpdatedTime = new Date(pub.updatedAt || pub.updated_at || 0).getTime();
+      const pubPublishedTime = new Date(pub.publishedAt || pub.published_at || 0).getTime();
+      const lastPublishedTime = Math.max(
+        isNaN(pubUpdatedTime) ? 0 : pubUpdatedTime,
+        isNaN(pubPublishedTime) ? 0 : pubPublishedTime
+      );
+
+      if (isNaN(draftUpdatedTime) || lastPublishedTime === 0) {
+        if (pub.publishedAt) {
+          entry.status = 'published';
+        } else {
+          entry.status = 'unknown';
+        }
+      } else if (draftUpdatedTime > lastPublishedTime) {
+        entry.status = 'modified';
+      } else {
+        entry.status = 'published';
+      }
+    }
+  }
+
+  return entries;
 }
 
 /**
@@ -1569,6 +1720,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         isRunnerRunning = false;
       }
     }, 30000);
+    if (typeof runnerInterval.unref === 'function') {
+      runnerInterval.unref();
+    }
   }
 
   return {
@@ -1812,6 +1966,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
             }
 
             const formattedEntries = (entries || []).map(formatEntryRecord);
+            await populateDocumentLifecycleStatus(strapi, uid, formattedEntries);
 
             modelsCache.set(uid, {
               signature,
@@ -1962,6 +2117,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           // Collection does not possess this attribute: return 0 matching entries
           result = {
             uid,
+            status: 'success',
             displayName: contentType.info?.displayName || uid,
             isSingleType,
             draftAndPublish: Boolean(contentType.options?.draftAndPublish),
@@ -2118,12 +2274,15 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         } catch {
           singleDoc = null;
         }
+        const formattedEntries = singleDoc ? [formatEntryRecord(singleDoc)] : [];
+        await populateDocumentLifecycleStatus(strapi, uid, formattedEntries);
         result = {
           uid,
+          status: 'success',
           displayName: contentType.info?.displayName || uid,
           isSingleType: true,
           draftAndPublish: Boolean(contentType.options?.draftAndPublish),
-          entries: singleDoc ? [formatEntryRecord(singleDoc)] : [],
+          entries: formattedEntries,
           pagination: {
             page: 1,
             pageSize: 1,
@@ -2218,13 +2377,16 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           const matchedEntries = (rawEntries || []).filter(passesDzFilter);
           const totalEntries = matchedEntries.length;
           const paginatedEntries = matchedEntries.slice(start, start + limit);
+          const formattedEntries = paginatedEntries.map(formatEntryRecord);
+          await populateDocumentLifecycleStatus(strapi, uid, formattedEntries);
 
           result = {
             uid,
+            status: 'success',
             displayName: contentType.info?.displayName || uid,
             isSingleType: false,
             draftAndPublish: Boolean(contentType.options?.draftAndPublish),
-            entries: paginatedEntries.map(formatEntryRecord),
+            entries: formattedEntries,
             pagination: {
               page: currentPage,
               pageSize: limit,
@@ -2250,12 +2412,16 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
             }),
           ]);
 
+          const formattedEntries = (entries || []).map(formatEntryRecord);
+          await populateDocumentLifecycleStatus(strapi, uid, formattedEntries);
+
           result = {
             uid,
+            status: 'success',
             displayName: contentType.info?.displayName || uid,
             isSingleType: false,
             draftAndPublish: Boolean(contentType.options?.draftAndPublish),
-            entries: (entries || []).map(formatEntryRecord),
+            entries: formattedEntries,
             pagination: {
               page: currentPage,
               pageSize: limit,

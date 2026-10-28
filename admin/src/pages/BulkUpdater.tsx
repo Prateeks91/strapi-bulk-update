@@ -29,10 +29,15 @@ import ProcessingDashboardModal from '../components/ProcessingDashboardModal';
 import BulkUpdatePreviewModal from '../components/BulkUpdatePreviewModal';
 import CheckerReviewModal from '../components/CheckerReviewModal';
 import { isAbortError } from '../utils/isAbortError';
+import { getEntryLifecycleStatus } from '../utils/lifecycleStatus';
+export { getEntryLifecycleStatus } from '../utils/lifecycleStatus';
 
 interface Entry {
   id: number | string;
   documentId: string;
+  status?: 'draft' | 'published' | 'modified' | 'unknown' | 'pending_review' | string;
+  publishedAt?: string | null;
+  updatedAt?: string | null;
   [key: string]: any;
 }
 
@@ -751,85 +756,6 @@ export function formatDisplayValue(val: any): string {
 }
 
 /**
- * Flat helper: Determines the real lifecycle status of an entry (Pending Review, Modified, Published, Draft).
- */
-export function getEntryLifecycleStatus(
-  entry: Entry,
-  col: CollectionModel | null,
-  pendingBatches: PendingBatch[] = []
-): { status: 'pending_review' | 'modified' | 'published' | 'draft'; label: string; badgeColor: string; textColor: string } {
-  // 1. Check if this entry is pending review in any pending_approval batch
-  const isPendingApproval = pendingBatches.some((b) => {
-    if (b.status !== 'pending_approval') return false;
-    const targets = b.payload?.selectedEntries || [];
-    return targets.some((t) => t.documentId === entry.documentId || String(t.documentId) === String(entry.id));
-  });
-
-  if (isPendingApproval) {
-    return {
-      status: 'pending_review',
-      label: 'Pending Review',
-      badgeColor: 'warning100',
-      textColor: 'warning700',
-    };
-  }
-
-  // 2. Check Strapi 5 document status
-  if (entry.status === 'modified') {
-    return {
-      status: 'modified',
-      label: 'Modified',
-      badgeColor: 'primary100',
-      textColor: 'primary700',
-    };
-  }
-
-  if (entry.status === 'draft') {
-    return {
-      status: 'draft',
-      label: 'Draft',
-      badgeColor: 'neutral150',
-      textColor: 'neutral700',
-    };
-  }
-
-  if (entry.status === 'published') {
-    return {
-      status: 'published',
-      label: 'Published',
-      badgeColor: 'success100',
-      textColor: 'success700',
-    };
-  }
-
-  // 3. Fallback: check publishedAt
-  if (col && col.draftAndPublish === false) {
-    return {
-      status: 'published',
-      label: 'Published',
-      badgeColor: 'success100',
-      textColor: 'success700',
-    };
-  }
-
-  if (entry.publishedAt) {
-    return {
-      status: 'published',
-      label: 'Published',
-      badgeColor: 'success100',
-      textColor: 'success700',
-    };
-  }
-
-  return {
-    status: 'draft',
-    label: 'Draft',
-    badgeColor: 'neutral150',
-    textColor: 'neutral700',
-  };
-}
-
-/**
  * Flat helper: Renders a single cell content using clean early returns.
  * Zero deep nesting.
  */
@@ -1247,7 +1173,7 @@ const BulkUpdater: React.FC = () => {
   const [filterOperator, setFilterOperator] = useState<FilterOperator>('none');
   const [filterQuery, setFilterQuery] = useState<string>('');
   const [entrySearch, setEntrySearch] = useState<string>('');
-  type StatusFilter = 'all' | 'pending_review' | 'draft' | 'published' | 'modified';
+  type StatusFilter = 'all' | 'pending_review' | 'draft' | 'published' | 'modified' | 'unknown';
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
 
   const isFilterActive =
@@ -1345,12 +1271,23 @@ const BulkUpdater: React.FC = () => {
     cols.forEach((col: CollectionModel) => {
       const total = col.totalEntries !== undefined ? col.totalEntries : (col.entries ? col.entries.length : 0);
       const initialPageSize = col.isSingleType ? 1 : 10;
+      const previewSlice = (col.entries || []).slice(0, initialPageSize).map((entry: Entry) => {
+        if (!entry.status) {
+          const lifecycle = getEntryLifecycleStatus(entry, col, pendingBatches);
+          return {
+            ...entry,
+            status: lifecycle.status,
+            publishedAt: entry.publishedAt ?? (lifecycle.status === 'published' ? (entry.updatedAt || null) : null),
+          };
+        }
+        return entry;
+      });
       pages[col.uid] = {
         page: 1,
         pageSize: initialPageSize,
         total,
         pageCount: col.isSingleType ? 1 : (Math.ceil(total / initialPageSize) || 1),
-        entries: (col.entries || []).slice(0, initialPageSize),
+        entries: previewSlice,
         loading: false,
       };
       initialVisibility[col.uid] = true;
@@ -1497,6 +1434,20 @@ const BulkUpdater: React.FC = () => {
         const totalNum = res.data.pagination?.total !== undefined ? res.data.pagination.total : fetchedEntries.length;
         const pageCountNum = res.data.pagination?.pageCount ?? Math.max(1, Math.ceil(totalNum / pageSizeNum));
 
+        // Ensure every entry has a guaranteed lifecycle status field attached
+        const col = collections.find((c) => c.uid === colUid) || null;
+        const enrichedEntries: Entry[] = fetchedEntries.map((entry) => {
+          if (!entry.status) {
+            const lifecycle = getEntryLifecycleStatus(entry, col, pendingBatches);
+            return {
+              ...entry,
+              status: lifecycle.status,
+              publishedAt: entry.publishedAt ?? (lifecycle.status === 'published' ? (entry.updatedAt || null) : null),
+            };
+          }
+          return entry;
+        });
+
         setCollectionPages((prev) => ({
           ...prev,
           [colUid]: {
@@ -1504,7 +1455,7 @@ const BulkUpdater: React.FC = () => {
             pageSize: pageSizeNum,
             total: totalNum,
             pageCount: pageCountNum,
-            entries: fetchedEntries,
+            entries: enrichedEntries,
             loading: false,
           },
         }));
@@ -2133,6 +2084,7 @@ const BulkUpdater: React.FC = () => {
     let modified = 0;
     let draft = 0;
     let pendingReview = 0;
+    let unknown = 0;
 
     Object.keys(selectedEntries).forEach((key) => {
       if (!selectedEntries[key]) return;
@@ -2152,19 +2104,21 @@ const BulkUpdater: React.FC = () => {
         else if (status === 'modified') modified++;
         else if (status === 'draft') draft++;
         else if (status === 'pending_review') pendingReview++;
+        else unknown++;
       } else {
         draft++;
       }
     });
 
-    const unreviewedCount = draft + modified + pendingReview;
+    const unreviewedCount = draft + modified + pendingReview + unknown;
     return {
       published,
       modified,
       draft,
       pendingReview,
+      unknown,
       unreviewedCount,
-      total: published + modified + draft + pendingReview,
+      total: published + modified + draft + pendingReview + unknown,
     };
   }, [selectedEntries, collections, collectionPages, pendingBatches]);
 
@@ -3320,6 +3274,7 @@ const BulkUpdater: React.FC = () => {
                       <SingleSelectOption value="draft">Draft</SingleSelectOption>
                       <SingleSelectOption value="published">Published</SingleSelectOption>
                       <SingleSelectOption value="modified">Modified</SingleSelectOption>
+                      <SingleSelectOption value="unknown">Unknown</SingleSelectOption>
                     </SingleSelect>
                   </Box>
 
