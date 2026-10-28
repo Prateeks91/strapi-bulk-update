@@ -1601,7 +1601,6 @@ const BulkUpdater: React.FC = () => {
 
     setSelectedEntries({});
     setSearchAttribute('');
-    setSearchAttributeSearch('');
 
     const targetCol = collections.find((c) => c.uid === newUid);
     const colAttrs = targetCol?.attributes || [];
