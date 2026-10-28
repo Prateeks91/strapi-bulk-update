@@ -1,5 +1,11 @@
 import type { Core } from '@strapi/strapi';
 import { recordContentHistoryVersion } from './content-history';
+import {
+  setDeepProperty,
+  buildDeepPopulate,
+  parseDynamicZonePath,
+  isDeepComponentField,
+} from './bulk-updater';
 
 export interface AuditConfig {
   enabled: boolean;
@@ -404,6 +410,11 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     for (const item of diffs) {
       if (item.status === 'updated' && item.uid && item.documentId && item.attribute) {
         try {
+          const ct = strapi.contentTypes[item.uid];
+          if (!ct) {
+            throw new Error(`Content type "${item.uid}" does not exist in schema.`);
+          }
+
           const isRel = item.oldValue && typeof item.oldValue === 'object' && item.oldValue.isRelation;
           let rollbackPayload: any;
 
@@ -411,37 +422,86 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             const oldDocIds = Array.isArray(item.oldValue.documentIds) ? item.oldValue.documentIds : [];
             rollbackPayload = { set: oldDocIds };
           } else {
-            rollbackPayload = item.oldValue;
+            rollbackPayload = item.oldValue ?? null;
           }
 
-          if (item.attribute.includes('.')) {
-            const [parentKey, childKey] = item.attribute.split('.');
-            const ct = strapi.contentTypes[item.uid];
-            if (ct?.attributes?.[parentKey]?.type === 'component') {
-              const currentDoc: any = await strapi.documents(item.uid as any).findOne({
-                documentId: item.documentId,
-                populate: [parentKey],
-              });
-              const currentParent = currentDoc?.[parentKey] || {};
-              const restoredParent = {
-                ...currentParent,
-                [childKey]: rollbackPayload,
-              };
-              await strapi.documents(item.uid as any).update({
-                documentId: item.documentId,
-                data: {
-                  [parentKey]: restoredParent,
-                },
-              });
+          const parsed = parseDynamicZonePath(item.attribute);
+          const rootKey = parsed.rootKey;
+          const rootAttrDef = ct.attributes?.[rootKey];
+          const isComponent = rootAttrDef?.type === 'component';
+          const isDynamicZone = rootAttrDef?.type === 'dynamiczone';
+          const isNested =
+            item.attribute.includes('.') ||
+            item.attribute.includes('[') ||
+            isComponent ||
+            isDynamicZone ||
+            isDeepComponentField(ct, strapi.components, item.attribute);
+
+          let wasPublished = false;
+
+          if (isNested && (isComponent || isDynamicZone || rootAttrDef)) {
+            // Retrieve current document with recursive deep populate to preserve all sibling fields, components, media, and relations
+            const populateOption = buildDeepPopulate(ct.attributes, strapi.components);
+            const findOneArgs: any = { documentId: item.documentId };
+            if (populateOption) {
+              findOneArgs.populate = populateOption;
+            }
+            const currentDoc: any = await strapi.documents(item.uid as any).findOne(findOneArgs);
+            if (!currentDoc) {
+              throw new Error(`Document "${item.documentId}" not found in collection "${item.uid}".`);
+            }
+            wasPublished = Boolean(currentDoc?.publishedAt);
+
+            const isRootDz = isDynamicZone;
+            const existingRoot = currentDoc?.[rootKey] || (isRootDz ? [] : {});
+
+            let restoredRoot: any;
+
+            if (Array.isArray(item.dynamicZoneDiffs) && item.dynamicZoneDiffs.length > 0) {
+              // If item recorded individual dynamic zone block diffs, revert each one
+              let workingRoot = existingRoot;
+              for (const dzDiff of item.dynamicZoneDiffs) {
+                const parsedDz = parseDynamicZonePath(dzDiff.attribute || item.attribute);
+                const dzParts = parsedDz.cleanPath.split('.').slice(1);
+                const targetIndexes =
+                  dzDiff.index !== undefined
+                    ? [dzDiff.index]
+                    : parsedDz.targetIndex !== undefined
+                    ? [parsedDz.targetIndex]
+                    : undefined;
+                workingRoot = setDeepProperty(workingRoot, dzParts, dzDiff.oldValue ?? null, {
+                  targetIndexes,
+                  targetComponentUid: dzDiff.componentUid || parsedDz.targetComponentUid,
+                  strapi,
+                });
+              }
+              restoredRoot = workingRoot;
             } else {
-              await strapi.documents(item.uid as any).update({
-                documentId: item.documentId,
-                data: {
-                  [item.attribute]: rollbackPayload,
-                },
+              const parts = parsed.cleanPath.split('.');
+              const pathParts = parts.slice(1);
+              const targetIndexes = parsed.targetIndex !== undefined ? [parsed.targetIndex] : undefined;
+              const targetComponentUid = parsed.targetComponentUid;
+
+              restoredRoot = setDeepProperty(existingRoot, pathParts, rollbackPayload, {
+                targetIndexes,
+                targetComponentUid,
+                strapi,
               });
             }
+
+            await strapi.documents(item.uid as any).update({
+              documentId: item.documentId,
+              data: {
+                [rootKey]: restoredRoot,
+              },
+            });
           } else {
+            // Top-level scalar or relation
+            const currentDoc: any = await strapi.documents(item.uid as any).findOne({
+              documentId: item.documentId,
+            });
+            wasPublished = Boolean(currentDoc?.publishedAt);
+
             await strapi.documents(item.uid as any).update({
               documentId: item.documentId,
               data: {
@@ -450,13 +510,14 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             });
           }
 
-          const ct = strapi.contentTypes[item.uid];
-          if (ct?.options?.draftAndPublish) {
+          if (ct?.options?.draftAndPublish && wasPublished) {
             try {
               await (strapi.documents(item.uid as any) as any).publish({
                 documentId: item.documentId,
               });
-            } catch {}
+            } catch (publishErr: any) {
+              strapi.log.warn(`[bulk-updater] Failed to auto-publish rollback for ${item.uid}/${item.documentId}:`, publishErr?.message);
+            }
           }
 
           // Record Content History Version for Strapi Content Manager
@@ -465,7 +526,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
               uid: item.uid,
               documentId: item.documentId,
               userId,
-              statusOverride: ct?.options?.draftAndPublish ? 'published' : undefined,
+              statusOverride: ct?.options?.draftAndPublish ? (wasPublished ? 'published' : 'draft') : undefined,
             });
           } catch {}
 

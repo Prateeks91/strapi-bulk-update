@@ -262,14 +262,15 @@ export function parseDynamicZonePath(path: string): {
   targetIndex?: number;
 } {
   if (!path) return { cleanPath: '', rootKey: '', subPath: '' };
-  const bracketMatch = path.match(/^([^.[]+)\[([^\]]+)\]\.(.+)$/);
+  const bracketMatch = path.match(/^([^.[]+)\[([^\]]+)\](?:\.(.+))?$/);
   if (bracketMatch) {
     const rootKey = bracketMatch[1];
-    const selector = bracketMatch[2];
-    const subPath = bracketMatch[3];
-    const cleanPath = `${rootKey}.${subPath}`;
-    if (/^\d+$/.test(selector)) {
-      return { cleanPath, rootKey, subPath, targetIndex: parseInt(selector, 10) };
+    const selector = bracketMatch[2].trim();
+    const subPath = bracketMatch[3] || '';
+    const cleanPath = subPath ? `${rootKey}.${subPath}` : rootKey;
+    const numMatch = selector.match(/^#?(\d+)/);
+    if (numMatch) {
+      return { cleanPath, rootKey, subPath, targetIndex: parseInt(numMatch[1], 10) };
     }
     return { cleanPath, rootKey, subPath, targetComponentUid: selector };
   }
