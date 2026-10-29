@@ -2116,9 +2116,18 @@ const BulkUpdater: React.FC = () => {
       if (selectedEntries[key]) {
         const parts = key.split(KEY_SEP);
         if (parts.length === 2) {
-          const targetObj: any = { uid: parts[0], documentId: parts[1] };
+          const colUid = parts[0];
+          const docId = parts[1];
+          const targetObj: any = { uid: colUid, documentId: docId };
           if (selectedDzBlocks[key] && selectedDzBlocks[key].length > 0) {
             targetObj.dynamicZoneIndexes = selectedDzBlocks[key];
+          }
+          const colPage = collectionPages[colUid];
+          const cachedEntry = colPage?.entries?.find((e: any) => e.documentId === docId);
+          if (cachedEntry) {
+            if (cachedEntry.status) targetObj.status = cachedEntry.status;
+            if (cachedEntry.publishedAt) targetObj.publishedAt = cachedEntry.publishedAt;
+            if (cachedEntry.locale) targetObj.locale = cachedEntry.locale;
           }
           targets.push(targetObj);
         }
@@ -2174,9 +2183,18 @@ const BulkUpdater: React.FC = () => {
       if (selectedEntries[key]) {
         const parts = key.split(KEY_SEP);
         if (parts.length === 2) {
-          const targetObj: any = { uid: parts[0], documentId: parts[1] };
+          const colUid = parts[0];
+          const docId = parts[1];
+          const targetObj: any = { uid: colUid, documentId: docId };
           if (selectedDzBlocks[key] && selectedDzBlocks[key].length > 0) {
             targetObj.dynamicZoneIndexes = selectedDzBlocks[key];
+          }
+          const colPage = collectionPages[colUid];
+          const cachedEntry = colPage?.entries?.find((e: any) => e.documentId === docId);
+          if (cachedEntry) {
+            if (cachedEntry.status) targetObj.status = cachedEntry.status;
+            if (cachedEntry.publishedAt) targetObj.publishedAt = cachedEntry.publishedAt;
+            if (cachedEntry.locale) targetObj.locale = cachedEntry.locale;
           }
           targets.push(targetObj);
         }

@@ -84,6 +84,166 @@ export function formatEntryRecord(entry: any): any {
   return formatted;
 }
 
+export type LifecycleStatus = 'draft' | 'published' | 'modified' | 'unknown';
+
+export interface PreUpdateStatusResult {
+  status: LifecycleStatus;
+  hadPublishedVersion: boolean;
+}
+
+/**
+ * Safely checks whether an entry or target object is in an unapproved editing / review stage.
+ */
+export function isRowInEditingStage(row: Record<string, any>): boolean {
+  if (!row || typeof row !== 'object') return false;
+  const candidates = [
+    row.strapi_stage,
+    row['strapi_stage'],
+    row.strapiStage,
+    row['Strapi Stage'],
+    row['strapi-stage'],
+    row.stage,
+    row.Stage,
+    row.review_stage,
+    row.workflow_stage,
+  ];
+  if (row.status && typeof row.status === 'string') {
+    const s = row.status.trim().toLowerCase();
+    if (s === 'editing' || s === 'in review' || s === 'in_review' || s === 'pending review' || s === 'pending_review') {
+      candidates.push(row.status);
+    }
+  }
+  for (const c of candidates) {
+    if (c !== undefined && c !== null) {
+      let stageName = '';
+      if (typeof c === 'object') {
+        stageName = String(c.name || c.title || c.status || c.documentId || c.id || '').trim();
+      } else if (typeof c === 'string') {
+        const trimmed = c.trim();
+        if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+          try {
+            const parsed = JSON.parse(trimmed);
+            if (typeof parsed === 'object' && parsed !== null) {
+              stageName = String(parsed.name || parsed.title || parsed.status || parsed.documentId || parsed.id || '').trim();
+            }
+          } catch {}
+        }
+        if (!stageName) {
+          stageName = trimmed;
+        }
+      } else {
+        stageName = String(c).trim();
+      }
+
+      if (stageName) {
+        const s = stageName.toLowerCase();
+        if (
+          s === 'editing' ||
+          s === 'in review' ||
+          s === 'in_review' ||
+          s === 'pending review' ||
+          s === 'pending_review'
+        ) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Accurately determines the pre-update publication state of a record.
+ * Handles casing variations ('Published', 'published', 'Modified', 'modified', 'Draft', 'draft').
+ * Distinguishes:
+ * - True Draft: no published version exists (hadPublishedVersion: false)
+ * - Published: published version exists and draft is not newer than published version (hadPublishedVersion: true)
+ * - Modified: published version exists and draft is newer than published version (hadPublishedVersion: true)
+ */
+export function resolveRecordPublicationStatus(
+  entry: any,
+  publishedRecord?: any,
+  isDraftAndPublish?: boolean
+): PreUpdateStatusResult {
+  if (isDraftAndPublish === false) {
+    return { status: 'published', hadPublishedVersion: true };
+  }
+
+  if (!entry || typeof entry !== 'object') {
+    return { status: 'unknown', hadPublishedVersion: false };
+  }
+
+  // 1. Explicit status string check on entry or target (case-insensitive)
+  if (typeof entry.status === 'string' && entry.status.trim()) {
+    const s = entry.status.trim().toLowerCase();
+    if (s === 'published') {
+      return { status: 'published', hadPublishedVersion: true };
+    }
+    if (s === 'modified') {
+      return { status: 'modified', hadPublishedVersion: true };
+    }
+    if (s === 'draft') {
+      return { status: 'draft', hadPublishedVersion: false };
+    }
+  }
+
+  // 2. Published counterpart evaluation
+  const pub = publishedRecord || (entry.publishedAt ? entry : null);
+  if (!pub) {
+    return { status: 'draft', hadPublishedVersion: false };
+  }
+
+  const draftUpdatedTime = new Date(entry.updatedAt || entry.updated_at || 0).getTime();
+  const pubUpdatedTime = new Date(pub.updatedAt || pub.updated_at || 0).getTime();
+  const pubPublishedTime = new Date(pub.publishedAt || pub.published_at || 0).getTime();
+  const lastPublishedTime = Math.max(
+    isNaN(pubUpdatedTime) ? 0 : pubUpdatedTime,
+    isNaN(pubPublishedTime) ? 0 : pubPublishedTime
+  );
+
+  if (isNaN(draftUpdatedTime) || lastPublishedTime === 0) {
+    if (pub.publishedAt || pub.published_at) {
+      return { status: 'published', hadPublishedVersion: true };
+    }
+    return { status: 'unknown', hadPublishedVersion: false };
+  }
+
+  if (draftUpdatedTime > lastPublishedTime) {
+    return { status: 'modified', hadPublishedVersion: true };
+  }
+
+  return { status: 'published', hadPublishedVersion: true };
+}
+
+/**
+ * Determines whether a document should be published after an update according to the publication status rules:
+ * - Records that were Published or Modified before update MUST end up Published.
+ * - Records that were Draft before update MUST remain Draft (never published by bulk update).
+ * - Records in an unreviewed/editing stage under safe mode are not published.
+ */
+export function evaluateShouldPublish({
+  isDraftAndPublish,
+  hadPublishedVersion,
+  isEditing,
+  publishOnApproval = true,
+  publishStrategy = 'safe',
+  unreviewedConsent = false,
+}: {
+  isDraftAndPublish: boolean;
+  hadPublishedVersion: boolean;
+  isEditing: boolean;
+  publishOnApproval?: boolean;
+  publishStrategy?: 'safe' | 'all';
+  unreviewedConsent?: boolean;
+}): boolean {
+  if (!isDraftAndPublish) return false;
+  if (!hadPublishedVersion) return false; // Pure Draft records must NEVER be published!
+  if (!publishOnApproval) return false;
+  if (isEditing) return false; // Records in Editing or Review stage must never be published!
+
+  return true;
+}
+
 /**
  * Resolves each entry's lifecycle status against the Strapi v5 Document Service.
  * - For non-draftAndPublish collections: returns 'published' for all entries.
@@ -1048,6 +1208,45 @@ async function executeBatchInternal(
   const targets = Array.from(targetsMap.values());
   const CHUNK_SIZE = 25; // 25 concurrent updates per batch window
 
+  // Pre-fetch published counterparts for all draftAndPublish targets in a single batched query per collection
+  const publishedCounterparts = new Map<string, any>();
+  const uidsWithDraftAndPublish = new Set<string>();
+  const docIdsByUid = new Map<string, string[]>();
+  for (const target of targets) {
+    if (target.uid && target.documentId) {
+      const ct = strapi.contentTypes[target.uid];
+      if (ct?.options?.draftAndPublish) {
+        uidsWithDraftAndPublish.add(target.uid);
+        if (!docIdsByUid.has(target.uid)) {
+          docIdsByUid.set(target.uid, []);
+        }
+        docIdsByUid.get(target.uid)!.push(target.documentId);
+      }
+    }
+  }
+
+  for (const colUid of uidsWithDraftAndPublish) {
+    const docIds = docIdsByUid.get(colUid) || [];
+    if (docIds.length > 0) {
+      try {
+        const pubDocs = await (strapi.documents(colUid as any) as any).findMany({
+          status: 'published',
+          filters: { documentId: { $in: docIds } },
+          fields: ['documentId', 'updatedAt', 'publishedAt', 'locale'],
+          limit: Math.max(docIds.length, 100),
+        });
+        for (const pub of (pubDocs || [])) {
+          if (pub?.documentId) {
+            publishedCounterparts.set(`${colUid}@@@${pub.documentId}`, pub);
+            if (pub.locale) {
+              publishedCounterparts.set(`${colUid}@@@${pub.documentId}@@@${pub.locale}`, pub);
+            }
+          }
+        }
+      } catch {}
+    }
+  }
+
   // Request-scoped DataLoader for deduplicating lookups during batch itemization
   const documentLoader = new Map<string, Promise<any>>();
   const getDocumentDeduplicated = (uid: string, documentId: string) => {
@@ -1124,24 +1323,66 @@ async function executeBatchInternal(
               targetComponentUid,
             });
 
-            await strapi.documents(target.uid as any).update({
+            const isDraftAndPublishComp = Boolean(contentType?.options?.draftAndPublish);
+            const candLocaleComp = (target as any).locale || currentEntry?.locale;
+            let pubRecordComp = (candLocaleComp && publishedCounterparts.get(`${target.uid}@@@${target.documentId}@@@${candLocaleComp}`)) ||
+              publishedCounterparts.get(`${target.uid}@@@${target.documentId}`);
+            if (!pubRecordComp && isDraftAndPublishComp && target.documentId) {
+              try {
+                const singlePub = await (strapi.documents(target.uid as any) as any).findMany({
+                  status: 'published',
+                  filters: { documentId: target.documentId },
+                  fields: ['documentId', 'updatedAt', 'publishedAt', 'locale'],
+                  limit: 1,
+                });
+                if (singlePub && singlePub.length > 0) {
+                  pubRecordComp = singlePub[0];
+                  publishedCounterparts.set(`${target.uid}@@@${target.documentId}`, pubRecordComp);
+                }
+              } catch {}
+            }
+
+            const inspectionTargetComp = ((target as any).status || (target as any).publishedAt)
+              ? { ...currentEntry, status: (target as any).status, publishedAt: (target as any).publishedAt }
+              : currentEntry;
+
+            const { hadPublishedVersion: hadPubComp } = resolveRecordPublicationStatus(
+              inspectionTargetComp,
+              pubRecordComp,
+              isDraftAndPublishComp
+            );
+
+            const isEditingComp = isRowInEditingStage(inspectionTargetComp) || isRowInEditingStage(target as any);
+            const shouldPublishComp = evaluateShouldPublish({
+              isDraftAndPublish: isDraftAndPublishComp,
+              hadPublishedVersion: hadPubComp,
+              isEditing: isEditingComp,
+              publishOnApproval: Boolean(publishOnApproval),
+              publishStrategy,
+              unreviewedConsent,
+            });
+
+            const updateArgsComp: any = {
               documentId: target.documentId,
               data: {
                 [rootKey]: updatedRoot,
               },
-            });
+            };
+            if (Boolean(contentType?.pluginOptions?.i18n?.localized) && candLocaleComp && candLocaleComp !== 'null' && candLocaleComp !== 'undefined') {
+              updateArgsComp.locale = candLocaleComp;
+            }
 
-            // If publishOnApproval is true and content type has draftAndPublish enabled, publish the document
-            const isDraftAndPublishComp = Boolean(contentType?.options?.draftAndPublish);
-            const isApprovedComp = isDraftAndPublishComp && Boolean(currentEntry?.publishedAt) && currentEntry?.status !== 'modified';
-            const shouldPublishComp = isDraftAndPublishComp && Boolean(publishOnApproval) && (
-              publishStrategy === 'all' ? true : isApprovedComp
-            );
+            await strapi.documents(target.uid as any).update(updateArgsComp);
+
             if (shouldPublishComp) {
               try {
-                await (strapi.documents(target.uid as any) as any).publish({
+                const pubArgs: any = {
                   documentId: target.documentId,
-                });
+                };
+                if (Boolean(contentType?.pluginOptions?.i18n?.localized) && candLocaleComp && candLocaleComp !== 'null' && candLocaleComp !== 'undefined') {
+                  pubArgs.locale = candLocaleComp;
+                }
+                await (strapi.documents(target.uid as any) as any).publish(pubArgs);
               } catch (publishErr) {
                 strapi.log.warn(`[bulk-updater] Failed to auto-publish ${target.uid}/${target.documentId}:`, publishErr);
               }
@@ -1153,7 +1394,7 @@ async function executeBatchInternal(
               uid: target.uid,
               documentId: target.documentId,
               userId: currentUser?.id,
-              statusOverride: shouldPublishComp ? 'published' : (isDraftAndPublishComp ? 'draft' : undefined),
+              statusOverride: shouldPublishComp ? 'published' : (isDraftAndPublishComp ? (hadPubComp ? 'modified' : 'draft') : undefined),
             });
 
             const dzDiffs = isRootDz && affectedMatches.length > 0
@@ -1245,24 +1486,66 @@ async function executeBatchInternal(
               relationPayload = { disconnect: targetDocIds };
             }
 
-            await strapi.documents(target.uid as any).update({
+            const isDraftAndPublishRel = Boolean(contentType?.options?.draftAndPublish);
+            const candLocaleRel = (target as any).locale || currentEntry?.locale;
+            let pubRecordRel = (candLocaleRel && publishedCounterparts.get(`${target.uid}@@@${target.documentId}@@@${candLocaleRel}`)) ||
+              publishedCounterparts.get(`${target.uid}@@@${target.documentId}`);
+            if (!pubRecordRel && isDraftAndPublishRel && target.documentId) {
+              try {
+                const singlePub = await (strapi.documents(target.uid as any) as any).findMany({
+                  status: 'published',
+                  filters: { documentId: target.documentId },
+                  fields: ['documentId', 'updatedAt', 'publishedAt', 'locale'],
+                  limit: 1,
+                });
+                if (singlePub && singlePub.length > 0) {
+                  pubRecordRel = singlePub[0];
+                  publishedCounterparts.set(`${target.uid}@@@${target.documentId}`, pubRecordRel);
+                }
+              } catch {}
+            }
+
+            const inspectionTargetRel = ((target as any).status || (target as any).publishedAt)
+              ? { ...currentEntry, status: (target as any).status, publishedAt: (target as any).publishedAt }
+              : currentEntry;
+
+            const { hadPublishedVersion: hadPubRel } = resolveRecordPublicationStatus(
+              inspectionTargetRel,
+              pubRecordRel,
+              isDraftAndPublishRel
+            );
+
+            const isEditingRel = isRowInEditingStage(inspectionTargetRel) || isRowInEditingStage(target as any);
+            const shouldPublishRel = evaluateShouldPublish({
+              isDraftAndPublish: isDraftAndPublishRel,
+              hadPublishedVersion: hadPubRel,
+              isEditing: isEditingRel,
+              publishOnApproval: Boolean(publishOnApproval),
+              publishStrategy,
+              unreviewedConsent,
+            });
+
+            const updateArgsRel: any = {
               documentId: target.documentId,
               data: {
                 [attribute]: relationPayload,
               },
-            });
+            };
+            if (Boolean(contentType?.pluginOptions?.i18n?.localized) && candLocaleRel && candLocaleRel !== 'null' && candLocaleRel !== 'undefined') {
+              updateArgsRel.locale = candLocaleRel;
+            }
 
-            // If publishOnApproval is true and content type has draftAndPublish enabled, publish the document
-            const isDraftAndPublishRel = Boolean(contentType?.options?.draftAndPublish);
-            const isApprovedRel = isDraftAndPublishRel && Boolean(currentEntry?.publishedAt) && currentEntry?.status !== 'modified';
-            const shouldPublishRel = isDraftAndPublishRel && Boolean(publishOnApproval) && (
-              publishStrategy === 'all' ? true : isApprovedRel
-            );
+            await strapi.documents(target.uid as any).update(updateArgsRel);
+
             if (shouldPublishRel) {
               try {
-                await (strapi.documents(target.uid as any) as any).publish({
+                const pubArgs: any = {
                   documentId: target.documentId,
-                });
+                };
+                if (Boolean(contentType?.pluginOptions?.i18n?.localized) && candLocaleRel && candLocaleRel !== 'null' && candLocaleRel !== 'undefined') {
+                  pubArgs.locale = candLocaleRel;
+                }
+                await (strapi.documents(target.uid as any) as any).publish(pubArgs);
               } catch (publishErr) {
                 strapi.log.warn(`[bulk-updater] Failed to auto-publish ${target.uid}/${target.documentId}:`, publishErr);
               }
@@ -1277,7 +1560,7 @@ async function executeBatchInternal(
               uid: target.uid,
               documentId: target.documentId,
               userId: currentUser?.id,
-              statusOverride: shouldPublishRel ? 'published' : (isDraftAndPublishRel ? 'draft' : undefined),
+              statusOverride: shouldPublishRel ? 'published' : (isDraftAndPublishRel ? (hadPubRel ? 'modified' : 'draft') : undefined),
             });
 
             return {
@@ -1300,24 +1583,66 @@ async function executeBatchInternal(
             newValue = currentVal.replace(regexObj, value);
           }
 
-          await strapi.documents(target.uid as any).update({
+          const isDraftAndPublishScalar = Boolean(contentType?.options?.draftAndPublish);
+          const candLocaleScalar = (target as any).locale || currentEntry?.locale;
+          let pubRecordScalar = (candLocaleScalar && publishedCounterparts.get(`${target.uid}@@@${target.documentId}@@@${candLocaleScalar}`)) ||
+            publishedCounterparts.get(`${target.uid}@@@${target.documentId}`);
+          if (!pubRecordScalar && isDraftAndPublishScalar && target.documentId) {
+            try {
+              const singlePub = await (strapi.documents(target.uid as any) as any).findMany({
+                status: 'published',
+                filters: { documentId: target.documentId },
+                fields: ['documentId', 'updatedAt', 'publishedAt', 'locale'],
+                limit: 1,
+              });
+              if (singlePub && singlePub.length > 0) {
+                pubRecordScalar = singlePub[0];
+                publishedCounterparts.set(`${target.uid}@@@${target.documentId}`, pubRecordScalar);
+              }
+            } catch {}
+          }
+
+          const inspectionTargetScalar = ((target as any).status || (target as any).publishedAt)
+            ? { ...currentEntry, status: (target as any).status, publishedAt: (target as any).publishedAt }
+            : currentEntry;
+
+          const { hadPublishedVersion: hadPubScalar } = resolveRecordPublicationStatus(
+            inspectionTargetScalar,
+            pubRecordScalar,
+            isDraftAndPublishScalar
+          );
+
+          const isEditingScalar = isRowInEditingStage(inspectionTargetScalar) || isRowInEditingStage(target as any);
+          const shouldPublishScalar = evaluateShouldPublish({
+            isDraftAndPublish: isDraftAndPublishScalar,
+            hadPublishedVersion: hadPubScalar,
+            isEditing: isEditingScalar,
+            publishOnApproval: Boolean(publishOnApproval),
+            publishStrategy,
+            unreviewedConsent,
+          });
+
+          const updateArgsScalar: any = {
             documentId: target.documentId,
             data: {
               [attribute]: newValue,
             },
-          });
+          };
+          if (Boolean(contentType?.pluginOptions?.i18n?.localized) && candLocaleScalar && candLocaleScalar !== 'null' && candLocaleScalar !== 'undefined') {
+            updateArgsScalar.locale = candLocaleScalar;
+          }
 
-          // If publishOnApproval is true and content type has draftAndPublish enabled, publish the document
-          const isDraftAndPublishScalar = Boolean(contentType?.options?.draftAndPublish);
-          const isApprovedScalar = isDraftAndPublishScalar && Boolean(currentEntry?.publishedAt) && currentEntry?.status !== 'modified';
-          const shouldPublishScalar = isDraftAndPublishScalar && Boolean(publishOnApproval) && (
-            publishStrategy === 'all' ? true : isApprovedScalar
-          );
+          await strapi.documents(target.uid as any).update(updateArgsScalar);
+
           if (shouldPublishScalar) {
             try {
-              await (strapi.documents(target.uid as any) as any).publish({
+              const pubArgs: any = {
                 documentId: target.documentId,
-              });
+              };
+              if (Boolean(contentType?.pluginOptions?.i18n?.localized) && candLocaleScalar && candLocaleScalar !== 'null' && candLocaleScalar !== 'undefined') {
+                pubArgs.locale = candLocaleScalar;
+              }
+              await (strapi.documents(target.uid as any) as any).publish(pubArgs);
             } catch (publishErr) {
               strapi.log.warn(`[bulk-updater] Failed to auto-publish ${target.uid}/${target.documentId}:`, publishErr);
             }
@@ -1327,7 +1652,7 @@ async function executeBatchInternal(
             uid: target.uid,
             documentId: target.documentId,
             userId: currentUser?.id,
-            statusOverride: shouldPublishScalar ? 'published' : (isDraftAndPublishScalar ? 'draft' : undefined),
+            statusOverride: shouldPublishScalar ? 'published' : (isDraftAndPublishScalar ? (hadPubScalar ? 'modified' : 'draft') : undefined),
           });
 
           return {

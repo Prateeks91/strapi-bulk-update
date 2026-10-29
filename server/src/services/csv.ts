@@ -5,6 +5,8 @@ import {
   checkBusinessHours,
   registerPendingBatch,
   type PendingBatch,
+  resolveRecordPublicationStatus,
+  evaluateShouldPublish,
 } from './bulk-updater';
 import { extractHeadingsFromRichText } from './validation-rules';
 
@@ -1070,6 +1072,28 @@ export async function processCsvRows(
   const { mode = 'auto', publish = true, publishStrategy = 'safe', user } = options;
   const isDraftAndPublish = Boolean(ct.options?.draftAndPublish);
 
+  // Pre-fetch published counterparts for all rows with docId in chunk
+  const docIdsInChunk = rows.map((r) => extractDocId(r)).filter(Boolean);
+  const publishedCounterparts = new Map<string, any>();
+  if (isDraftAndPublish && docIdsInChunk.length > 0) {
+    try {
+      const pubDocs = await (strapi.documents(uid as any) as any).findMany({
+        status: 'published',
+        filters: { documentId: { $in: docIdsInChunk } },
+        fields: ['documentId', 'updatedAt', 'publishedAt', 'locale'],
+        limit: Math.max(docIdsInChunk.length, 100),
+      });
+      for (const pub of (pubDocs || [])) {
+        if (pub?.documentId) {
+          publishedCounterparts.set(String(pub.documentId), pub);
+          if (pub.locale) {
+            publishedCounterparts.set(`${pub.documentId}@@@${pub.locale}`, pub);
+          }
+        }
+      }
+    } catch {}
+  }
+
   const stats: ProcessRowsStats = {
     total: rows.length,
     created: 0,
@@ -1158,10 +1182,41 @@ export async function processCsvRows(
 
         await (strapi.documents(uid as any) as any).update(updateArgs);
 
-        const isApproved = !isEditing && isDraftAndPublish && Boolean(existing?.publishedAt) && existing?.status !== 'modified';
-        const shouldPublish = !isEditing && isDraftAndPublish && Boolean(publish) && (
-          publishStrategy === 'all' || options.unreviewedConsent ? true : isApproved
+        let pubRecord = (effectiveLocale && publishedCounterparts.get(`${resolvedDocId}@@@${effectiveLocale}`)) ||
+          publishedCounterparts.get(String(resolvedDocId));
+        if (!pubRecord && isDraftAndPublish && resolvedDocId) {
+          try {
+            const singlePub = await (strapi.documents(uid as any) as any).findMany({
+              status: 'published',
+              filters: { documentId: resolvedDocId },
+              fields: ['documentId', 'updatedAt', 'publishedAt', 'locale'],
+              limit: 1,
+            });
+            if (singlePub && singlePub.length > 0) {
+              pubRecord = singlePub[0];
+              publishedCounterparts.set(String(resolvedDocId), pubRecord);
+            }
+          } catch {}
+        }
+
+        const inspectionExisting = (row.status || row.publishedAt)
+          ? { ...existing, status: row.status, publishedAt: row.publishedAt }
+          : existing;
+
+        const { hadPublishedVersion } = resolveRecordPublicationStatus(
+          inspectionExisting,
+          pubRecord,
+          isDraftAndPublish
         );
+
+        const shouldPublish = evaluateShouldPublish({
+          isDraftAndPublish,
+          hadPublishedVersion,
+          isEditing,
+          publishOnApproval: Boolean(publish),
+          publishStrategy,
+          unreviewedConsent: options.unreviewedConsent,
+        });
 
         if (shouldPublish) {
           try {
@@ -1180,7 +1235,7 @@ export async function processCsvRows(
             userId: user?.id,
             statusOverride: shouldPublish
               ? 'published'
-              : (isDraftAndPublish ? (existing?.publishedAt ? 'modified' : 'draft') : undefined),
+              : (isDraftAndPublish ? (hadPublishedVersion ? 'modified' : 'draft') : undefined),
           });
         } catch {}
 
@@ -1223,10 +1278,41 @@ export async function processCsvRows(
 
           await (strapi.documents(uid as any) as any).update(updateArgs);
 
-          const isApproved = !isEditing && isDraftAndPublish && Boolean(existing?.publishedAt) && existing?.status !== 'modified';
-          const shouldPublish = !isEditing && isDraftAndPublish && Boolean(publish) && (
-            publishStrategy === 'all' || options.unreviewedConsent ? true : isApproved
+          let pubRecord = (effectiveLocale && publishedCounterparts.get(`${resolvedDocId}@@@${effectiveLocale}`)) ||
+            publishedCounterparts.get(String(resolvedDocId));
+          if (!pubRecord && isDraftAndPublish && resolvedDocId) {
+            try {
+              const singlePub = await (strapi.documents(uid as any) as any).findMany({
+                status: 'published',
+                filters: { documentId: resolvedDocId },
+                fields: ['documentId', 'updatedAt', 'publishedAt', 'locale'],
+                limit: 1,
+              });
+              if (singlePub && singlePub.length > 0) {
+                pubRecord = singlePub[0];
+                publishedCounterparts.set(String(resolvedDocId), pubRecord);
+              }
+            } catch {}
+          }
+
+          const inspectionExisting = (row.status || row.publishedAt)
+            ? { ...existing, status: row.status, publishedAt: row.publishedAt }
+            : existing;
+
+          const { hadPublishedVersion } = resolveRecordPublicationStatus(
+            inspectionExisting,
+            pubRecord,
+            isDraftAndPublish
           );
+
+          const shouldPublish = evaluateShouldPublish({
+            isDraftAndPublish,
+            hadPublishedVersion,
+            isEditing,
+            publishOnApproval: Boolean(publish),
+            publishStrategy,
+            unreviewedConsent: options.unreviewedConsent,
+          });
 
           if (shouldPublish) {
             try {
@@ -1245,7 +1331,7 @@ export async function processCsvRows(
               userId: user?.id,
               statusOverride: shouldPublish
                 ? 'published'
-                : (isDraftAndPublish ? (existing?.publishedAt ? 'modified' : 'draft') : undefined),
+                : (isDraftAndPublish ? (hadPublishedVersion ? 'modified' : 'draft') : undefined),
             });
           } catch {}
 
@@ -1339,10 +1425,41 @@ export async function processCsvRows(
 
           await (strapi.documents(uid as any) as any).update(updateArgs);
 
-          const isApproved = !isEditing && isDraftAndPublish && Boolean(existing?.publishedAt) && existing?.status !== 'modified';
-          const shouldPublish = !isEditing && isDraftAndPublish && Boolean(publish) && (
-            publishStrategy === 'all' || options.unreviewedConsent ? true : isApproved
+          let pubRecord = (effectiveLocale && publishedCounterparts.get(`${resolvedDocId}@@@${effectiveLocale}`)) ||
+            publishedCounterparts.get(String(resolvedDocId));
+          if (!pubRecord && isDraftAndPublish && resolvedDocId) {
+            try {
+              const singlePub = await (strapi.documents(uid as any) as any).findMany({
+                status: 'published',
+                filters: { documentId: resolvedDocId },
+                fields: ['documentId', 'updatedAt', 'publishedAt', 'locale'],
+                limit: 1,
+              });
+              if (singlePub && singlePub.length > 0) {
+                pubRecord = singlePub[0];
+                publishedCounterparts.set(String(resolvedDocId), pubRecord);
+              }
+            } catch {}
+          }
+
+          const inspectionExisting = (row.status || row.publishedAt)
+            ? { ...existing, status: row.status, publishedAt: row.publishedAt }
+            : existing;
+
+          const { hadPublishedVersion } = resolveRecordPublicationStatus(
+            inspectionExisting,
+            pubRecord,
+            isDraftAndPublish
           );
+
+          const shouldPublish = evaluateShouldPublish({
+            isDraftAndPublish,
+            hadPublishedVersion,
+            isEditing,
+            publishOnApproval: Boolean(publish),
+            publishStrategy,
+            unreviewedConsent: options.unreviewedConsent,
+          });
 
           if (shouldPublish) {
             try {
@@ -1361,7 +1478,7 @@ export async function processCsvRows(
               userId: user?.id,
               statusOverride: shouldPublish
                 ? 'published'
-                : (isDraftAndPublish ? (existing?.publishedAt ? 'modified' : 'draft') : undefined),
+                : (isDraftAndPublish ? (hadPublishedVersion ? 'modified' : 'draft') : undefined),
             });
           } catch {}
 
@@ -2172,10 +2289,18 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
       if (existing && isDraftAndPublish) {
         lifecycleStats.totalChecked++;
-        const isApproved = !isEditing && Boolean(existing.publishedAt) && existing.status !== 'modified';
+        const inspectionExisting = (row.status || row.publishedAt)
+          ? { ...existing, status: row.status, publishedAt: row.publishedAt }
+          : existing;
+        const { status: preStatus, hadPublishedVersion } = resolveRecordPublicationStatus(
+          inspectionExisting,
+          undefined,
+          isDraftAndPublish
+        );
+        const isApproved = !isEditing && hadPublishedVersion;
         if (isApproved) {
           lifecycleStats.published++;
-        } else if (existing.status === 'modified' || (existing.publishedAt && isEditing)) {
+        } else if (preStatus === 'modified' || (hadPublishedVersion && isEditing)) {
           lifecycleStats.modified++;
           lifecycleStats.unreviewedCount++;
         } else {
