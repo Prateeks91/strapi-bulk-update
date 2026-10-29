@@ -90,41 +90,104 @@ export function formatEntryRecord(entry: any): any {
  */
 export function extractStageName(val: any): string {
   if (val === undefined || val === null) return '';
-  if (typeof val === 'object') {
-    // If it's a row object containing a stage property
-    const candidateProps = [
-      'strapi_stage',
-      'strapi_stage.name',
-      'strapiStage',
-      'Strapi Stage',
-      'strapi-stage',
-      'stage',
-      'Stage',
-      'review_stage',
-    ];
-    for (const prop of candidateProps) {
-      if (val[prop] !== undefined && val[prop] !== null) {
-        const fromProp = extractStageName(val[prop]);
-        if (fromProp) return fromProp;
-      }
-    }
-    // If val itself is the stage object (e.g. { name: 'Approved', ... })
-    return String(val.name || val.title || val.status || val.label || '').trim();
-  }
+
   if (typeof val === 'string') {
     const trimmed = val.trim();
     if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
       try {
         const parsed = JSON.parse(trimmed);
         if (parsed && typeof parsed === 'object') {
-          const fromParsed = String(parsed.name || parsed.title || parsed.status || parsed.label || '').trim();
+          const fromParsed = extractStageName(parsed);
           if (fromParsed) return fromParsed;
         }
       } catch {}
     }
     return trimmed;
   }
-  return String(val).trim();
+
+  if (typeof val === 'number') {
+    return String(val);
+  }
+
+  if (typeof val === 'object') {
+    // 1. Direct candidate stage properties on this object (e.g. if val is a row, entry, or wrapper)
+    const candidateProps = [
+      'strapi_stage',
+      'strapi_stage.name',
+      'strapi_stage[name]',
+      'strapi_stage.title',
+      'strapiStage',
+      'Strapi Stage',
+      'strapi-stage',
+      'strapi_stage_name',
+      'stage',
+      'Stage',
+      'stage.name',
+      'stage[name]',
+      'stage_name',
+      'Stage Name',
+      'review_stage',
+      'review_stage.name',
+      'review_stage[name]',
+      'Review Stage',
+      'reviewStage',
+      'workflow_stage',
+      'workflow_stage.name',
+      'Workflow Stage',
+      'workflowStage',
+    ];
+
+    for (const prop of candidateProps) {
+      if (val[prop] !== undefined && val[prop] !== null) {
+        const fromProp = extractStageName(val[prop]);
+        if (fromProp) return fromProp;
+      }
+    }
+
+    // 2. Case-insensitive / normalized property check on row or entry
+    const keys = Object.keys(val);
+    for (const k of keys) {
+      const norm = k.toLowerCase().replace(/[\s_\-\.\[\]]+/g, '');
+      if (
+        norm === 'strapistage' ||
+        norm === 'strapistagename' ||
+        norm === 'stagename' ||
+        norm === 'reviewstage' ||
+        norm === 'reviewstagename' ||
+        norm === 'workflowstage' ||
+        norm === 'workflowstagename'
+      ) {
+        if (val[k] !== undefined && val[k] !== null) {
+          const fromNorm = extractStageName(val[k]);
+          if (fromNorm) return fromNorm;
+        }
+      }
+    }
+
+    // 3. If this object is a document entry or CSV row (has documentId but is not a stage entity with color/workflow)
+    // do NOT accidentally return entry.name or entry.title as a workflow stage!
+    if (val.documentId && !val.color && !val.workflow) {
+      return '';
+    }
+
+    // 4. val itself is the stage object (e.g. { name: 'Approved', color: '#E0C1F4', locale: null })
+    const candidateStageValues = [
+      val.name,
+      val.title,
+      val.label,
+      val.value,
+      val.stageName,
+      val.stage_name,
+      val.status,
+    ];
+    for (const sv of candidateStageValues) {
+      if (sv !== undefined && sv !== null && typeof sv === 'string' && sv.trim()) {
+        return sv.trim();
+      }
+    }
+  }
+
+  return '';
 }
 
 /**
@@ -156,16 +219,43 @@ export function isStageEditingOrPending(stageVal: any): boolean {
  *   or if publishedAt is present.
  * - Pure 'draft' records have never been published.
  */
-export function inspectPreUpdateStatus(entry: any): { hadPublishedVersion: boolean; isModified: boolean } {
+export function inspectPreUpdateStatus(
+  entry: any,
+  publishedCounterpart?: any
+): { hadPublishedVersion: boolean; isModified: boolean } {
   if (!entry || typeof entry !== 'object') {
     return { hadPublishedVersion: false, isModified: false };
   }
 
-  const isModified = entry.status === 'modified';
-  const isPublished = entry.status === 'published' || Boolean(entry.publishedAt);
-  const hadPublishedVersion = isModified || isPublished;
+  // 1. If explicit lifecycle status is already tagged on entry (e.g. from grid)
+  const status = String(entry.status || '').toLowerCase();
+  if (status === 'published') {
+    return { hadPublishedVersion: true, isModified: false };
+  }
+  if (status === 'modified' || status === 'modified draft') {
+    return { hadPublishedVersion: true, isModified: true };
+  }
+  if (status === 'draft') {
+    return { hadPublishedVersion: false, isModified: false };
+  }
 
-  return { hadPublishedVersion, isModified };
+  // 2. If a published counterpart was discovered from Strapi 5 Document Service findMany({ status: 'published' })
+  if (publishedCounterpart) {
+    const draftUpdatedTime = new Date(entry.updatedAt || entry.updated_at || 0).getTime();
+    const pubUpdatedTime = new Date(publishedCounterpart.updatedAt || publishedCounterpart.updated_at || 0).getTime();
+    const pubPublishedTime = new Date(publishedCounterpart.publishedAt || publishedCounterpart.published_at || 0).getTime();
+    const lastPublishedTime = Math.max(
+      isNaN(pubUpdatedTime) ? 0 : pubUpdatedTime,
+      isNaN(pubPublishedTime) ? 0 : pubPublishedTime
+    );
+
+    const isModified = !isNaN(draftUpdatedTime) && lastPublishedTime > 0 && draftUpdatedTime > lastPublishedTime;
+    return { hadPublishedVersion: true, isModified };
+  }
+
+  // 3. Fallback to entry timestamps if present
+  const hasPubAt = Boolean(entry.publishedAt || entry.published_at);
+  return { hadPublishedVersion: hasPubAt, isModified: false };
 }
 
 /**
@@ -223,6 +313,14 @@ export function determineShouldPublish({
   if (isEditingOrPending) {
     return false;
   }
+
+  // Missing, null, or unrecognized stage values: Preserve plugin's existing behavior.
+  if (publishStrategy === 'all' || unreviewedConsent) {
+    return true;
+  }
+
+  // In safe mode for unrecognized stage: publish only if previously published and not modified.
+  return hadPublishedVersion && !isModified;
 
   // Missing, null, or unrecognized stage values: Preserve plugin's existing behavior.
   if (publishStrategy === 'all' || unreviewedConsent) {
@@ -1203,10 +1301,7 @@ async function executeBatchInternal(
     const loaderKey = `${uid}@@@${documentId}`;
     if (!documentLoader.has(loaderKey)) {
       const ct = strapi.contentTypes[uid];
-      const findOneArgs: any = { documentId };
-      if (ct?.attributes?.strapi_stage) {
-        findOneArgs.populate = ['strapi_stage'];
-      }
+      const findOneArgs: any = { documentId, populate: ['strapi_stage', 'stage'] };
       documentLoader.set(
         loaderKey,
         strapi.documents(uid as any).findOne(findOneArgs)
@@ -1217,6 +1312,38 @@ async function executeBatchInternal(
 
   for (let i = 0; i < targets.length; i += CHUNK_SIZE) {
     const chunk = targets.slice(i, i + CHUNK_SIZE);
+
+    // Pre-fetch published counterparts for all targets in this chunk across collections
+    const chunkByUid = new Map<string, string[]>();
+    for (const t of chunk) {
+      if (t.uid && t.documentId) {
+        if (!chunkByUid.has(t.uid)) chunkByUid.set(t.uid, []);
+        chunkByUid.get(t.uid).push(t.documentId);
+      }
+    }
+
+    const publishedCounterparts = new Map<string, any>();
+    for (const [colUid, docIds] of chunkByUid.entries()) {
+      const colCt = strapi.contentTypes[colUid];
+      if (colCt?.options?.draftAndPublish && docIds.length > 0) {
+        try {
+          const pubList = await (strapi.documents(colUid as any) as any).findMany({
+            status: 'published',
+            filters: { documentId: { $in: docIds } },
+            fields: ['documentId', 'updatedAt', 'publishedAt'],
+            limit: docIds.length,
+          });
+          for (const pub of pubList || []) {
+            if (pub?.documentId) {
+              publishedCounterparts.set(`${colUid}@@@${pub.documentId}`, pub);
+            }
+          }
+        } catch (err) {
+          strapi.log.warn(`[bulk-updater] Failed to pre-fetch published status for ${colUid}:`, err);
+        }
+      }
+    }
+
     const chunkPromises = chunk.map(async (target) => {
       const contentType = strapi.contentTypes[target.uid];
       const displayName = contentType?.info?.displayName || target.uid;
@@ -1287,7 +1414,25 @@ async function executeBatchInternal(
 
             // If publishOnApproval is true and content type has draftAndPublish enabled, publish the document
             const isDraftAndPublishComp = Boolean(contentType?.options?.draftAndPublish);
-            const { hadPublishedVersion: hadPubComp, isModified: isModComp } = inspectPreUpdateStatus(currentEntry);
+            let pubRecordComp = publishedCounterparts.get(`${target.uid}@@@${target.documentId}`);
+            if (!pubRecordComp && isDraftAndPublishComp && target.documentId) {
+              try {
+                const singlePub = await (strapi.documents(target.uid as any) as any).findMany({
+                  status: 'published',
+                  filters: { documentId: target.documentId },
+                  fields: ['documentId', 'updatedAt', 'publishedAt'],
+                  limit: 1,
+                });
+                if (singlePub && singlePub.length > 0) {
+                  pubRecordComp = singlePub[0];
+                  publishedCounterparts.set(`${target.uid}@@@${target.documentId}`, pubRecordComp);
+                }
+              } catch {}
+            }
+            const inspectionTargetComp = (target.status || target.publishedAt)
+              ? { ...currentEntry, status: target.status, publishedAt: target.publishedAt }
+              : currentEntry;
+            const { hadPublishedVersion: hadPubComp, isModified: isModComp } = inspectPreUpdateStatus(inspectionTargetComp, pubRecordComp);
             const targetStageComp =
               (attribute.toLowerCase() === 'strapi_stage' || attribute.toLowerCase() === 'stage')
                 ? value
@@ -1304,8 +1449,9 @@ async function executeBatchInternal(
             if (shouldPublishComp) {
               try {
                 const pubArgs: any = { documentId: target.documentId };
-                if (target.locale || currentEntry?.locale) {
-                  pubArgs.locale = target.locale || currentEntry?.locale;
+                const candLoc = target.locale || currentEntry?.locale;
+                if (Boolean(contentType?.pluginOptions?.i18n?.localized) && candLoc && candLoc !== 'null' && candLoc !== 'undefined') {
+                  pubArgs.locale = candLoc;
                 }
                 await (strapi.documents(target.uid as any) as any).publish(pubArgs);
               } catch (publishErr) {
@@ -1420,7 +1566,25 @@ async function executeBatchInternal(
 
             // If publishOnApproval is true and content type has draftAndPublish enabled, publish the document
             const isDraftAndPublishRel = Boolean(contentType?.options?.draftAndPublish);
-            const { hadPublishedVersion: hadPubRel, isModified: isModRel } = inspectPreUpdateStatus(currentEntry);
+            let pubRecordRel = publishedCounterparts.get(`${target.uid}@@@${target.documentId}`);
+            if (!pubRecordRel && isDraftAndPublishRel && target.documentId) {
+              try {
+                const singlePub = await (strapi.documents(target.uid as any) as any).findMany({
+                  status: 'published',
+                  filters: { documentId: target.documentId },
+                  fields: ['documentId', 'updatedAt', 'publishedAt'],
+                  limit: 1,
+                });
+                if (singlePub && singlePub.length > 0) {
+                  pubRecordRel = singlePub[0];
+                  publishedCounterparts.set(`${target.uid}@@@${target.documentId}`, pubRecordRel);
+                }
+              } catch {}
+            }
+            const inspectionTargetRel = (target.status || target.publishedAt)
+              ? { ...currentEntry, status: target.status, publishedAt: target.publishedAt }
+              : currentEntry;
+            const { hadPublishedVersion: hadPubRel, isModified: isModRel } = inspectPreUpdateStatus(inspectionTargetRel, pubRecordRel);
             const targetStageRel =
               (attribute.toLowerCase() === 'strapi_stage' || attribute.toLowerCase() === 'stage')
                 ? value
@@ -1437,8 +1601,9 @@ async function executeBatchInternal(
             if (shouldPublishRel) {
               try {
                 const pubArgs: any = { documentId: target.documentId };
-                if (target.locale || currentEntry?.locale) {
-                  pubArgs.locale = target.locale || currentEntry?.locale;
+                const candLoc = target.locale || currentEntry?.locale;
+                if (Boolean(contentType?.pluginOptions?.i18n?.localized) && candLoc && candLoc !== 'null' && candLoc !== 'undefined') {
+                  pubArgs.locale = candLoc;
                 }
                 await (strapi.documents(target.uid as any) as any).publish(pubArgs);
               } catch (publishErr) {
@@ -1487,7 +1652,25 @@ async function executeBatchInternal(
 
           // If publishOnApproval is true and content type has draftAndPublish enabled, publish the document
           const isDraftAndPublishScalar = Boolean(contentType?.options?.draftAndPublish);
-          const { hadPublishedVersion: hadPubScalar, isModified: isModScalar } = inspectPreUpdateStatus(currentEntry);
+          let pubRecordScalar = publishedCounterparts.get(`${target.uid}@@@${target.documentId}`);
+          if (!pubRecordScalar && isDraftAndPublishScalar && target.documentId) {
+            try {
+              const singlePub = await (strapi.documents(target.uid as any) as any).findMany({
+                status: 'published',
+                filters: { documentId: target.documentId },
+                fields: ['documentId', 'updatedAt', 'publishedAt'],
+                limit: 1,
+              });
+              if (singlePub && singlePub.length > 0) {
+                pubRecordScalar = singlePub[0];
+                publishedCounterparts.set(`${target.uid}@@@${target.documentId}`, pubRecordScalar);
+              }
+            } catch {}
+          }
+          const inspectionTargetScalar = (target.status || target.publishedAt)
+            ? { ...currentEntry, status: target.status, publishedAt: target.publishedAt }
+            : currentEntry;
+          const { hadPublishedVersion: hadPubScalar, isModified: isModScalar } = inspectPreUpdateStatus(inspectionTargetScalar, pubRecordScalar);
           const targetStageScalar =
             (attribute.toLowerCase() === 'strapi_stage' || attribute.toLowerCase() === 'stage')
               ? value
@@ -1504,8 +1687,9 @@ async function executeBatchInternal(
           if (shouldPublishScalar) {
             try {
               const pubArgs: any = { documentId: target.documentId };
-              if (target.locale || currentEntry?.locale) {
-                pubArgs.locale = target.locale || currentEntry?.locale;
+              const candLoc = target.locale || currentEntry?.locale;
+              if (Boolean(contentType?.pluginOptions?.i18n?.localized) && candLoc && candLoc !== 'null' && candLoc !== 'undefined') {
+                pubArgs.locale = candLoc;
               }
               await (strapi.documents(target.uid as any) as any).publish(pubArgs);
             } catch (publishErr) {
