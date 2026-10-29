@@ -5,6 +5,11 @@ import {
   checkBusinessHours,
   registerPendingBatch,
   type PendingBatch,
+  inspectPreUpdateStatus,
+  determineShouldPublish,
+  isStageApproved,
+  isStageEditingOrPending,
+  extractStageName,
 } from './bulk-updater';
 import { extractHeadingsFromRichText } from './validation-rules';
 
@@ -304,6 +309,11 @@ export function isRowInEditingStage(row: Record<string, any>): boolean {
     }
   }
   return false;
+}
+
+export function isRowInApprovedStage(row: Record<string, any>): boolean {
+  if (!row || typeof row !== 'object') return false;
+  return isStageApproved(row);
 }
 
 export function extractDetailedErrorMessage(err: any): string {
@@ -609,6 +619,7 @@ async function findExistingDocument(
   try {
     const queryArgs: any = { documentId: targetDocId };
     if (effectiveLocale) queryArgs.locale = effectiveLocale;
+    if (ct?.attributes?.strapi_stage) queryArgs.populate = ['strapi_stage'];
     const found = await (strapi.documents(uid as any) as any).findOne(queryArgs);
     if (found) return found;
   } catch {
@@ -1158,10 +1169,17 @@ export async function processCsvRows(
 
         await (strapi.documents(uid as any) as any).update(updateArgs);
 
-        const isApproved = !isEditing && isDraftAndPublish && Boolean(existing?.publishedAt) && existing?.status !== 'modified';
-        const shouldPublish = !isEditing && isDraftAndPublish && Boolean(publish) && (
-          publishStrategy === 'all' || options.unreviewedConsent ? true : isApproved
-        );
+        const { hadPublishedVersion, isModified } = inspectPreUpdateStatus(existing);
+        const stageVal = row.strapi_stage ?? row['strapi_stage'] ?? row.stage ?? (existing as any)?.strapi_stage;
+        const shouldPublish = determineShouldPublish({
+          isDraftAndPublish,
+          hadPublishedVersion,
+          isModified,
+          stageValue: stageVal,
+          publish: Boolean(publish),
+          publishStrategy,
+          unreviewedConsent: options.unreviewedConsent,
+        });
 
         if (shouldPublish) {
           try {
@@ -1180,7 +1198,7 @@ export async function processCsvRows(
             userId: user?.id,
             statusOverride: shouldPublish
               ? 'published'
-              : (isDraftAndPublish ? (existing?.publishedAt ? 'modified' : 'draft') : undefined),
+              : (isDraftAndPublish ? (hadPublishedVersion ? 'modified' : 'draft') : undefined),
           });
         } catch {}
 
@@ -1223,10 +1241,17 @@ export async function processCsvRows(
 
           await (strapi.documents(uid as any) as any).update(updateArgs);
 
-          const isApproved = !isEditing && isDraftAndPublish && Boolean(existing?.publishedAt) && existing?.status !== 'modified';
-          const shouldPublish = !isEditing && isDraftAndPublish && Boolean(publish) && (
-            publishStrategy === 'all' || options.unreviewedConsent ? true : isApproved
-          );
+          const { hadPublishedVersion, isModified } = inspectPreUpdateStatus(existing);
+          const stageVal = row.strapi_stage ?? row['strapi_stage'] ?? row.stage ?? (existing as any)?.strapi_stage;
+          const shouldPublish = determineShouldPublish({
+            isDraftAndPublish,
+            hadPublishedVersion,
+            isModified,
+            stageValue: stageVal,
+            publish: Boolean(publish),
+            publishStrategy,
+            unreviewedConsent: options.unreviewedConsent,
+          });
 
           if (shouldPublish) {
             try {
@@ -1245,7 +1270,7 @@ export async function processCsvRows(
               userId: user?.id,
               statusOverride: shouldPublish
                 ? 'published'
-                : (isDraftAndPublish ? (existing?.publishedAt ? 'modified' : 'draft') : undefined),
+                : (isDraftAndPublish ? (hadPublishedVersion ? 'modified' : 'draft') : undefined),
             });
           } catch {}
 
@@ -1273,7 +1298,8 @@ export async function processCsvRows(
         const created: any = await strapi.documents(uid as any).create(createArgs);
 
         const newDocId = created?.documentId || docId;
-        const shouldPublishNew = !isEditing && isDraftAndPublish && Boolean(publish) && (
+        const isApprovedStage = isRowInApprovedStage(row);
+        const shouldPublishNew = !isEditing && !isApprovedStage && isDraftAndPublish && Boolean(publish) && (
           publishStrategy === 'all' || options.unreviewedConsent ? true : false
         );
 
@@ -1339,10 +1365,17 @@ export async function processCsvRows(
 
           await (strapi.documents(uid as any) as any).update(updateArgs);
 
-          const isApproved = !isEditing && isDraftAndPublish && Boolean(existing?.publishedAt) && existing?.status !== 'modified';
-          const shouldPublish = !isEditing && isDraftAndPublish && Boolean(publish) && (
-            publishStrategy === 'all' || options.unreviewedConsent ? true : isApproved
-          );
+          const { hadPublishedVersion, isModified } = inspectPreUpdateStatus(existing);
+          const stageVal = row.strapi_stage ?? row['strapi_stage'] ?? row.stage ?? (existing as any)?.strapi_stage;
+          const shouldPublish = determineShouldPublish({
+            isDraftAndPublish,
+            hadPublishedVersion,
+            isModified,
+            stageValue: stageVal,
+            publish: Boolean(publish),
+            publishStrategy,
+            unreviewedConsent: options.unreviewedConsent,
+          });
 
           if (shouldPublish) {
             try {
@@ -1361,7 +1394,7 @@ export async function processCsvRows(
               userId: user?.id,
               statusOverride: shouldPublish
                 ? 'published'
-                : (isDraftAndPublish ? (existing?.publishedAt ? 'modified' : 'draft') : undefined),
+                : (isDraftAndPublish ? (hadPublishedVersion ? 'modified' : 'draft') : undefined),
             });
           } catch {}
 
@@ -1390,7 +1423,8 @@ export async function processCsvRows(
         const created: any = await strapi.documents(uid as any).create(createArgs);
 
         const newDocId = created?.documentId || docId;
-        const shouldPublishNew = !isEditing && isDraftAndPublish && Boolean(publish) && (
+        const isApprovedStage = isRowInApprovedStage(row);
+        const shouldPublishNew = !isEditing && !isApprovedStage && isDraftAndPublish && Boolean(publish) && (
           publishStrategy === 'all' || options.unreviewedConsent ? true : false
         );
 
@@ -2172,15 +2206,28 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
       if (existing && isDraftAndPublish) {
         lifecycleStats.totalChecked++;
-        const isApproved = !isEditing && Boolean(existing.publishedAt) && existing.status !== 'modified';
-        if (isApproved) {
+        const { hadPublishedVersion, isModified } = inspectPreUpdateStatus(existing);
+        const stageVal = row.strapi_stage ?? row['strapi_stage'] ?? row.stage ?? (existing as any)?.strapi_stage;
+        const willPublish = determineShouldPublish({
+          isDraftAndPublish,
+          hadPublishedVersion,
+          isModified,
+          stageValue: stageVal,
+          publish: true,
+          publishStrategy: options.publishStrategy || 'safe',
+          unreviewedConsent: options.unreviewedConsent,
+        });
+
+        if (willPublish) {
           lifecycleStats.published++;
-        } else if (existing.status === 'modified' || (existing.publishedAt && isEditing)) {
+        } else if (hadPublishedVersion && (isModified || isRowInEditingStage(row))) {
           lifecycleStats.modified++;
           lifecycleStats.unreviewedCount++;
-        } else {
+        } else if (!hadPublishedVersion) {
           lifecycleStats.draft++;
           lifecycleStats.unreviewedCount++;
+        } else {
+          lifecycleStats.published++;
         }
       }
 
