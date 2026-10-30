@@ -1174,14 +1174,6 @@ export async function processCsvRows(
           continue;
         }
 
-        const updateArgs: any = {
-          documentId: resolvedDocId,
-          data: mergedPayload,
-        };
-        if (effectiveLocale) updateArgs.locale = effectiveLocale;
-
-        await (strapi.documents(uid as any) as any).update(updateArgs);
-
         let pubRecord = (effectiveLocale && publishedCounterparts.get(`${resolvedDocId}@@@${effectiveLocale}`)) ||
           publishedCounterparts.get(String(resolvedDocId));
         if (!pubRecord && isDraftAndPublish && resolvedDocId) {
@@ -1199,8 +1191,10 @@ export async function processCsvRows(
           } catch {}
         }
 
-        const inspectionExisting = (row.status || row.publishedAt)
-          ? { ...existing, status: row.status, publishedAt: row.publishedAt }
+        const rowStatus = row.status || row.Status || row.STATUS || row['Published Status'] || row['published_status'] || row['strapi_status'];
+        const rowPubAt = row.publishedAt || row.published_at || row.PublishedAt;
+        const inspectionExisting = (rowStatus || rowPubAt)
+          ? { ...existing, ...(rowStatus ? { status: rowStatus } : {}), ...(rowPubAt ? { publishedAt: rowPubAt } : {}) }
           : existing;
 
         const { hadPublishedVersion } = resolveRecordPublicationStatus(
@@ -1218,6 +1212,16 @@ export async function processCsvRows(
           unreviewedConsent: options.unreviewedConsent,
         });
 
+        const updateArgs: any = {
+          documentId: resolvedDocId,
+          data: mergedPayload,
+        };
+        if (effectiveLocale) updateArgs.locale = effectiveLocale;
+
+        // Perform update mutation
+        await (strapi.documents(uid as any) as any).update(updateArgs);
+
+        // Publish ONLY after successful update, and ONLY if originally Published/Modified
         if (shouldPublish) {
           try {
             const pubArgs: any = { documentId: resolvedDocId };
@@ -1270,14 +1274,6 @@ export async function processCsvRows(
             }
           }
 
-          const updateArgs: any = {
-            documentId: resolvedDocId,
-            data: mergedPayload,
-          };
-          if (effectiveLocale) updateArgs.locale = effectiveLocale;
-
-          await (strapi.documents(uid as any) as any).update(updateArgs);
-
           let pubRecord = (effectiveLocale && publishedCounterparts.get(`${resolvedDocId}@@@${effectiveLocale}`)) ||
             publishedCounterparts.get(String(resolvedDocId));
           if (!pubRecord && isDraftAndPublish && resolvedDocId) {
@@ -1295,8 +1291,10 @@ export async function processCsvRows(
             } catch {}
           }
 
-          const inspectionExisting = (row.status || row.publishedAt)
-            ? { ...existing, status: row.status, publishedAt: row.publishedAt }
+          const rowStatus = row.status || row.Status || row.STATUS || row['Published Status'] || row['published_status'] || row['strapi_status'];
+          const rowPubAt = row.publishedAt || row.published_at || row.PublishedAt;
+          const inspectionExisting = (rowStatus || rowPubAt)
+            ? { ...existing, ...(rowStatus ? { status: rowStatus } : {}), ...(rowPubAt ? { publishedAt: rowPubAt } : {}) }
             : existing;
 
           const { hadPublishedVersion } = resolveRecordPublicationStatus(
@@ -1314,6 +1312,16 @@ export async function processCsvRows(
             unreviewedConsent: options.unreviewedConsent,
           });
 
+          const updateArgs: any = {
+            documentId: resolvedDocId,
+            data: mergedPayload,
+          };
+          if (effectiveLocale) updateArgs.locale = effectiveLocale;
+
+          // Perform update mutation
+          await (strapi.documents(uid as any) as any).update(updateArgs);
+
+          // Publish ONLY after successful update, and ONLY if originally Published/Modified
           if (shouldPublish) {
             try {
               const pubArgs: any = { documentId: resolvedDocId };
@@ -1417,14 +1425,6 @@ export async function processCsvRows(
             }
           }
 
-          const updateArgs: any = {
-            documentId: resolvedDocId,
-            data: mergedPayload,
-          };
-          if (effectiveLocale) updateArgs.locale = effectiveLocale;
-
-          await (strapi.documents(uid as any) as any).update(updateArgs);
-
           let pubRecord = (effectiveLocale && publishedCounterparts.get(`${resolvedDocId}@@@${effectiveLocale}`)) ||
             publishedCounterparts.get(String(resolvedDocId));
           if (!pubRecord && isDraftAndPublish && resolvedDocId) {
@@ -1442,8 +1442,10 @@ export async function processCsvRows(
             } catch {}
           }
 
-          const inspectionExisting = (row.status || row.publishedAt)
-            ? { ...existing, status: row.status, publishedAt: row.publishedAt }
+          const rowStatus = row.status || row.Status || row.STATUS || row['Published Status'] || row['published_status'] || row['strapi_status'];
+          const rowPubAt = row.publishedAt || row.published_at || row.PublishedAt;
+          const inspectionExisting = (rowStatus || rowPubAt)
+            ? { ...existing, ...(rowStatus ? { status: rowStatus } : {}), ...(rowPubAt ? { publishedAt: rowPubAt } : {}) }
             : existing;
 
           const { hadPublishedVersion } = resolveRecordPublicationStatus(
@@ -1461,6 +1463,16 @@ export async function processCsvRows(
             unreviewedConsent: options.unreviewedConsent,
           });
 
+          const updateArgs: any = {
+            documentId: resolvedDocId,
+            data: mergedPayload,
+          };
+          if (effectiveLocale) updateArgs.locale = effectiveLocale;
+
+          // Perform update mutation
+          await (strapi.documents(uid as any) as any).update(updateArgs);
+
+          // Publish ONLY after successful update, and ONLY if originally Published/Modified
           if (shouldPublish) {
             try {
               const pubArgs: any = { documentId: resolvedDocId };
@@ -1986,10 +1998,23 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         limit: docIds.length,
       });
 
+      let pubSet = new Set<string>();
+      if (Boolean(ct.options?.draftAndPublish)) {
+        try {
+          const pubDocs = await (strapi.documents(uid as any) as any).findMany({
+            status: 'published',
+            filters: { documentId: { $in: docIds } },
+            fields: ['documentId'],
+            limit: docIds.length,
+          });
+          pubSet = new Set((pubDocs || []).map((p: any) => String(p.documentId)));
+        } catch {}
+      }
+
       for (const entry of (entries || []) as any[]) {
         const titleOrName = entry.title || entry.name || entry.subject || entry.email || `Entry #${entry.documentId}`;
         const identifier = entry.slug || entry.email || entry.username || entry.documentId;
-        const isPublished = Boolean(entry.publishedAt);
+        const isPublished = Boolean(entry.publishedAt) || pubSet.has(String(entry.documentId));
 
         const row = [
           uid,
@@ -2272,6 +2297,28 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     const errors: Array<{ row: number; documentId?: string; error: string }> = [];
     const warnings: Array<{ row: number; documentId?: string; warning: string }> = [];
 
+    // Pre-fetch published counterparts for preflight
+    const docIdsInPreflight = rows.map((r) => extractDocId(r)).filter(Boolean);
+    const publishedCounterparts = new Map<string, any>();
+    if (isDraftAndPublish && docIdsInPreflight.length > 0) {
+      try {
+        const pubDocs = await (strapi.documents(uid as any) as any).findMany({
+          status: 'published',
+          filters: { documentId: { $in: docIdsInPreflight } },
+          fields: ['documentId', 'updatedAt', 'publishedAt', 'locale'],
+          limit: Math.max(docIdsInPreflight.length, 100),
+        });
+        for (const pub of (pubDocs || [])) {
+          if (pub?.documentId) {
+            publishedCounterparts.set(String(pub.documentId), pub);
+            if (pub.locale) {
+              publishedCounterparts.set(`${pub.documentId}@@@${pub.locale}`, pub);
+            }
+          }
+        }
+      } catch {}
+    }
+
     for (let i = 0; i < rows.length; i++) {
       const rowNumber = i + 2;
       const row = rows[i];
@@ -2289,16 +2336,19 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
       if (existing && isDraftAndPublish) {
         lifecycleStats.totalChecked++;
-        const inspectionExisting = (row.status || row.publishedAt)
-          ? { ...existing, status: row.status, publishedAt: row.publishedAt }
+        const pubRecord = (effectiveLocale && publishedCounterparts.get(`${docId}@@@${effectiveLocale}`)) ||
+          publishedCounterparts.get(String(docId));
+        const rowStatus = row.status || row.Status || row.STATUS || row['Published Status'] || row['published_status'] || row['strapi_status'];
+        const rowPubAt = row.publishedAt || row.published_at || row.PublishedAt;
+        const inspectionExisting = (rowStatus || rowPubAt)
+          ? { ...existing, ...(rowStatus ? { status: rowStatus } : {}), ...(rowPubAt ? { publishedAt: rowPubAt } : {}) }
           : existing;
         const { status: preStatus, hadPublishedVersion } = resolveRecordPublicationStatus(
           inspectionExisting,
-          undefined,
+          pubRecord,
           isDraftAndPublish
         );
-        const isApproved = !isEditing && hadPublishedVersion;
-        if (isApproved) {
+        if (!isEditing && preStatus === 'published') {
           lifecycleStats.published++;
         } else if (preStatus === 'modified' || (hadPublishedVersion && isEditing)) {
           lifecycleStats.modified++;
