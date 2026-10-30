@@ -23,6 +23,7 @@ import {
 import { Download, Upload, ArrowClockwise, Check, ChevronLeft, ChevronRight, Eye } from '@strapi/icons';
 import { parseCsv, extractDocId } from '../utils/csvParser';
 import { isAbortError } from '../utils/isAbortError';
+import { getEntryLifecycleStatus, Entry, PendingBatch } from '../utils/lifecycleStatus';
 
 interface CollectionModel {
   uid: string;
@@ -40,6 +41,8 @@ export default function CsvManagerTab() {
   const [collections, setCollections] = useState<CollectionModel[]>([]);
   const [loadingCollections, setLoadingCollections] = useState<boolean>(true);
   const [selectedUid, setSelectedUid] = useState<string>('');
+  const [collectionEntries, setCollectionEntries] = useState<Entry[]>([]);
+  const [pendingBatches, setPendingBatches] = useState<PendingBatch[]>([]);
 
   // Export filters (0 = Unlimited / All records)
   const [exportLimit, setExportLimit] = useState<number>(0);
@@ -114,19 +117,28 @@ export default function CsvManagerTab() {
   const fetchInitialData = async () => {
     try {
       setLoadingCollections(true);
-      const [modelsRes, rulesRes] = await Promise.all([
+      const [modelsRes, rulesRes, batchesRes] = await Promise.all([
         get('/bulk-updater/models'),
         get('/bulk-updater/validation-rules'),
+        get('/bulk-updater/pending-batches').catch(() => ({ data: { batches: [] } })),
       ]);
 
       if (modelsRes.data?.executionWindow) {
         setExecutionWindow(modelsRes.data.executionWindow);
       }
 
+      if (batchesRes.data?.batches) {
+        setPendingBatches(batchesRes.data.batches);
+      }
+
+      let loadedCollections: CollectionModel[] = [];
       if (modelsRes.data?.collections) {
-        setCollections(modelsRes.data.collections);
-        if (modelsRes.data.collections.length > 0) {
-          setSelectedUid(modelsRes.data.collections[0].uid);
+        loadedCollections = modelsRes.data.collections;
+        setCollections(loadedCollections);
+        if (loadedCollections.length > 0) {
+          const firstUid = loadedCollections[0].uid;
+          setSelectedUid(firstUid);
+          fetchAndEnrichEntries(firstUid, loadedCollections, batchesRes.data?.batches || []);
         }
       }
 
@@ -146,6 +158,86 @@ export default function CsvManagerTab() {
       setLoadingCollections(false);
     }
   };
+
+  const fetchAndEnrichEntries = async (
+    colUid: string,
+    cols: CollectionModel[] = collections,
+    batches: PendingBatch[] = pendingBatches
+  ): Promise<Entry[]> => {
+    if (!colUid) return [];
+    try {
+      const res = await get(`/bulk-updater/collections/${colUid}/entries?page=1&pageSize=500`);
+      if (res.data && (res.data.success || res.data.entries !== undefined)) {
+        const fetchedEntries: Entry[] = res.data.entries || [];
+        const col = (cols || []).find((c) => c.uid === colUid) || null;
+
+        const enrichedEntries: Entry[] = fetchedEntries.map((entry: Entry) => {
+          if (!entry.status) {
+            const lifecycle = getEntryLifecycleStatus(entry, col, batches);
+            return {
+              ...entry,
+              status: lifecycle.status,
+              publishedAt:
+                entry.publishedAt ??
+                (lifecycle.status === 'published' ? (entry.updatedAt || null) : null),
+            };
+          }
+          return entry;
+        });
+
+        setCollectionEntries(enrichedEntries);
+        return enrichedEntries;
+      }
+    } catch (err: any) {
+      if (isAbortError(err)) return [];
+    }
+    return [];
+  };
+
+  const enrichCsvRowsWithLifecycle = (
+    rows: Array<Record<string, string>>,
+    knownEntries: Entry[] = collectionEntries
+  ): Array<Record<string, string>> => {
+    if (!rows || rows.length === 0) return rows;
+    const entryByDocId = new Map<string, Entry>();
+    for (const e of knownEntries) {
+      if (e.documentId) entryByDocId.set(String(e.documentId), e);
+      if (e.id) entryByDocId.set(String(e.id), e);
+    }
+
+    return rows.map((row) => {
+      const docId = extractDocId(row);
+      const matched = docId ? entryByDocId.get(docId) : undefined;
+
+      const existingStatus = row.status || row.Status;
+      const existingPubAt = row.publishedAt || row.published_at;
+
+      let status = existingStatus;
+      let publishedAt = existingPubAt;
+
+      if (!status && matched?.status) {
+        status = matched.status;
+      }
+      if (!publishedAt && matched?.publishedAt) {
+        publishedAt = matched.publishedAt;
+      }
+
+      if (status || publishedAt) {
+        return {
+          ...row,
+          ...(status ? { status } : {}),
+          ...(publishedAt ? { publishedAt } : {}),
+        };
+      }
+      return row;
+    });
+  };
+
+  useEffect(() => {
+    if (selectedUid) {
+      fetchAndEnrichEntries(selectedUid);
+    }
+  }, [selectedUid]);
 
   const handleDownloadTemplate = async () => {
     if (!selectedUid) return;
@@ -170,6 +262,7 @@ export default function CsvManagerTab() {
   const handleExportCollection = async () => {
     if (!selectedUid) return;
     try {
+      await fetchAndEnrichEntries(selectedUid);
       const res = await get(`/bulk-updater/csv/export/${selectedUid}?limit=${exportLimit}`);
       const csvStr = res.data?.csvContent || (typeof res.data === 'string' ? res.data : '');
       const filename = res.data?.filename || `${selectedUid.split('.').pop()}_export.csv`;
@@ -243,7 +336,8 @@ export default function CsvManagerTab() {
 
       try {
         const records = parseCsv(text);
-        setAllParsedRecords(records);
+        const enriched = enrichCsvRowsWithLifecycle(records, collectionEntries);
+        setAllParsedRecords(enriched);
         setPreviewPage(1);
       } catch (err) {
         setAllParsedRecords([]);
@@ -256,7 +350,14 @@ export default function CsvManagerTab() {
   const handleExecuteImport = async () => {
     if (!selectedUid || allParsedRecords.length === 0) return;
 
-    const totalRows = allParsedRecords.length;
+    // Ensure CSV workflow receives the enriched entries before processing
+    let currentEntries = collectionEntries;
+    if (currentEntries.length === 0) {
+      currentEntries = await fetchAndEnrichEntries(selectedUid);
+    }
+    const enrichedRecords = enrichCsvRowsWithLifecycle(allParsedRecords, currentEntries);
+
+    const totalRows = enrichedRecords.length;
     const CHUNK_SIZE = 100;
     const totalChunks = Math.ceil(totalRows / CHUNK_SIZE);
     const batchId = `csv_batch_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
@@ -286,7 +387,7 @@ export default function CsvManagerTab() {
       for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
         const startIdx = chunkIdx * CHUNK_SIZE;
         const endIdx = Math.min(startIdx + CHUNK_SIZE, totalRows);
-        const chunkRows = allParsedRecords.slice(startIdx, endIdx);
+        const chunkRows = enrichedRecords.slice(startIdx, endIdx);
         const isFirst = chunkIdx === 0;
         const isLast = chunkIdx === totalChunks - 1;
         const startRowNumber = startIdx + 2;
@@ -363,9 +464,15 @@ export default function CsvManagerTab() {
     if (!selectedUid || allParsedRecords.length === 0) return;
     try {
       setPreflightLoading(true);
+      let currentEntries = collectionEntries;
+      if (currentEntries.length === 0) {
+        currentEntries = await fetchAndEnrichEntries(selectedUid);
+      }
+      const enrichedRecords = enrichCsvRowsWithLifecycle(allParsedRecords, currentEntries);
+
       const res = await post('/bulk-updater/csv/validate-preflight', {
         uid: selectedUid,
-        rows: allParsedRecords,
+        rows: enrichedRecords,
         mode: importMode,
       });
       if (res.data && res.data.success) {
@@ -413,9 +520,15 @@ export default function CsvManagerTab() {
 
     try {
       setSubmittingBatch(true);
+      let currentEntries = collectionEntries;
+      if (currentEntries.length === 0) {
+        currentEntries = await fetchAndEnrichEntries(selectedUid);
+      }
+      const enrichedRecords = enrichCsvRowsWithLifecycle(allParsedRecords, currentEntries);
+
       const res = await post('/bulk-updater/csv/submit-batch', {
         uid: selectedUid,
-        rows: allParsedRecords,
+        rows: enrichedRecords,
         executionMode,
         makerNotes: makerNotesInput,
         forceImmediate,
