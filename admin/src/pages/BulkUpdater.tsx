@@ -2111,7 +2111,7 @@ const BulkUpdater: React.FC = () => {
       return;
     }
 
-    const targets: Array<{ uid: string; documentId: string; dynamicZoneIndexes?: number[]; status?: string; strapi_stage?: any; publishedAt?: string | null }> = [];
+    const targets: Array<{ uid: string; documentId: string; dynamicZoneIndexes?: number[] }> = [];
     Object.keys(selectedEntries).forEach((key) => {
       if (selectedEntries[key]) {
         const parts = key.split(KEY_SEP);
@@ -2126,8 +2126,8 @@ const BulkUpdater: React.FC = () => {
           const cachedEntry = colPage?.entries?.find((e: any) => e.documentId === docId);
           if (cachedEntry) {
             if (cachedEntry.status) targetObj.status = cachedEntry.status;
-            if (cachedEntry.strapi_stage) targetObj.strapi_stage = cachedEntry.strapi_stage;
             if (cachedEntry.publishedAt) targetObj.publishedAt = cachedEntry.publishedAt;
+            if (cachedEntry.locale) targetObj.locale = cachedEntry.locale;
           }
           targets.push(targetObj);
         }
@@ -2178,14 +2178,7 @@ const BulkUpdater: React.FC = () => {
     executionMode: 'immediate' | 'queue_offpeak' | 'maker_checker',
     forceImmediate = false
   ) => {
-        const targets: Array<{
-      uid: string;
-      documentId: string;
-      dynamicZoneIndexes?: number[];
-      status?: string;
-      strapi_stage?: any;
-      publishedAt?: string | null;
-    }> = [];
+    const targets: Array<{ uid: string; documentId: string; dynamicZoneIndexes?: number[] }> = [];
     Object.keys(selectedEntries).forEach((key) => {
       if (selectedEntries[key]) {
         const parts = key.split(KEY_SEP);
@@ -2200,8 +2193,8 @@ const BulkUpdater: React.FC = () => {
           const cachedEntry = colPage?.entries?.find((e: any) => e.documentId === docId);
           if (cachedEntry) {
             if (cachedEntry.status) targetObj.status = cachedEntry.status;
-            if (cachedEntry.strapi_stage) targetObj.strapi_stage = cachedEntry.strapi_stage;
             if (cachedEntry.publishedAt) targetObj.publishedAt = cachedEntry.publishedAt;
+            if (cachedEntry.locale) targetObj.locale = cachedEntry.locale;
           }
           targets.push(targetObj);
         }
