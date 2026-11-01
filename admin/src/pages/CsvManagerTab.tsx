@@ -44,8 +44,12 @@ export default function CsvManagerTab() {
   const [collectionEntries, setCollectionEntries] = useState<Entry[]>([]);
   const [pendingBatches, setPendingBatches] = useState<PendingBatch[]>([]);
 
-  // Export filters (0 = Unlimited / All records)
+  // Export filters and loading states (0 = Unlimited / All records)
   const [exportLimit, setExportLimit] = useState<number>(0);
+  const [exportLimitInput, setExportLimitInput] = useState<string>('');
+  const [exportingCollection, setExportingCollection] = useState<boolean>(false);
+  const [downloadingTemplate, setDownloadingTemplate] = useState<boolean>(false);
+  const [exportingViolations, setExportingViolations] = useState<boolean>(false);
   const [exportOnlyViolations, setExportOnlyViolations] = useState<boolean>(false);
   const [rules, setRules] = useState<any[]>([]);
   const [selectedRuleId, setSelectedRuleId] = useState<string>('');
@@ -138,7 +142,6 @@ export default function CsvManagerTab() {
         if (loadedCollections.length > 0) {
           const firstUid = loadedCollections[0].uid;
           setSelectedUid(firstUid);
-          fetchAndEnrichEntries(firstUid, loadedCollections, batchesRes.data?.batches || []);
         }
       }
 
@@ -233,15 +236,10 @@ export default function CsvManagerTab() {
     });
   };
 
-  useEffect(() => {
-    if (selectedUid) {
-      fetchAndEnrichEntries(selectedUid);
-    }
-  }, [selectedUid]);
-
   const handleDownloadTemplate = async () => {
-    if (!selectedUid) return;
+    if (!selectedUid || downloadingTemplate) return;
     try {
+      setDownloadingTemplate(true);
       const res = await get(`/bulk-updater/csv/template/${selectedUid}`);
       const csvStr = res.data?.csvContent || (typeof res.data === 'string' ? res.data : '');
       const filename = res.data?.filename || `${selectedUid.split('.').pop()}_template.csv`;
@@ -256,13 +254,15 @@ export default function CsvManagerTab() {
         type: 'danger',
         message: err.message || 'Failed downloading CSV template',
       });
+    } finally {
+      setDownloadingTemplate(false);
     }
   };
 
   const handleExportCollection = async () => {
-    if (!selectedUid) return;
+    if (!selectedUid || exportingCollection) return;
     try {
-      await fetchAndEnrichEntries(selectedUid);
+      setExportingCollection(true);
       const res = await get(`/bulk-updater/csv/export/${selectedUid}?limit=${exportLimit}`);
       const csvStr = res.data?.csvContent || (typeof res.data === 'string' ? res.data : '');
       const filename = res.data?.filename || `${selectedUid.split('.').pop()}_export.csv`;
@@ -277,12 +277,15 @@ export default function CsvManagerTab() {
         type: 'danger',
         message: err.message || 'Failed exporting collection to CSV',
       });
+    } finally {
+      setExportingCollection(false);
     }
   };
 
   const handleExportViolations = async () => {
-    if (!selectedRuleId) return;
+    if (!selectedRuleId || exportingViolations) return;
     try {
+      setExportingViolations(true);
       const res = await get(`/bulk-updater/csv/export-violations/${selectedRuleId}`);
       const csvStr = res.data?.csvContent || (typeof res.data === 'string' ? res.data : '');
       const filename = res.data?.filename || `violations_${selectedRuleId}.csv`;
@@ -297,6 +300,8 @@ export default function CsvManagerTab() {
         type: 'danger',
         message: err.message || 'Failed exporting violations to CSV',
       });
+    } finally {
+      setExportingViolations(false);
     }
   };
 
@@ -623,7 +628,8 @@ export default function CsvManagerTab() {
               variant="tertiary"
               startIcon={<Download />}
               onClick={handleDownloadTemplate}
-              disabled={!selectedUid}
+              disabled={!selectedUid || downloadingTemplate}
+              loading={downloadingTemplate}
             >
               Download Sample CSV Template
             </Button>
@@ -639,19 +645,64 @@ export default function CsvManagerTab() {
             Extract entire collections without artificial limits (streams 10,000+ records in paged chunks) or pinpoint records violating validation quotas.
           </Typography>
 
-          <Flex gap={4} wrap="wrap" alignItems="center" marginTop={3}>
-            {/* Export Limit Selector */}
+          <Flex gap={4} wrap="wrap" alignItems="flex-end" marginTop={3}>
+            {/* Custom Download Limit with Typeable Input */}
             <Box style={{ width: 220 }}>
-              <SingleSelect
-                value={String(exportLimit)}
-                onChange={(val: string) => setExportLimit(Number(val))}
-                placeholder="Export Limit"
-              >
-                <SingleSelectOption value="0">All Records (No Limit)</SingleSelectOption>
-                <SingleSelectOption value="10000">Up to 10,000 Records</SingleSelectOption>
-                <SingleSelectOption value="5000">Up to 5,000 Records</SingleSelectOption>
-                <SingleSelectOption value="1000">Up to 1,000 Records</SingleSelectOption>
-              </SingleSelect>
+              <Typography variant="pi" fontWeight="bold" textColor="neutral800" marginBottom={1} display="block">
+                Records to Download
+              </Typography>
+              <TextInput
+                type="number"
+                min={0}
+                placeholder="All records (or enter count)"
+                value={exportLimitInput}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+                  const raw = e.target.value;
+                  setExportLimitInput(raw);
+                  const parsed = parseInt(raw, 10);
+                  setExportLimit(!raw || isNaN(parsed) || parsed <= 0 ? 0 : parsed);
+                }}
+                hint={
+                  exportLimit === 0
+                    ? 'Exporting all records (no limit)'
+                    : `Exporting first ${exportLimit.toLocaleString()} records`
+                }
+              />
+            </Box>
+
+            {/* Quick Presets */}
+            <Box>
+              <Typography variant="pi" textColor="neutral600" marginBottom={1} display="block">
+                Quick Presets:
+              </Typography>
+              <Flex gap={1} wrap="wrap">
+                {[
+                  { label: 'All', value: 0 },
+                  { label: '100', value: 100 },
+                  { label: '500', value: 500 },
+                  { label: '1,000', value: 1000 },
+                  { label: '5,000', value: 5000 },
+                  { label: '10,000', value: 10000 },
+                ].map((preset) => {
+                  const isSelected =
+                    preset.value === 0
+                      ? exportLimit === 0 && (!exportLimitInput || exportLimitInput === '0')
+                      : exportLimit === preset.value && exportLimitInput === String(preset.value);
+                  return (
+                    <Button
+                      key={preset.value}
+                      variant={isSelected ? 'secondary' : 'tertiary'}
+                      size="S"
+                      onClick={() => {
+                        setExportLimit(preset.value);
+                        setExportLimitInput(preset.value === 0 ? '' : String(preset.value));
+                      }}
+                    >
+                      {preset.label}
+                    </Button>
+                  );
+                })}
+              </Flex>
             </Box>
 
             {/* Standard Collection Export */}
@@ -659,9 +710,12 @@ export default function CsvManagerTab() {
               variant="default"
               startIcon={<Download />}
               onClick={handleExportCollection}
-              disabled={!selectedUid}
+              disabled={!selectedUid || exportingCollection}
+              loading={exportingCollection}
             >
-              Export {exportLimit === 0 ? 'All' : `${exportLimit}`} {selectedCol?.displayName || 'Collection'} Records (.csv)
+              {exportingCollection
+                ? 'Preparing CSV download...'
+                : `Export ${exportLimit === 0 ? 'All' : exportLimit.toLocaleString()} ${selectedCol?.displayName || 'Collection'} Records (.csv)`}
             </Button>
 
             {/* Violations Export */}
@@ -683,7 +737,8 @@ export default function CsvManagerTab() {
                   variant="danger-light"
                   startIcon={<Download />}
                   onClick={handleExportViolations}
-                  disabled={!selectedRuleId}
+                  disabled={!selectedRuleId || exportingViolations}
+                  loading={exportingViolations}
                 >
                   Export Violators CSV
                 </Button>

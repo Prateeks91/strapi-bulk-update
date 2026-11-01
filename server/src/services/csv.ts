@@ -445,8 +445,14 @@ function buildDeepPopulate(
       }
     } else if (def.type === 'dynamiczone') {
       populate[key] = true;
-    } else if (def.type === 'relation' || def.type === 'media') {
-      populate[key] = true;
+    } else if (def.type === 'relation') {
+      populate[key] = {
+        fields: ['documentId', 'name', 'title', 'slug', 'username', 'email'],
+      };
+    } else if (def.type === 'media') {
+      populate[key] = {
+        fields: ['url', 'name', 'mime'],
+      };
     }
   }
 
@@ -1832,7 +1838,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
     let totalExported = 0;
     const maxLimit = options.limit && options.limit > 0 ? options.limit : Infinity;
-    const CHUNK_SIZE = 1000;
+    const BATCH_SIZE = 200;
 
     if (ct.kind === 'singleType') {
       const findFirstArgs: any = {};
@@ -1849,16 +1855,25 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       let currentPage = 1;
       let hasMore = true;
 
+      // Safe sorting clause: prefer createdAt, then id, otherwise undefined
+      const sortClause = ct.attributes?.createdAt
+        ? { createdAt: 'desc' }
+        : ct.attributes?.id
+          ? { id: 'desc' }
+          : undefined;
+
       while (hasMore && totalExported < maxLimit) {
         const remaining = maxLimit - totalExported;
-        const currentBatchLimit = Math.min(CHUNK_SIZE, remaining);
+        const currentBatchLimit = Math.min(BATCH_SIZE, remaining);
 
         const findPageArgs: any = {
           filters: Object.keys(filters).length > 0 ? filters : undefined,
           page: currentPage,
           pageSize: currentBatchLimit,
-          sort: { createdAt: 'desc' },
         };
+        if (sortClause) {
+          findPageArgs.sort = sortClause;
+        }
         if (deepPopulate) {
           findPageArgs.populate = deepPopulate;
         }
@@ -1885,6 +1900,10 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         } else {
           currentPage++;
         }
+
+        // Cooperative non-blocking yield to Node.js event loop
+        // Allows other concurrent requests, health checks, and dashboard queries to execute smoothly
+        await new Promise((resolve) => setImmediate(resolve));
       }
     }
 
