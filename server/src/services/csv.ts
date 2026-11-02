@@ -445,14 +445,8 @@ function buildDeepPopulate(
       }
     } else if (def.type === 'dynamiczone') {
       populate[key] = true;
-    } else if (def.type === 'relation') {
-      populate[key] = {
-        fields: ['documentId', 'name', 'title', 'slug', 'username', 'email'],
-      };
-    } else if (def.type === 'media') {
-      populate[key] = {
-        fields: ['url', 'name', 'mime'],
-      };
+    } else if (def.type === 'relation' || def.type === 'media') {
+      populate[key] = true;
     }
   }
 
