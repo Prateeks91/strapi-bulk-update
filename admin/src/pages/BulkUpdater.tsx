@@ -1037,6 +1037,7 @@ const BulkUpdater: React.FC = () => {
   const [pendingBatchesLoading, setPendingBatchesLoading] = useState<boolean>(false);
   const [approvingBatchId, setApprovingBatchId] = useState<string | null>(null);
   const [rejectingBatchId, setRejectingBatchId] = useState<string | null>(null);
+  const [executingNowBatchId, setExecutingNowBatchId] = useState<string | null>(null);
   const [inspectingPendingBatch, setInspectingPendingBatch] = useState<PendingBatch | null>(null);
   const [exportingPendingBatchId, setExportingPendingBatchId] = useState<string | null>(null);
   const [makerNotesInput, setMakerNotesInput] = useState<string>('');
@@ -1386,6 +1387,9 @@ const BulkUpdater: React.FC = () => {
     autoSelectReturned = true,
     overrideSearchAttr?: string
   ) => {
+    if (!colUid || !colUid.trim()) {
+      return;
+    }
     const currentPageState = collectionPages[colUid];
     const size = customPageSize || currentPageState?.pageSize || defaultPageSize;
     const currentSort = collectionSorts[colUid] || { field: 'createdAt', order: 'desc' };
@@ -1588,19 +1592,31 @@ const BulkUpdater: React.FC = () => {
   const KEY_SEP = '@@@';
 
   const selectedCol = useMemo(() => {
-    if (!collections.length) return null;
-    return collections.find((c) => c.uid === selectedCollectionUid) || collections[0] || null;
+    if (!collections.length || !selectedCollectionUid) return null;
+    return collections.find((c) => c.uid === selectedCollectionUid) || null;
   }, [collections, selectedCollectionUid]);
 
   const handleCollectionChange = (newUid: string) => {
     if (newUid === selectedCollectionUid) return;
     setSelectedCollectionUid(newUid);
     try {
-      localStorage.setItem(LAST_COLLECTION_KEY, newUid);
+      if (newUid) {
+        localStorage.setItem(LAST_COLLECTION_KEY, newUid);
+      } else {
+        localStorage.removeItem(LAST_COLLECTION_KEY);
+      }
     } catch {}
 
     setSelectedEntries({});
     setSearchAttribute('');
+
+    if (!newUid || !newUid.trim()) {
+      setAttributes([]);
+      setSelectedAttribute('');
+      setSelectedRelationDocId('');
+      setAttributeValue('');
+      return;
+    }
 
     const targetCol = collections.find((c) => c.uid === newUid);
     const colAttrs = targetCol?.attributes || [];
@@ -3006,9 +3022,7 @@ const BulkUpdater: React.FC = () => {
                         e.target.select();
                       }}
                       onChange={(val: any) => {
-                        if (val && typeof val === 'string') {
-                          handleCollectionChange(val);
-                        }
+                        handleCollectionChange(val ? String(val) : '');
                       }}
                     >
                       {collections.map((col) => (
