@@ -1037,6 +1037,7 @@ const BulkUpdater: React.FC = () => {
   const [pendingBatchesLoading, setPendingBatchesLoading] = useState<boolean>(false);
   const [approvingBatchId, setApprovingBatchId] = useState<string | null>(null);
   const [rejectingBatchId, setRejectingBatchId] = useState<string | null>(null);
+  const [executingNowBatchId, setExecutingNowBatchId] = useState<string | null>(null);
   const [inspectingPendingBatch, setInspectingPendingBatch] = useState<PendingBatch | null>(null);
   const [exportingPendingBatchId, setExportingPendingBatchId] = useState<string | null>(null);
   const [makerNotesInput, setMakerNotesInput] = useState<string>('');
