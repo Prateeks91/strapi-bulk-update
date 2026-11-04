@@ -8,7 +8,7 @@ import {
   resolveRecordPublicationStatus,
   evaluateShouldPublish,
 } from './bulk-updater';
-import { extractHeadingsFromRichText } from './validation-rules';
+import { extractHeadingsFromRichText, validateEntityQuotas, deepMergeEntities } from './validation-rules';
 
 /**
  * Robust, Excel-Safe CSV string escaping helper (RFC-4180 compliant)
@@ -546,6 +546,7 @@ export interface ProcessRowsStats {
   created: number;
   updated: number;
   skipped: number;
+  failed?: number;
   newWithoutDocId: number;
   errors: Array<{ row: number; error: string; documentId?: string }>;
   diffs: Array<any>;
@@ -559,6 +560,7 @@ interface CsvImportSession {
   created: number;
   updated: number;
   skipped: number;
+  failed?: number;
   newWithoutDocId: number;
   errors: Array<{ row: number; error: string; documentId?: string }>;
   diffs: Array<any>;
@@ -608,8 +610,13 @@ async function findExistingDocument(
   const ct = strapi.contentTypes[uid];
   const effectiveLocale = getEffectiveLocale(ct, docLocale);
 
+  const populateDef = ct?.attributes ? buildDeepPopulate(ct.attributes, (strapi as any).components) : undefined;
+
   try {
-    const queryArgs: any = { documentId: targetDocId };
+    const queryArgs: any = {
+      documentId: targetDocId,
+      ...(populateDef ? { populate: populateDef } : { populate: '*' }),
+    };
     if (effectiveLocale) queryArgs.locale = effectiveLocale;
     const found = await (strapi.documents(uid as any) as any).findOne(queryArgs);
     if (found) return found;
@@ -1099,6 +1106,7 @@ export async function processCsvRows(
     created: 0,
     updated: 0,
     skipped: 0,
+    failed: 0,
     newWithoutDocId: 0,
     errors: [],
     diffs: [],
@@ -1218,6 +1226,31 @@ export async function processCsvRows(
         };
         if (effectiveLocale) updateArgs.locale = effectiveLocale;
 
+        // Pre-validate entire proposed entity against active Validation & Quota Rules before mutating or publishing
+        const proposedEntity = deepMergeEntities(existing, mergedPayload);
+        const valResult = await validateEntityQuotas(strapi, uid, proposedEntity);
+        if (!valResult.isValid) {
+          stats.skipped++;
+          if (stats.failed !== undefined) stats.failed++;
+          stats.errors.push({
+            row: rowNumber,
+            documentId: resolvedDocId,
+            error: valResult.errorMessage,
+          });
+          stats.diffs.push({
+            uid,
+            collectionName: ct.info?.displayName || uid,
+            documentId: resolvedDocId,
+            label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
+            attribute: valResult.targetField || '',
+            oldValue: (existing as any)?.[valResult.targetField || ''] ?? null,
+            newValue: (mergedPayload as any)?.[valResult.targetField || ''] ?? null,
+            status: 'error',
+            message: valResult.errorMessage,
+          });
+          continue;
+        }
+
         // Perform update mutation
         await (strapi.documents(uid as any) as any).update(updateArgs);
 
@@ -1318,6 +1351,31 @@ export async function processCsvRows(
           };
           if (effectiveLocale) updateArgs.locale = effectiveLocale;
 
+          // Pre-validate entire proposed entity against active Validation & Quota Rules before mutating or publishing
+          const proposedEntity = deepMergeEntities(existing, mergedPayload);
+          const valResult = await validateEntityQuotas(strapi, uid, proposedEntity);
+          if (!valResult.isValid) {
+            stats.skipped++;
+            if (stats.failed !== undefined) stats.failed++;
+            stats.errors.push({
+              row: rowNumber,
+              documentId: resolvedDocId,
+              error: valResult.errorMessage,
+            });
+            stats.diffs.push({
+              uid,
+              collectionName: ct.info?.displayName || uid,
+              documentId: resolvedDocId,
+              label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
+              attribute: valResult.targetField || '',
+              oldValue: (existing as any)?.[valResult.targetField || ''] ?? null,
+              newValue: (mergedPayload as any)?.[valResult.targetField || ''] ?? null,
+              status: 'error',
+              message: valResult.errorMessage,
+            });
+            continue;
+          }
+
           // Perform update mutation
           await (strapi.documents(uid as any) as any).update(updateArgs);
 
@@ -1359,6 +1417,30 @@ export async function processCsvRows(
               message: `Overridden "${attrKey}" via CSV import (row ${rowNumber})`,
             });
           }
+          continue;
+        }
+
+        // Pre-validate new entity against active Validation & Quota Rules before creating or publishing
+        const valResultNew = await validateEntityQuotas(strapi, uid, payload);
+        if (!valResultNew.isValid) {
+          stats.skipped++;
+          if (stats.failed !== undefined) stats.failed++;
+          stats.errors.push({
+            row: rowNumber,
+            documentId: docId || 'new',
+            error: valResultNew.errorMessage,
+          });
+          stats.diffs.push({
+            uid,
+            collectionName: ct.info?.displayName || uid,
+            documentId: docId || 'new',
+            label: `Row ${rowNumber}`,
+            attribute: valResultNew.targetField || '',
+            oldValue: null,
+            newValue: (payload as any)?.[valResultNew.targetField || ''] ?? null,
+            status: 'error',
+            message: valResultNew.errorMessage,
+          });
           continue;
         }
 
@@ -1469,6 +1551,31 @@ export async function processCsvRows(
           };
           if (effectiveLocale) updateArgs.locale = effectiveLocale;
 
+          // Pre-validate entire proposed entity against active Validation & Quota Rules before mutating or publishing
+          const proposedEntity = deepMergeEntities(existing, mergedPayload);
+          const valResult = await validateEntityQuotas(strapi, uid, proposedEntity);
+          if (!valResult.isValid) {
+            stats.skipped++;
+            if (stats.failed !== undefined) stats.failed++;
+            stats.errors.push({
+              row: rowNumber,
+              documentId: resolvedDocId,
+              error: valResult.errorMessage,
+            });
+            stats.diffs.push({
+              uid,
+              collectionName: ct.info?.displayName || uid,
+              documentId: resolvedDocId,
+              label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
+              attribute: valResult.targetField || '',
+              oldValue: (existing as any)?.[valResult.targetField || ''] ?? null,
+              newValue: (mergedPayload as any)?.[valResult.targetField || ''] ?? null,
+              status: 'error',
+              message: valResult.errorMessage,
+            });
+            continue;
+          }
+
           // Perform update mutation
           await (strapi.documents(uid as any) as any).update(updateArgs);
 
@@ -1514,6 +1621,30 @@ export async function processCsvRows(
         }
 
         // Missing docId OR provided docId does not exist in DB -> create new
+        // Pre-validate new entity against active Validation & Quota Rules before creating or publishing
+        const valResultNew = await validateEntityQuotas(strapi, uid, payload);
+        if (!valResultNew.isValid) {
+          stats.skipped++;
+          if (stats.failed !== undefined) stats.failed++;
+          stats.errors.push({
+            row: rowNumber,
+            documentId: docId || 'new',
+            error: valResultNew.errorMessage,
+          });
+          stats.diffs.push({
+            uid,
+            collectionName: ct.info?.displayName || uid,
+            documentId: docId || 'new',
+            label: `Row ${rowNumber}`,
+            attribute: valResultNew.targetField || '',
+            oldValue: null,
+            newValue: (payload as any)?.[valResultNew.targetField || ''] ?? null,
+            status: 'error',
+            message: valResultNew.errorMessage,
+          });
+          continue;
+        }
+
         const createArgs: any = { data: payload };
         if (effectiveLocale) createArgs.locale = effectiveLocale;
         const created: any = await strapi.documents(uid as any).create(createArgs);
@@ -2091,6 +2222,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         created: 0,
         updated: 0,
         skipped: 0,
+        failed: 0,
         newWithoutDocId: 0,
         errors: [],
         diffs: [],
@@ -2107,6 +2239,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     session.created += chunkStats.created;
     session.updated += chunkStats.updated;
     session.skipped += chunkStats.skipped;
+    session.failed = (session.failed || 0) + (chunkStats.failed || 0);
     session.newWithoutDocId += chunkStats.newWithoutDocId;
     session.errors.push(...chunkStats.errors);
     session.diffs.push(...chunkStats.diffs);
@@ -2136,6 +2269,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         created: session.created,
         updated: session.updated,
         skipped: session.skipped,
+        failed: session.failed || 0,
         newWithoutDocId: session.newWithoutDocId,
         errors: session.errors,
         diffs: session.diffs,
@@ -2471,7 +2605,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         if (activeRules.length > 0) {
           for (const rule of activeRules) {
             if (rule.collectionUid && rule.collectionUid !== '*' && rule.collectionUid !== uid) continue;
-            if (rule.includeRichTextHtml && (rawVal.includes('<h') || rawVal.includes('# '))) {
+            if (rule.includeRichTextHtml && (/<h[1-6]\b/i.test(rawVal) || rawVal.includes('# '))) {
               const headings = extractHeadingsFromRichText(rawVal);
               for (const [tag, count] of Object.entries(headings)) {
                 const max = rule.quotas?.[tag.toLowerCase()];
@@ -2485,6 +2619,20 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
               }
             }
           }
+        }
+      }
+
+      // 4. Complete Validation & Quota Rules Check across entire proposed entity
+      if (activeRules.length > 0) {
+        const proposedEntity = existing ? deepMergeEntities(existing, payload) : payload;
+        const valResult = await validateEntityQuotas(strapi, uid, proposedEntity, activeRules);
+        if (!valResult.isValid) {
+          errors.push({
+            row: rowNumber,
+            documentId: docId || undefined,
+            error: valResult.errorMessage,
+          });
+          rowHasError = true;
         }
       }
 

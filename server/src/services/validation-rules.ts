@@ -184,6 +184,303 @@ export function matchesPath(normalizedPath: string, leafKey: string, targetField
   return matchesInOrder;
 }
 
+/**
+ * Safely deep-merges incoming changes into an existing document entity.
+ * - Primitive values and arrays (e.g. dynamic zones, repeatables) in source overwrite target.
+ * - Nested objects are merged recursively so sibling fields are preserved.
+ */
+export function deepMergeEntities(target: any, source: any): any {
+  if (!target || typeof target !== 'object') {
+    return source;
+  }
+  if (!source || typeof source !== 'object') {
+    return source !== undefined ? source : target;
+  }
+
+  // Arrays (e.g. dynamic zones, repeatable components, relation lists) are replaced entirely by source
+  if (Array.isArray(source) || Array.isArray(target)) {
+    return source;
+  }
+
+  const result = { ...target };
+  for (const key of Object.keys(source)) {
+    const sVal = source[key];
+    const tVal = target[key];
+
+    if (sVal === undefined) continue;
+
+    if (sVal !== null && typeof sVal === 'object' && !Array.isArray(sVal)) {
+      if (tVal !== null && typeof tVal === 'object' && !Array.isArray(tVal)) {
+        result[key] = deepMergeEntities(tVal, sVal);
+      } else {
+        result[key] = sVal;
+      }
+    } else {
+      result[key] = sVal;
+    }
+  }
+  return result;
+}
+
+/**
+ * Filters active rules applicable to collectionUid and gathers schema-defined scoped-select rules.
+ */
+export function filterAndEnrichRules(
+  strapi: any,
+  collectionUid: string,
+  activeRules: ValidationRule[]
+): Array<{
+  id: string;
+  name: string;
+  collectionUid?: string;
+  targetField: string;
+  quotas: Record<string, number>;
+  includeRichTextHtml?: boolean;
+  richTextFields?: string[];
+}> {
+  const effectiveRules: Array<{
+    id: string;
+    name: string;
+    collectionUid?: string;
+    targetField: string;
+    quotas: Record<string, number>;
+    includeRichTextHtml?: boolean;
+    richTextFields?: string[];
+  }> = [
+    ...(activeRules || [])
+      .filter((r: any) => {
+        if (!r.collectionUid || r.collectionUid === '*') return true;
+        if (r.collectionUid === collectionUid) return true;
+        const cleanRuleCol = cleanKey(r.collectionUid);
+        const cleanCtxCol = cleanKey(collectionUid);
+        return cleanCtxCol.includes(cleanRuleCol) || cleanRuleCol.includes(cleanCtxCol);
+      })
+      .map((r: any) => ({
+        id: r.id || r.targetField,
+        name: r.name || r.targetField,
+        collectionUid: r.collectionUid || '*',
+        targetField: r.targetField,
+        quotas: r.quotas || {},
+        includeRichTextHtml: Boolean(r.includeRichTextHtml),
+        richTextFields: Array.isArray(r.richTextFields) ? r.richTextFields : [],
+      })),
+  ];
+
+  // Discover schema-defined scoped-select rules from components and content type as fallback
+  const allComponents = strapi?.components || {};
+  const ct = strapi?.contentTypes?.[collectionUid];
+  const schemasToInspect = [
+    ...Object.values(allComponents),
+    ...(ct ? [ct] : []),
+  ];
+
+  for (const schema of schemasToInspect as any[]) {
+    const attrs = schema?.attributes || {};
+    for (const [attrName, attrDef] of Object.entries(attrs) as any[]) {
+      if (
+        attrDef.type === 'customField' &&
+        (attrDef.customField === 'plugin::bulk-updater.scoped-select' ||
+         attrDef.customField === 'global::scoped-select') &&
+        !effectiveRules.some((r) => matchesPath(attrName, attrName, r.targetField))
+      ) {
+        const quotas = attrDef.options?.quotas || {};
+        const items = attrDef.options?.items || [];
+        const itemQuotas: Record<string, number> = {};
+
+        for (const item of items) {
+          if (typeof item.maxAllowed === 'number' && item.maxAllowed > 0) {
+            itemQuotas[item.value] = item.maxAllowed;
+          }
+        }
+
+        effectiveRules.push({
+          id: `schema_${attrName}`,
+          name: `${attrName} quota rule`,
+          collectionUid: '*',
+          targetField: attrName,
+          quotas: {
+            h1: 1,
+            h2: 3,
+            ...itemQuotas,
+            ...quotas,
+          },
+          includeRichTextHtml: true,
+          richTextFields: [],
+        });
+      }
+    }
+  }
+
+  return effectiveRules;
+}
+
+export interface ValidationResult {
+  isValid: boolean;
+  ruleId?: string;
+  ruleName?: string;
+  targetField?: string;
+  violatingOption?: string;
+  foundCount?: number;
+  maxAllowed?: number;
+  structuredCount?: number;
+  richTextCount?: number;
+  errorMessage?: string;
+}
+
+/**
+ * Validates a document entity against all applicable Validation and Quota Rules.
+ * Works across all rule types (structured fields, dynamic zones, headings, custom options).
+ */
+export async function validateEntityQuotas(
+  strapi: any,
+  collectionUid: string,
+  entity: any,
+  customRules?: any[]
+): Promise<ValidationResult> {
+  if (!entity || typeof entity !== 'object') {
+    return { isValid: true };
+  }
+
+  let effectiveRules: any[] = [];
+  if (customRules && Array.isArray(customRules)) {
+    effectiveRules = customRules;
+  } else {
+    try {
+      const rulesService = strapi.plugin('bulk-updater').service('validationRules');
+      if (rulesService) {
+        const allRules = await rulesService.getRules();
+        const activeUiRules = (allRules || []).filter((r: any) => r.enabled);
+        effectiveRules = filterAndEnrichRules(strapi, collectionUid, activeUiRules);
+      }
+    } catch (err) {
+      strapi.log?.warn?.('[bulk-updater] Failed to fetch validation rules for quota check:', err);
+    }
+  }
+
+  if (effectiveRules.length === 0) {
+    return { isValid: true };
+  }
+
+  const structuredCounts: Record<string, Record<string, number>> = {};
+  const richTextCounts: Record<string, Record<string, number>> = {};
+
+  for (const rule of effectiveRules) {
+    structuredCounts[rule.id] = {};
+    richTextCounts[rule.id] = { h1: 0, h2: 0, h3: 0, h4: 0, h5: 0, h6: 0 };
+  }
+
+  function scanDataTree(obj: any, currentPath = '', depth = 0) {
+    if (!obj || typeof obj !== 'object' || depth > 20) return;
+    const compName = typeof obj.__component === 'string' ? obj.__component : '';
+
+    if (Array.isArray(obj)) {
+      for (let i = 0; i < obj.length; i++) {
+        const item = obj[i];
+        if (item && typeof item === 'object') {
+          scanDataTree(item, currentPath ? `${currentPath}.${i}` : `${i}`, depth + 1);
+        }
+      }
+      return;
+    }
+
+    for (const key of Object.keys(obj)) {
+      if (key === '__component') continue;
+      const val = obj[key];
+      const newPath = currentPath ? `${currentPath}.${key}` : key;
+      const normalizedPath = newPath.replace(/\.\d+/g, '');
+
+      const compPath = compName
+        ? (currentPath ? `${currentPath}.${compName}.${key}` : `${compName}.${key}`).replace(/\.\d+/g, '')
+        : '';
+
+      // Check structured rules matching targetField
+      for (const rule of effectiveRules) {
+        const isMatch = matchesPath(normalizedPath, key, rule.targetField) ||
+          (compPath ? matchesPath(compPath, key, rule.targetField) : false);
+
+        if (isMatch && (typeof val === 'string' || typeof val === 'number') && String(val).trim()) {
+          const lowerVal = String(val).toLowerCase().trim();
+          structuredCounts[rule.id][lowerVal] = (structuredCounts[rule.id][lowerVal] || 0) + 1;
+        }
+      }
+
+      // Check rich text HTML / Markdown / Blocks content
+      const isRichTextString = typeof val === 'string' && (/<h[1-6]\b/i.test(val) || val.includes('#'));
+      const isBlocksArray = Array.isArray(val) && val.length > 0 && typeof val[0] === 'object' && val[0]?.type;
+
+      if (isRichTextString || isBlocksArray) {
+        const headings = extractHeadingsFromRichText(val);
+        for (const rule of effectiveRules) {
+          if (!rule.includeRichTextHtml) continue;
+
+          if (Array.isArray(rule.richTextFields) && rule.richTextFields.length > 0) {
+            const matchesSpecificField = rule.richTextFields.some((rf: string) =>
+              matchesPath(normalizedPath, key, rf) || (compPath ? matchesPath(compPath, key, rf) : false)
+            );
+            if (!matchesSpecificField) continue;
+          }
+
+          for (const [tag, count] of Object.entries(headings)) {
+            if (count > 0) {
+              richTextCounts[rule.id][tag] = (richTextCounts[rule.id][tag] || 0) + count;
+            }
+          }
+        }
+
+        if (isBlocksArray) {
+          continue;
+        }
+      }
+
+      if (typeof val === 'object' && val !== null) {
+        scanDataTree(val, newPath, depth + 1);
+      }
+    }
+  }
+
+  scanDataTree(entity);
+
+  // Validate counts against active quotas for each rule
+  for (const rule of effectiveRules) {
+    const ruleCounts = structuredCounts[rule.id] || {};
+    const rtRuleCounts = richTextCounts[rule.id] || {};
+
+    for (const [quotaKey, maxAllowed] of Object.entries(rule.quotas || {})) {
+      const lowerVal = quotaKey.toLowerCase().trim();
+      const structCount = ruleCounts[lowerVal] || 0;
+      const rtCount = rule.includeRichTextHtml ? (rtRuleCounts[lowerVal] || 0) : 0;
+      const totalFound = structCount + rtCount;
+
+      if (totalFound > (maxAllowed as number)) {
+        let detailMsg = `Option "${quotaKey.toUpperCase()}" cannot appear more than ${maxAllowed} time(s) across this entry.`;
+        if (rtCount > 0 && structCount > 0) {
+          detailMsg += ` Found ${totalFound} occurrences combined: ${structCount} in structured component ('${rule.targetField}') and ${rtCount} in rich text HTML / Markdown.`;
+        } else if (rtCount > 0) {
+          detailMsg += ` Found ${totalFound} in rich text HTML / Markdown content.`;
+        } else {
+          detailMsg += ` Found ${totalFound} in structured field '${rule.targetField}'.`;
+        }
+
+        const fullErrorMessage = `Validation Error (${rule.name}): ${detailMsg}`;
+        return {
+          isValid: false,
+          ruleId: rule.id,
+          ruleName: rule.name,
+          targetField: rule.targetField,
+          violatingOption: quotaKey.toUpperCase(),
+          foundCount: totalFound,
+          maxAllowed: maxAllowed as number,
+          structuredCount: structCount,
+          richTextCount: rtCount,
+          errorMessage: fullErrorMessage,
+        };
+      }
+    }
+  }
+
+  return { isValid: true };
+}
+
 export default ({ strapi }: { strapi: Core.Strapi }) => ({
   async getStore() {
     return strapi.store({
@@ -518,5 +815,15 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       totalViolations: violations.length,
       violations,
     };
+  },
+
+  async getEffectiveRules(collectionUid: string) {
+    const allRules = await this.getRules();
+    const activeUiRules = (allRules || []).filter((r: any) => r.enabled);
+    return filterAndEnrichRules(strapi, collectionUid, activeUiRules);
+  },
+
+  async validateEntity(entity: any, collectionUid: string, customRules?: any[]) {
+    return validateEntityQuotas(strapi, collectionUid, entity, customRules);
   },
 });
