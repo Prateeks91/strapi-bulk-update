@@ -1,6 +1,7 @@
 import type { Core } from '@strapi/strapi';
 import crypto from 'crypto';
 import { recordContentHistoryVersion } from './content-history';
+import { validateEntityQuotas, deepMergeEntities } from './validation-rules';
 
 // In-process memory caches (scoped to pod)
 interface CacheEntry {
@@ -1252,9 +1253,14 @@ async function executeBatchInternal(
   const getDocumentDeduplicated = (uid: string, documentId: string) => {
     const loaderKey = `${uid}@@@${documentId}`;
     if (!documentLoader.has(loaderKey)) {
+      const ct = strapi.contentTypes[uid];
+      const populateDef = ct?.attributes ? buildDeepPopulate(ct.attributes, strapi.components) : undefined;
       documentLoader.set(
         loaderKey,
-        strapi.documents(uid as any).findOne({ documentId })
+        strapi.documents(uid as any).findOne({
+          documentId,
+          ...(populateDef ? { populate: populateDef } : { populate: '*' }),
+        })
       );
     }
     return documentLoader.get(loaderKey);
@@ -1361,6 +1367,23 @@ async function executeBatchInternal(
               publishStrategy,
               unreviewedConsent,
             });
+
+            // Pre-validate entire proposed entity against active Validation & Quota Rules before mutating or publishing
+            const proposedEntityComp = deepMergeEntities(currentEntryWithPopulate || currentEntry, { [rootKey]: updatedRoot });
+            const valResultComp = await validateEntityQuotas(strapi, target.uid, proposedEntityComp);
+            if (!valResultComp.isValid) {
+              return {
+                uid: target.uid,
+                collectionName: displayName,
+                documentId: target.documentId,
+                label: entryLabel,
+                attribute,
+                oldValue: currentVal ?? null,
+                newValue,
+                status: 'error' as const,
+                message: valResultComp.errorMessage,
+              };
+            }
 
             const updateArgsComp: any = {
               documentId: target.documentId,
@@ -1525,6 +1548,23 @@ async function executeBatchInternal(
               unreviewedConsent,
             });
 
+            // Pre-validate entire proposed entity against active Validation & Quota Rules before mutating or publishing
+            const proposedEntityRel = deepMergeEntities(currentEntry, { [attribute]: relationPayload });
+            const valResultRel = await validateEntityQuotas(strapi, target.uid, proposedEntityRel);
+            if (!valResultRel.isValid) {
+              return {
+                uid: target.uid,
+                collectionName: displayName,
+                documentId: target.documentId,
+                label: entryLabel,
+                attribute,
+                oldValue: { isRelation: true, documentIds: oldDocIds, display: oldDisplay },
+                newValue: { isRelation: true, mode, documentIds: targetDocIds, display: newDisplay },
+                status: 'error' as const,
+                message: valResultRel.errorMessage,
+              };
+            }
+
             const updateArgsRel: any = {
               documentId: target.documentId,
               data: {
@@ -1621,6 +1661,23 @@ async function executeBatchInternal(
             publishStrategy,
             unreviewedConsent,
           });
+
+          // Pre-validate entire proposed entity against active Validation & Quota Rules before mutating or publishing
+          const proposedEntityScalar = deepMergeEntities(currentEntry, { [attribute]: newValue });
+          const valResultScalar = await validateEntityQuotas(strapi, target.uid, proposedEntityScalar);
+          if (!valResultScalar.isValid) {
+            return {
+              uid: target.uid,
+              collectionName: displayName,
+              documentId: target.documentId,
+              label: entryLabel,
+              attribute,
+              oldValue: currentVal ?? null,
+              newValue,
+              status: 'error' as const,
+              message: valResultScalar.errorMessage,
+            };
+          }
 
           const updateArgsScalar: any = {
             documentId: target.documentId,
