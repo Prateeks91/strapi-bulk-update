@@ -10,6 +10,10 @@ import validationRulesService, { extractHeadingsFromRichText, matchesPath, clean
 import csvService from './services/csv';
 import contentHistoryService, { recordContentHistoryVersion } from './services/content-history';
 
+export * from './services/csv/index';
+export { extractHeadingsFromRichText, validateEntityQuotas, deepMergeEntities } from './services/validation-rules';
+export { sortAuditRecordsDesc, withRollbackLock } from './services/audit';
+
 import { errors } from '@strapi/utils';
 
 function createValidationError(ruleName: string, detailMsg: string, targetField: string) {

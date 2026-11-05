@@ -39,6 +39,49 @@ const DEFAULT_CANDIDATE_TYPES = [
   'api::bulk-audit-log.bulk-audit-log',
 ];
 
+/**
+ * Deterministically sorts audit history records descending:
+ * Primary: executedAt or createdAt (newest timestamp first)
+ * Secondary tiebreaker: monotonic ID descending or string comparison of batchId/id
+ */
+export function sortAuditRecordsDesc<T extends { executedAt?: string; createdAt?: string; id?: any; batchId?: string }>(records: T[]): T[] {
+  return [...records].sort((a, b) => {
+    const timeA = a.executedAt || a.createdAt ? new Date(a.executedAt || a.createdAt).getTime() : 0;
+    const validTimeA = Number.isNaN(timeA) ? 0 : timeA;
+    const timeB = b.executedAt || b.createdAt ? new Date(b.executedAt || b.createdAt).getTime() : 0;
+    const validTimeB = Number.isNaN(timeB) ? 0 : timeB;
+    if (validTimeB !== validTimeA) {
+      return validTimeB - validTimeA;
+    }
+    if (typeof a.id === 'number' && typeof b.id === 'number') {
+      return b.id - a.id;
+    }
+    const idA = String(a.id ?? a.batchId ?? '');
+    const idB = String(b.id ?? b.batchId ?? '');
+    return idB.localeCompare(idA);
+  });
+}
+
+let rollbackLock: Promise<any> = Promise.resolve();
+
+/**
+ * Concurrency guard to serialize batch rollback operations and prevent race conditions.
+ */
+export function withRollbackLock<T>(fn: () => Promise<T>): Promise<T> {
+  const previousLock = rollbackLock;
+  let release: () => void = () => {};
+  rollbackLock = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return previousLock.then(async () => {
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  });
+}
+
 export default ({ strapi }: { strapi: Core.Strapi }) => ({
   /**
    * Detects whether Strapi Enterprise Native Audit Log service is available.
@@ -333,7 +376,16 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       try {
         const store = strapi.store({ type: 'plugin', name: 'bulk-updater', key: 'audit-history' });
         const stored = (await store.get({})) || { history: [] };
-        const history = Array.isArray(stored.history) ? stored.history : [];
+        const rawHistory = Array.isArray(stored.history) ? stored.history : [];
+        const sortedHistory = sortAuditRecordsDesc(rawHistory);
+        const latestRecord = sortedHistory.length > 0 ? sortedHistory[0] : null;
+
+        const history = sortedHistory.map((rec: any) => ({
+          ...rec,
+          isLatestEligible: Boolean(
+            latestRecord && rec.batchId === latestRecord.batchId && !latestRecord.isRolledBack
+          ),
+        }));
 
         return {
           enabled: true,
@@ -382,6 +434,17 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         rolledBackAt: r[f.rolledBackAt] || null,
         rolledBackBy: r[f.rolledBackBy] || null,
         executedAt: r[f.executedAt] || r.createdAt,
+        createdAt: r.createdAt,
+      }));
+
+      const sortedHistory = sortAuditRecordsDesc(normalized);
+      const latestRecord = sortedHistory.length > 0 ? sortedHistory[0] : null;
+
+      const history = sortedHistory.map((rec: any) => ({
+        ...rec,
+        isLatestEligible: Boolean(
+          latestRecord && rec.batchId === latestRecord.batchId && !latestRecord.isRolledBack
+        ),
       }));
 
       return {
@@ -389,7 +452,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         mode: config.mode,
         contentType: config.contentType,
         isEnterpriseNativeAvailable: config.isEnterpriseNativeAvailable,
-        history: normalized,
+        history,
       };
     } catch (err: any) {
       return {
@@ -562,38 +625,173 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
   },
 
   /**
-   * Performs deterministic rollback of a batch
+   * Performs deterministic rollback of a batch.
+   * Strict invariant: ONLY the latest completed update is eligible for rollback.
+   * Older completed updates, already rolled-back updates, and pending/failed/executing batches are strictly rejected.
    */
   async rollbackBatch(batchId: string, currentUser?: any) {
-    const config = this.getAuditConfig();
-    if (!config.enabled) {
-      throw new Error('Audit trail is not configured or disabled.');
-    }
+    return withRollbackLock(async () => {
+      const config = this.getAuditConfig();
+      if (!config.enabled) {
+        throw new Error('Audit trail is not configured or disabled.');
+      }
 
-    if (config.mode === 'store') {
-      const store = strapi.store({ type: 'plugin', name: 'bulk-updater', key: 'audit-history' });
-      const stored = (await store.get({})) || { history: [] };
-      const history = Array.isArray(stored.history) ? stored.history : [];
+      if (!batchId) {
+        throw new Error('A valid batchId is required to perform rollback.');
+      }
 
-      const recordIndex = history.findIndex((r: any) => r.batchId === batchId);
-      if (recordIndex === -1) {
+      // 1. Guard against rolling back pending, queued, executing, or failed batches
+      try {
+        const bulkService = strapi.plugin('bulk-updater')?.service('bulkUpdater');
+        if (bulkService && typeof bulkService.getBatchStatus === 'function') {
+          const statusRes = await bulkService.getBatchStatus(batchId);
+          const batchJob = statusRes?.batch;
+          if (batchJob) {
+            if (batchJob.status === 'pending_approval' || batchJob.status === 'queued_offpeak') {
+              throw new Error(`Batch "${batchId}" is currently pending and cannot be rolled back.`);
+            }
+            if (batchJob.status === 'processing' || batchJob.status === 'running' || batchJob.status === 'executing') {
+              throw new Error(`Batch "${batchId}" is currently executing and cannot be rolled back.`);
+            }
+            if (batchJob.status === 'failed') {
+              throw new Error(`Batch "${batchId}" failed during execution and cannot be rolled back.`);
+            }
+          }
+        }
+      } catch (checkErr: any) {
+        if (checkErr.message?.startsWith('Batch "')) {
+          throw checkErr;
+        }
+      }
+
+      if (config.mode === 'store') {
+        const store = strapi.store({ type: 'plugin', name: 'bulk-updater', key: 'audit-history' });
+        const stored = (await store.get({})) || { history: [] };
+        const rawHistory = Array.isArray(stored.history) ? stored.history : [];
+
+        if (rawHistory.length === 0) {
+          throw new Error('No completed update records found in audit trail.');
+        }
+
+        const sortedHistory = sortAuditRecordsDesc(rawHistory);
+        const targetRecord = sortedHistory.find((r: any) => r.batchId === batchId);
+        if (!targetRecord) {
+          throw new Error(`Batch record with ID "${batchId}" was not found in audit trail.`);
+        }
+
+        const latestRecord = sortedHistory[0];
+        if (latestRecord.batchId !== batchId) {
+          throw new Error('Only the latest completed update can be rolled back. Older batch updates cannot be rolled back.');
+        }
+
+        if (targetRecord.isRolledBack) {
+          throw new Error(`Batch "${batchId}" has already been rolled back.`);
+        }
+
+        const diffs = Array.isArray(targetRecord.diffs) ? targetRecord.diffs : [];
+        const { revertedCount, rollbackDetails } = await this.revertDiffItems(diffs, currentUser?.id);
+
+        const recordIndex = rawHistory.findIndex((r: any) => r.batchId === batchId);
+        if (recordIndex !== -1) {
+          rawHistory[recordIndex] = {
+            ...rawHistory[recordIndex],
+            isRolledBack: true,
+            rolledBackAt: new Date().toISOString(),
+            rolledBackBy: currentUser?.email || 'Admin',
+          };
+          await store.set({ value: { history: rawHistory } });
+        }
+
+        try {
+          const affectedUids = new Set(rollbackDetails.map((d: any) => d.uid));
+          const bulkService = strapi.plugin('bulk-updater').service('bulkUpdater');
+          affectedUids.forEach((uid: any) => {
+            if (uid && bulkService?.invalidateCache) {
+              bulkService.invalidateCache(uid);
+            }
+          });
+        } catch {}
+
+        await this.recordToEnterpriseNative(
+          'bulk-updater.rollback',
+          {
+            batchId,
+            revertedCount,
+          },
+          currentUser
+        );
+
+        return {
+          success: true,
+          batchId,
+          revertedCount,
+          details: rollbackDetails,
+        };
+      }
+
+      if (!config.contentType || !config.fields) {
+        throw new Error('Audit trail is not configured or disabled.');
+      }
+
+      const f = config.fields;
+      const allRecords: any[] = await strapi.documents(config.contentType as any).findMany({
+        sort: { createdAt: 'desc' } as any,
+      });
+
+      if (!allRecords || allRecords.length === 0) {
+        throw new Error('No completed update records found in audit trail.');
+      }
+
+      const normalizedHistory = allRecords.map((r: any) => ({
+        id: r.id,
+        documentId: r.documentId,
+        batchId: r[f.batchId] || r.documentId,
+        attribute: r[f.attribute],
+        value: r[f.value],
+        userEmail: r[f.userEmail] || 'admin@strapi.io',
+        userName: r[f.userName] || 'Admin',
+        updatedCount: r[f.updatedCount] || 0,
+        skippedCount: r[f.skippedCount] || 0,
+        totalTargets: r[f.totalTargets] || 0,
+        diffs: typeof r[f.diffs] === 'string' ? JSON.parse(r[f.diffs]) : r[f.diffs] || [],
+        isRolledBack: Boolean(r[f.isRolledBack]),
+        rolledBackAt: r[f.rolledBackAt] || null,
+        rolledBackBy: r[f.rolledBackBy] || null,
+        executedAt: r[f.executedAt] || r.createdAt,
+        createdAt: r.createdAt,
+      }));
+
+      const sortedHistory = sortAuditRecordsDesc(normalizedHistory);
+      const targetRecord = sortedHistory.find((r: any) => r.batchId === batchId);
+      if (!targetRecord) {
         throw new Error(`Batch record with ID "${batchId}" was not found in audit trail.`);
       }
 
-      const record = history[recordIndex];
-      if (record.isRolledBack) {
+      const latestRecord = sortedHistory[0];
+      if (latestRecord.batchId !== batchId) {
+        throw new Error('Only the latest completed update can be rolled back. Older batch updates cannot be rolled back.');
+      }
+
+      if (targetRecord.isRolledBack) {
         throw new Error(`Batch "${batchId}" has already been rolled back.`);
       }
 
-      const diffs = Array.isArray(record.diffs) ? record.diffs : [];
+      const diffs = Array.isArray(targetRecord.diffs) ? targetRecord.diffs : [];
       const { revertedCount, rollbackDetails } = await this.revertDiffItems(diffs, currentUser?.id);
 
-      record.isRolledBack = true;
-      record.rolledBackAt = new Date().toISOString();
-      record.rolledBackBy = currentUser?.email || 'Admin';
-      history[recordIndex] = record;
-      await store.set({ value: { history } });
+      const updateData: any = {};
+      if (f.isRolledBack) updateData[f.isRolledBack] = true;
+      if (f.rolledBackAt) updateData[f.rolledBackAt] = new Date().toISOString();
+      if (f.rolledBackBy) {
+        updateData[f.rolledBackBy] = currentUser?.email || 'Admin';
+      }
 
+      await strapi.documents(config.contentType as any).update({
+        documentId: targetRecord.documentId,
+        data: updateData,
+      });
+
+      // Invalidate affected collection caches
       try {
         const affectedUids = new Set(rollbackDetails.map((d: any) => d.uid));
         const bulkService = strapi.plugin('bulk-updater').service('bulkUpdater');
@@ -604,6 +802,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         });
       } catch {}
 
+      // Mirror rollback event to Strapi Enterprise native audit log if available
       await this.recordToEnterpriseNative(
         'bulk-updater.rollback',
         {
@@ -619,73 +818,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         revertedCount,
         details: rollbackDetails,
       };
-    }
-
-    if (!config.contentType || !config.fields) {
-      throw new Error('Audit trail is not configured or disabled.');
-    }
-
-    const f = config.fields;
-    const records: any[] = await strapi.documents(config.contentType as any).findMany({
-      filters: {
-        [f.batchId]: { $eq: batchId },
-      } as any,
     });
-
-    const record = records?.[0];
-    if (!record) {
-      throw new Error(`Batch record with ID "${batchId}" was not found in audit trail.`);
-    }
-
-    if (record[f.isRolledBack]) {
-      throw new Error(`Batch "${batchId}" has already been rolled back.`);
-    }
-
-    const diffs =
-      typeof record[f.diffs] === 'string'
-        ? JSON.parse(record[f.diffs])
-        : record[f.diffs] || [];
-
-    const { revertedCount, rollbackDetails } = await this.revertDiffItems(diffs, currentUser?.id);
-
-    const updateData: any = {};
-    if (f.isRolledBack) updateData[f.isRolledBack] = true;
-    if (f.rolledBackAt) updateData[f.rolledBackAt] = new Date().toISOString();
-    if (f.rolledBackBy) {
-      updateData[f.rolledBackBy] = currentUser?.email || 'Admin';
-    }
-
-    await strapi.documents(config.contentType as any).update({
-      documentId: record.documentId,
-      data: updateData,
-    });
-
-    // Invalidate affected collection caches
-    try {
-      const affectedUids = new Set(rollbackDetails.map((d: any) => d.uid));
-      const bulkService = strapi.plugin('bulk-updater').service('bulkUpdater');
-      affectedUids.forEach((uid: any) => {
-        if (uid && bulkService?.invalidateCache) {
-          bulkService.invalidateCache(uid);
-        }
-      });
-    } catch {}
-
-    // Mirror rollback event to Strapi Enterprise native audit log if available
-    await this.recordToEnterpriseNative(
-      'bulk-updater.rollback',
-      {
-        batchId,
-        revertedCount,
-      },
-      currentUser
-    );
-
-    return {
-      success: true,
-      batchId,
-      revertedCount,
-      details: rollbackDetails,
-    };
   },
 });
