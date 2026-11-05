@@ -9,6 +9,19 @@ import {
   evaluateShouldPublish,
 } from './bulk-updater';
 import { extractHeadingsFromRichText, validateEntityQuotas, deepMergeEntities } from './validation-rules';
+import {
+  discoverSchema,
+  buildLosslessPopulate,
+  serializeDocumentsToCsv,
+  serializeFieldValue,
+  escapeCsvCell,
+  METADATA_COLUMN_KEY,
+  CURRENT_SCHEMA_VERSION,
+  type BulkUpdaterMetadata,
+  extractMetadataFromRow,
+  buildDocumentUpdatePayload,
+  verifyDocumentIntegrity,
+} from './csv/index';
 
 /**
  * Robust, Excel-Safe CSV string escaping helper (RFC-4180 compliant)
@@ -186,6 +199,10 @@ export function isValidDocId(val: any): boolean {
 
 export function extractDocId(row: Record<string, any>): string {
   if (!row || typeof row !== 'object') return '';
+  const meta = extractMetadataFromRow(row);
+  if (meta?.documentId && isValidDocId(String(meta.documentId).trim())) {
+    return String(meta.documentId).trim();
+  }
   const candidates = [
     row.documentId,
     row.document_id,
@@ -211,6 +228,10 @@ export function extractDocId(row: Record<string, any>): string {
 
 export function extractLocale(row: Record<string, any>): string | undefined {
   if (!row || typeof row !== 'object') return undefined;
+  const meta = extractMetadataFromRow(row);
+  if (meta?.locale && String(meta.locale).trim()) {
+    return String(meta.locale).trim();
+  }
   const candidates = [
     row.locale,
     row.Locale,
@@ -610,7 +631,7 @@ async function findExistingDocument(
   const ct = strapi.contentTypes[uid];
   const effectiveLocale = getEffectiveLocale(ct, docLocale);
 
-  const populateDef = ct?.attributes ? buildDeepPopulate(ct.attributes, (strapi as any).components) : undefined;
+  const populateDef = ct ? buildLosslessPopulate(strapi, uid) : undefined;
 
   try {
     const queryArgs: any = {
@@ -1061,6 +1082,283 @@ function formatValueDisplay(val: any): string {
   return s === '' ? '(empty)' : s;
 }
 
+
+async function executeUpdateMutation(
+  strapi: Core.Strapi,
+  ct: any,
+  uid: string,
+  existing: any,
+  row: Record<string, string>,
+  rowNumber: number,
+  options: any,
+  effectiveLocale: string | undefined,
+  isEditing: boolean,
+  isDraftAndPublish: boolean,
+  publishedCounterparts: Map<string, any>,
+  stats: ProcessRowsStats,
+  actionLabel = 'Updated'
+) {
+  const resolvedDocId = existing.documentId;
+  const updatePayload = await buildDocumentUpdatePayload(
+    strapi,
+    uid,
+    existing,
+    row,
+    { isPartialUpdate: options.mode === 'update' }
+  );
+
+  if (Object.keys(updatePayload).length === 0) {
+    stats.skipped++;
+    stats.diffs.push({
+      uid,
+      collectionName: ct.info?.displayName || uid,
+      documentId: resolvedDocId,
+      label: existing.title || existing.name || `Entry #${resolvedDocId}`,
+      attribute: '',
+      oldValue: existing,
+      newValue: {},
+      status: 'skipped',
+      message: `Skipped (no editable attributes in row ${rowNumber})`,
+    });
+    return;
+  }
+
+  let pubRecord =
+    (effectiveLocale && publishedCounterparts.get(`${resolvedDocId}@@@${effectiveLocale}`)) ||
+    publishedCounterparts.get(String(resolvedDocId));
+  if (!pubRecord && isDraftAndPublish && resolvedDocId) {
+    try {
+      const singlePub = await (strapi.documents(uid as any) as any).findMany({
+        status: 'published',
+        filters: { documentId: resolvedDocId },
+        fields: ['documentId', 'updatedAt', 'publishedAt', 'locale'],
+        limit: 1,
+      });
+      if (singlePub && singlePub.length > 0) {
+        pubRecord = singlePub[0];
+        publishedCounterparts.set(String(resolvedDocId), pubRecord);
+      }
+    } catch {}
+  }
+
+  const rowStatus =
+    row.status ||
+    row.Status ||
+    row.STATUS ||
+    row['Published Status'] ||
+    row['published_status'] ||
+    row['strapi_status'];
+  const rowPubAt = row.publishedAt || row.published_at || row.PublishedAt;
+  const inspectionExisting =
+    rowStatus || rowPubAt
+      ? {
+          ...existing,
+          ...(rowStatus ? { status: rowStatus } : {}),
+          ...(rowPubAt ? { publishedAt: rowPubAt } : {}),
+        }
+      : existing;
+
+  const { hadPublishedVersion } = resolveRecordPublicationStatus(
+    inspectionExisting,
+    pubRecord,
+    isDraftAndPublish
+  );
+
+  const shouldPublish = evaluateShouldPublish({
+    isDraftAndPublish,
+    hadPublishedVersion,
+    isEditing,
+    publishOnApproval: Boolean(options.publish),
+    publishStrategy: options.publishStrategy || 'safe',
+    unreviewedConsent: options.unreviewedConsent,
+  });
+
+  // Pre-validate entire proposed entity against active Validation & Quota Rules before mutating or publishing
+  const proposedEntity = deepMergeEntities(existing, updatePayload);
+  const valResult = await validateEntityQuotas(strapi, uid, proposedEntity);
+  if (!valResult.isValid) {
+    stats.skipped++;
+    if (stats.failed !== undefined) stats.failed++;
+    stats.errors.push({
+      row: rowNumber,
+      documentId: resolvedDocId,
+      error: valResult.errorMessage,
+    });
+    stats.diffs.push({
+      uid,
+      collectionName: ct.info?.displayName || uid,
+      documentId: resolvedDocId,
+      label: existing.title || existing.name || `Entry #${resolvedDocId}`,
+      attribute: valResult.targetField || '',
+      oldValue: existing?.[valResult.targetField || ''] ?? null,
+      newValue: updatePayload?.[valResult.targetField || ''] ?? null,
+      status: 'error',
+      message: valResult.errorMessage,
+    });
+    return;
+  }
+
+  const updateArgs: any = {
+    documentId: resolvedDocId,
+    data: updatePayload,
+  };
+  if (effectiveLocale) updateArgs.locale = effectiveLocale;
+
+  await (strapi.documents(uid as any) as any).update(updateArgs);
+
+  if (shouldPublish) {
+    try {
+      const pubArgs: any = { documentId: resolvedDocId };
+      if (effectiveLocale) pubArgs.locale = effectiveLocale;
+      await (strapi.documents(uid as any) as any).publish(pubArgs);
+    } catch (pubErr) {
+      strapi.log.warn(`[bulk-updater] Auto-publish failed for ${resolvedDocId}:`, pubErr);
+    }
+  }
+
+  try {
+    await recordContentHistoryVersion(strapi, {
+      uid,
+      documentId: resolvedDocId,
+      userId: options.user?.id,
+      statusOverride: shouldPublish
+        ? 'published'
+        : isDraftAndPublish
+        ? hadPublishedVersion
+          ? 'modified'
+          : 'draft'
+        : undefined,
+    });
+  } catch {}
+
+  // Post-update verification with data comparator
+  try {
+    const postDoc = await (strapi.documents(uid as any) as any).findOne({
+      documentId: resolvedDocId,
+      ...(effectiveLocale ? { locale: effectiveLocale } : {}),
+      populate: buildLosslessPopulate(strapi, uid),
+    });
+    if (postDoc) {
+      const integrityReport = verifyDocumentIntegrity(strapi, uid, existing, updatePayload, postDoc);
+      if (integrityReport.status === 'FAILED') {
+        strapi.log.warn(`[bulk-updater] Data integrity warning on row ${rowNumber}:`, integrityReport.diffs);
+      }
+    }
+  } catch {}
+
+  stats.updated++;
+  for (const attrKey of Object.keys(updatePayload)) {
+    const oldVal = existing?.[attrKey] ?? null;
+    const newVal = updatePayload[attrKey];
+    stats.diffs.push({
+      uid,
+      collectionName: ct.info?.displayName || uid,
+      documentId: resolvedDocId,
+      label: existing.title || existing.name || `Entry #${resolvedDocId}`,
+      attribute: attrKey,
+      oldValue: oldVal,
+      newValue: newVal,
+      status: 'updated',
+      message: `${actionLabel} "${attrKey}" via CSV import (row ${rowNumber})`,
+    });
+  }
+}
+
+async function executeCreateMutation(
+  strapi: Core.Strapi,
+  ct: any,
+  uid: string,
+  docId: string,
+  row: Record<string, string>,
+  rowNumber: number,
+  options: any,
+  effectiveLocale: string | undefined,
+  isEditing: boolean,
+  isDraftAndPublish: boolean,
+  stats: ProcessRowsStats
+) {
+  const createPayload = await buildDocumentUpdatePayload(
+    strapi,
+    uid,
+    null,
+    row,
+    { isPartialUpdate: false }
+  );
+
+  const valResultNew = await validateEntityQuotas(strapi, uid, createPayload);
+  if (!valResultNew.isValid) {
+    stats.skipped++;
+    if (stats.failed !== undefined) stats.failed++;
+    stats.errors.push({
+      row: rowNumber,
+      documentId: docId || 'new',
+      error: valResultNew.errorMessage,
+    });
+    stats.diffs.push({
+      uid,
+      collectionName: ct.info?.displayName || uid,
+      documentId: docId || 'new',
+      label: `Row ${rowNumber}`,
+      attribute: valResultNew.targetField || '',
+      oldValue: null,
+      newValue: createPayload?.[valResultNew.targetField || ''] ?? null,
+      status: 'error',
+      message: valResultNew.errorMessage,
+    });
+    return;
+  }
+
+  const createArgs: any = { data: createPayload };
+  if (effectiveLocale) createArgs.locale = effectiveLocale;
+  const created: any = await strapi.documents(uid as any).create(createArgs);
+
+  const newDocId = created?.documentId || docId;
+  const shouldPublishNew =
+    !isEditing &&
+    isDraftAndPublish &&
+    Boolean(options.publish) &&
+    (options.publishStrategy === 'all' || options.unreviewedConsent ? true : false);
+
+  if (shouldPublishNew && newDocId) {
+    try {
+      const pubArgs: any = { documentId: newDocId };
+      if (effectiveLocale) pubArgs.locale = effectiveLocale;
+      await (strapi.documents(uid as any) as any).publish(pubArgs);
+    } catch (pubErr) {
+      strapi.log.warn(`[bulk-updater] Auto-publish failed for ${newDocId}:`, pubErr);
+    }
+  }
+
+  try {
+    await recordContentHistoryVersion(strapi, {
+      uid,
+      documentId: newDocId,
+      userId: options.user?.id,
+      statusOverride: shouldPublishNew ? 'published' : isDraftAndPublish ? 'draft' : undefined,
+    });
+  } catch {}
+
+  stats.created++;
+  if (!docId) {
+    stats.newWithoutDocId++;
+  }
+  for (const attrKey of Object.keys(createPayload)) {
+    stats.diffs.push({
+      uid,
+      collectionName: ct.info?.displayName || uid,
+      documentId: newDocId,
+      label: created?.title || created?.name || `New Entry #${newDocId}`,
+      attribute: attrKey,
+      oldValue: null,
+      newValue: createPayload[attrKey],
+      status: 'created',
+      message: docId
+        ? `Created "${attrKey}" via CSV import (row ${rowNumber})`
+        : `Created "${attrKey}" as new entry (row ${rowNumber})`,
+    });
+  }
+}
+
 export async function processCsvRows(
   strapi: Core.Strapi,
   ct: any,
@@ -1133,8 +1431,6 @@ export async function processCsvRows(
       } catch {}
     }
 
-    const payload = parseRowToPayload(strapi, attrs, row);
-
     try {
       if (mode === 'update') {
         if (!docId) {
@@ -1147,7 +1443,6 @@ export async function processCsvRows(
         }
 
         const existing = await findExistingDocument(strapi, uid, docId, effectiveLocale);
-
         if (!existing) {
           stats.skipped++;
           stats.errors.push({
@@ -1158,140 +1453,21 @@ export async function processCsvRows(
           continue;
         }
 
-        const resolvedDocId = existing.documentId || docId;
-        const mergedPayload = { ...payload };
-        for (const key of Object.keys(payload)) {
-          if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
-            mergedPayload[key] = deepMergeComponent((existing as any)[key], payload[key]);
-          }
-        }
-
-        if (Object.keys(mergedPayload).length === 0) {
-          stats.skipped++;
-          stats.diffs.push({
-            uid,
-            collectionName: ct.info?.displayName || uid,
-            documentId: resolvedDocId,
-            label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
-            attribute: '',
-            oldValue: existing,
-            newValue: {},
-            status: 'skipped',
-            message: `Skipped (no editable attributes in row ${rowNumber})`,
-          });
-          continue;
-        }
-
-        let pubRecord = (effectiveLocale && publishedCounterparts.get(`${resolvedDocId}@@@${effectiveLocale}`)) ||
-          publishedCounterparts.get(String(resolvedDocId));
-        if (!pubRecord && isDraftAndPublish && resolvedDocId) {
-          try {
-            const singlePub = await (strapi.documents(uid as any) as any).findMany({
-              status: 'published',
-              filters: { documentId: resolvedDocId },
-              fields: ['documentId', 'updatedAt', 'publishedAt', 'locale'],
-              limit: 1,
-            });
-            if (singlePub && singlePub.length > 0) {
-              pubRecord = singlePub[0];
-              publishedCounterparts.set(String(resolvedDocId), pubRecord);
-            }
-          } catch {}
-        }
-
-        const rowStatus = row.status || row.Status || row.STATUS || row['Published Status'] || row['published_status'] || row['strapi_status'];
-        const rowPubAt = row.publishedAt || row.published_at || row.PublishedAt;
-        const inspectionExisting = (rowStatus || rowPubAt)
-          ? { ...existing, ...(rowStatus ? { status: rowStatus } : {}), ...(rowPubAt ? { publishedAt: rowPubAt } : {}) }
-          : existing;
-
-        const { hadPublishedVersion } = resolveRecordPublicationStatus(
-          inspectionExisting,
-          pubRecord,
-          isDraftAndPublish
-        );
-
-        const shouldPublish = evaluateShouldPublish({
-          isDraftAndPublish,
-          hadPublishedVersion,
+        await executeUpdateMutation(
+          strapi,
+          ct,
+          uid,
+          existing,
+          row,
+          rowNumber,
+          options,
+          effectiveLocale,
           isEditing,
-          publishOnApproval: Boolean(publish),
-          publishStrategy,
-          unreviewedConsent: options.unreviewedConsent,
-        });
-
-        const updateArgs: any = {
-          documentId: resolvedDocId,
-          data: mergedPayload,
-        };
-        if (effectiveLocale) updateArgs.locale = effectiveLocale;
-
-        // Pre-validate entire proposed entity against active Validation & Quota Rules before mutating or publishing
-        const proposedEntity = deepMergeEntities(existing, mergedPayload);
-        const valResult = await validateEntityQuotas(strapi, uid, proposedEntity);
-        if (!valResult.isValid) {
-          stats.skipped++;
-          if (stats.failed !== undefined) stats.failed++;
-          stats.errors.push({
-            row: rowNumber,
-            documentId: resolvedDocId,
-            error: valResult.errorMessage,
-          });
-          stats.diffs.push({
-            uid,
-            collectionName: ct.info?.displayName || uid,
-            documentId: resolvedDocId,
-            label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
-            attribute: valResult.targetField || '',
-            oldValue: (existing as any)?.[valResult.targetField || ''] ?? null,
-            newValue: (mergedPayload as any)?.[valResult.targetField || ''] ?? null,
-            status: 'error',
-            message: valResult.errorMessage,
-          });
-          continue;
-        }
-
-        // Perform update mutation
-        await (strapi.documents(uid as any) as any).update(updateArgs);
-
-        // Publish ONLY after successful update, and ONLY if originally Published/Modified
-        if (shouldPublish) {
-          try {
-            const pubArgs: any = { documentId: resolvedDocId };
-            if (effectiveLocale) pubArgs.locale = effectiveLocale;
-            await (strapi.documents(uid as any) as any).publish(pubArgs);
-          } catch (pubErr) {
-            strapi.log.warn(`[bulk-updater] Auto-publish failed for ${resolvedDocId}:`, pubErr);
-          }
-        }
-
-        try {
-          await recordContentHistoryVersion(strapi, {
-            uid,
-            documentId: resolvedDocId,
-            userId: user?.id,
-            statusOverride: shouldPublish
-              ? 'published'
-              : (isDraftAndPublish ? (hadPublishedVersion ? 'modified' : 'draft') : undefined),
-          });
-        } catch {}
-
-        stats.updated++;
-        for (const attrKey of Object.keys(payload)) {
-          const oldVal = (existing as any)?.[attrKey] ?? null;
-          const newVal = payload[attrKey];
-          stats.diffs.push({
-            uid,
-            collectionName: ct.info?.displayName || uid,
-            documentId: resolvedDocId,
-            label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
-            attribute: attrKey,
-            oldValue: oldVal,
-            newValue: newVal,
-            status: 'updated',
-            message: `Updated "${attrKey}" via CSV import (row ${rowNumber})`,
-          });
-        }
+          isDraftAndPublish,
+          publishedCounterparts,
+          stats,
+          'Updated'
+        );
       } else if (mode === 'create_or_override') {
         let existing: any = null;
         if (docId) {
@@ -1299,405 +1475,94 @@ export async function processCsvRows(
         }
 
         if (existing) {
-          const resolvedDocId = existing.documentId || docId;
-          const mergedPayload = { ...payload };
-          for (const key of Object.keys(payload)) {
-            if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
-              mergedPayload[key] = deepMergeComponent((existing as any)[key], payload[key]);
-            }
-          }
-
-          let pubRecord = (effectiveLocale && publishedCounterparts.get(`${resolvedDocId}@@@${effectiveLocale}`)) ||
-            publishedCounterparts.get(String(resolvedDocId));
-          if (!pubRecord && isDraftAndPublish && resolvedDocId) {
-            try {
-              const singlePub = await (strapi.documents(uid as any) as any).findMany({
-                status: 'published',
-                filters: { documentId: resolvedDocId },
-                fields: ['documentId', 'updatedAt', 'publishedAt', 'locale'],
-                limit: 1,
-              });
-              if (singlePub && singlePub.length > 0) {
-                pubRecord = singlePub[0];
-                publishedCounterparts.set(String(resolvedDocId), pubRecord);
-              }
-            } catch {}
-          }
-
-          const rowStatus = row.status || row.Status || row.STATUS || row['Published Status'] || row['published_status'] || row['strapi_status'];
-          const rowPubAt = row.publishedAt || row.published_at || row.PublishedAt;
-          const inspectionExisting = (rowStatus || rowPubAt)
-            ? { ...existing, ...(rowStatus ? { status: rowStatus } : {}), ...(rowPubAt ? { publishedAt: rowPubAt } : {}) }
-            : existing;
-
-          const { hadPublishedVersion } = resolveRecordPublicationStatus(
-            inspectionExisting,
-            pubRecord,
-            isDraftAndPublish
-          );
-
-          const shouldPublish = evaluateShouldPublish({
-            isDraftAndPublish,
-            hadPublishedVersion,
+          await executeUpdateMutation(
+            strapi,
+            ct,
+            uid,
+            existing,
+            row,
+            rowNumber,
+            options,
+            effectiveLocale,
             isEditing,
-            publishOnApproval: Boolean(publish),
-            publishStrategy,
-            unreviewedConsent: options.unreviewedConsent,
-          });
-
-          const updateArgs: any = {
-            documentId: resolvedDocId,
-            data: mergedPayload,
-          };
-          if (effectiveLocale) updateArgs.locale = effectiveLocale;
-
-          // Pre-validate entire proposed entity against active Validation & Quota Rules before mutating or publishing
-          const proposedEntity = deepMergeEntities(existing, mergedPayload);
-          const valResult = await validateEntityQuotas(strapi, uid, proposedEntity);
-          if (!valResult.isValid) {
-            stats.skipped++;
-            if (stats.failed !== undefined) stats.failed++;
-            stats.errors.push({
-              row: rowNumber,
-              documentId: resolvedDocId,
-              error: valResult.errorMessage,
-            });
-            stats.diffs.push({
-              uid,
-              collectionName: ct.info?.displayName || uid,
-              documentId: resolvedDocId,
-              label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
-              attribute: valResult.targetField || '',
-              oldValue: (existing as any)?.[valResult.targetField || ''] ?? null,
-              newValue: (mergedPayload as any)?.[valResult.targetField || ''] ?? null,
-              status: 'error',
-              message: valResult.errorMessage,
-            });
-            continue;
-          }
-
-          // Perform update mutation
-          await (strapi.documents(uid as any) as any).update(updateArgs);
-
-          // Publish ONLY after successful update, and ONLY if originally Published/Modified
-          if (shouldPublish) {
-            try {
-              const pubArgs: any = { documentId: resolvedDocId };
-              if (effectiveLocale) pubArgs.locale = effectiveLocale;
-              await (strapi.documents(uid as any) as any).publish(pubArgs);
-            } catch (pubErr) {
-              strapi.log.warn(`[bulk-updater] Auto-publish failed for ${resolvedDocId}:`, pubErr);
-            }
-          }
-
-          try {
-            await recordContentHistoryVersion(strapi, {
-              uid,
-              documentId: resolvedDocId,
-              userId: user?.id,
-              statusOverride: shouldPublish
-                ? 'published'
-                : (isDraftAndPublish ? (hadPublishedVersion ? 'modified' : 'draft') : undefined),
-            });
-          } catch {}
-
-          stats.updated++;
-          for (const attrKey of Object.keys(payload)) {
-            const oldVal = (existing as any)?.[attrKey] ?? null;
-            const newVal = payload[attrKey];
-            stats.diffs.push({
-              uid,
-              collectionName: ct.info?.displayName || uid,
-              documentId: resolvedDocId,
-              label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
-              attribute: attrKey,
-              oldValue: oldVal,
-              newValue: newVal,
-              status: 'updated',
-              message: `Overridden "${attrKey}" via CSV import (row ${rowNumber})`,
-            });
-          }
-          continue;
-        }
-
-        // Pre-validate new entity against active Validation & Quota Rules before creating or publishing
-        const valResultNew = await validateEntityQuotas(strapi, uid, payload);
-        if (!valResultNew.isValid) {
-          stats.skipped++;
-          if (stats.failed !== undefined) stats.failed++;
-          stats.errors.push({
-            row: rowNumber,
-            documentId: docId || 'new',
-            error: valResultNew.errorMessage,
-          });
-          stats.diffs.push({
+            isDraftAndPublish,
+            publishedCounterparts,
+            stats,
+            'Overridden'
+          );
+        } else {
+          await executeCreateMutation(
+            strapi,
+            ct,
             uid,
-            collectionName: ct.info?.displayName || uid,
-            documentId: docId || 'new',
-            label: `Row ${rowNumber}`,
-            attribute: valResultNew.targetField || '',
-            oldValue: null,
-            newValue: (payload as any)?.[valResultNew.targetField || ''] ?? null,
-            status: 'error',
-            message: valResultNew.errorMessage,
-          });
-          continue;
-        }
-
-        const createArgs: any = { data: payload };
-        if (effectiveLocale) createArgs.locale = effectiveLocale;
-        const created: any = await strapi.documents(uid as any).create(createArgs);
-
-        const newDocId = created?.documentId || docId;
-        const shouldPublishNew = !isEditing && isDraftAndPublish && Boolean(publish) && (
-          publishStrategy === 'all' || options.unreviewedConsent ? true : false
-        );
-
-        if (shouldPublishNew && newDocId) {
-          try {
-            const pubArgs: any = { documentId: newDocId };
-            if (effectiveLocale) pubArgs.locale = effectiveLocale;
-            await (strapi.documents(uid as any) as any).publish(pubArgs);
-          } catch (pubErr) {
-            strapi.log.warn(`[bulk-updater] Auto-publish failed for ${newDocId}:`, pubErr);
-          }
-        }
-
-        try {
-          await recordContentHistoryVersion(strapi, {
-            uid,
-            documentId: newDocId,
-            userId: user?.id,
-            statusOverride: shouldPublishNew ? 'published' : (isDraftAndPublish ? 'draft' : undefined),
-          });
-        } catch {}
-
-        stats.created++;
-        if (!docId) {
-          stats.newWithoutDocId++;
-        }
-        for (const attrKey of Object.keys(payload)) {
-          stats.diffs.push({
-            uid,
-            collectionName: ct.info?.displayName || uid,
-            documentId: newDocId,
-            label: created?.title || created?.name || `New Entry #${newDocId}`,
-            attribute: attrKey,
-            oldValue: null,
-            newValue: payload[attrKey],
-            status: 'created',
-            message: docId
-              ? `Created "${attrKey}" via CSV import (row ${rowNumber})`
-              : `Created "${attrKey}" as new entry (row ${rowNumber})`,
-          });
+            docId,
+            row,
+            rowNumber,
+            options,
+            effectiveLocale,
+            isEditing,
+            isDraftAndPublish,
+            stats
+          );
         }
       } else {
-        // Default: Smart Auto-Detect ('auto')
+        // Smart Auto-Detect ('auto')
         let existing: any = null;
         if (docId) {
           existing = await findExistingDocument(strapi, uid, docId, effectiveLocale);
         }
 
         if (existing) {
-          const resolvedDocId = existing.documentId || docId;
-          const mergedPayload = { ...payload };
-          for (const key of Object.keys(payload)) {
-            if (attrs[key]?.type === 'component' && typeof payload[key] === 'object' && payload[key] !== null) {
-              mergedPayload[key] = deepMergeComponent((existing as any)[key], payload[key]);
-            }
-          }
-
-          let pubRecord = (effectiveLocale && publishedCounterparts.get(`${resolvedDocId}@@@${effectiveLocale}`)) ||
-            publishedCounterparts.get(String(resolvedDocId));
-          if (!pubRecord && isDraftAndPublish && resolvedDocId) {
-            try {
-              const singlePub = await (strapi.documents(uid as any) as any).findMany({
-                status: 'published',
-                filters: { documentId: resolvedDocId },
-                fields: ['documentId', 'updatedAt', 'publishedAt', 'locale'],
-                limit: 1,
-              });
-              if (singlePub && singlePub.length > 0) {
-                pubRecord = singlePub[0];
-                publishedCounterparts.set(String(resolvedDocId), pubRecord);
-              }
-            } catch {}
-          }
-
-          const rowStatus = row.status || row.Status || row.STATUS || row['Published Status'] || row['published_status'] || row['strapi_status'];
-          const rowPubAt = row.publishedAt || row.published_at || row.PublishedAt;
-          const inspectionExisting = (rowStatus || rowPubAt)
-            ? { ...existing, ...(rowStatus ? { status: rowStatus } : {}), ...(rowPubAt ? { publishedAt: rowPubAt } : {}) }
-            : existing;
-
-          const { hadPublishedVersion } = resolveRecordPublicationStatus(
-            inspectionExisting,
-            pubRecord,
-            isDraftAndPublish
-          );
-
-          const shouldPublish = evaluateShouldPublish({
-            isDraftAndPublish,
-            hadPublishedVersion,
+          await executeUpdateMutation(
+            strapi,
+            ct,
+            uid,
+            existing,
+            row,
+            rowNumber,
+            options,
+            effectiveLocale,
             isEditing,
-            publishOnApproval: Boolean(publish),
-            publishStrategy,
-            unreviewedConsent: options.unreviewedConsent,
-          });
-
-          const updateArgs: any = {
-            documentId: resolvedDocId,
-            data: mergedPayload,
-          };
-          if (effectiveLocale) updateArgs.locale = effectiveLocale;
-
-          // Pre-validate entire proposed entity against active Validation & Quota Rules before mutating or publishing
-          const proposedEntity = deepMergeEntities(existing, mergedPayload);
-          const valResult = await validateEntityQuotas(strapi, uid, proposedEntity);
-          if (!valResult.isValid) {
-            stats.skipped++;
-            if (stats.failed !== undefined) stats.failed++;
-            stats.errors.push({
-              row: rowNumber,
-              documentId: resolvedDocId,
-              error: valResult.errorMessage,
-            });
-            stats.diffs.push({
-              uid,
-              collectionName: ct.info?.displayName || uid,
-              documentId: resolvedDocId,
-              label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
-              attribute: valResult.targetField || '',
-              oldValue: (existing as any)?.[valResult.targetField || ''] ?? null,
-              newValue: (mergedPayload as any)?.[valResult.targetField || ''] ?? null,
-              status: 'error',
-              message: valResult.errorMessage,
-            });
-            continue;
-          }
-
-          // Perform update mutation
-          await (strapi.documents(uid as any) as any).update(updateArgs);
-
-          // Publish ONLY after successful update, and ONLY if originally Published/Modified
-          if (shouldPublish) {
-            try {
-              const pubArgs: any = { documentId: resolvedDocId };
-              if (effectiveLocale) pubArgs.locale = effectiveLocale;
-              await (strapi.documents(uid as any) as any).publish(pubArgs);
-            } catch (pubErr) {
-              strapi.log.warn(`[bulk-updater] Auto-publish failed for ${resolvedDocId}:`, pubErr);
-            }
-          }
-
-          try {
-            await recordContentHistoryVersion(strapi, {
-              uid,
-              documentId: resolvedDocId,
-              userId: user?.id,
-              statusOverride: shouldPublish
-                ? 'published'
-                : (isDraftAndPublish ? (hadPublishedVersion ? 'modified' : 'draft') : undefined),
-            });
-          } catch {}
-
-          stats.updated++;
-          for (const attrKey of Object.keys(payload)) {
-            const oldVal = (existing as any)?.[attrKey] ?? null;
-            const newVal = payload[attrKey];
-            stats.diffs.push({
-              uid,
-              collectionName: ct.info?.displayName || uid,
-              documentId: resolvedDocId,
-              label: (existing as any).title || (existing as any).name || `Entry #${resolvedDocId}`,
-              attribute: attrKey,
-              oldValue: oldVal,
-              newValue: newVal,
-              status: 'updated',
-              message: `Updated "${attrKey}" via CSV import (row ${rowNumber})`,
-            });
-          }
-          continue;
-        }
-
-        // Missing docId OR provided docId does not exist in DB -> create new
-        // Pre-validate new entity against active Validation & Quota Rules before creating or publishing
-        const valResultNew = await validateEntityQuotas(strapi, uid, payload);
-        if (!valResultNew.isValid) {
-          stats.skipped++;
-          if (stats.failed !== undefined) stats.failed++;
-          stats.errors.push({
-            row: rowNumber,
-            documentId: docId || 'new',
-            error: valResultNew.errorMessage,
-          });
-          stats.diffs.push({
+            isDraftAndPublish,
+            publishedCounterparts,
+            stats,
+            'Updated'
+          );
+        } else {
+          await executeCreateMutation(
+            strapi,
+            ct,
             uid,
-            collectionName: ct.info?.displayName || uid,
-            documentId: docId || 'new',
-            label: `Row ${rowNumber}`,
-            attribute: valResultNew.targetField || '',
-            oldValue: null,
-            newValue: (payload as any)?.[valResultNew.targetField || ''] ?? null,
-            status: 'error',
-            message: valResultNew.errorMessage,
-          });
-          continue;
-        }
-
-        const createArgs: any = { data: payload };
-        if (effectiveLocale) createArgs.locale = effectiveLocale;
-        const created: any = await strapi.documents(uid as any).create(createArgs);
-
-        const newDocId = created?.documentId || docId;
-        const shouldPublishNew = !isEditing && isDraftAndPublish && Boolean(publish) && (
-          publishStrategy === 'all' || options.unreviewedConsent ? true : false
-        );
-
-        if (shouldPublishNew && newDocId) {
-          try {
-            const pubArgs: any = { documentId: newDocId };
-            if (effectiveLocale) pubArgs.locale = effectiveLocale;
-            await (strapi.documents(uid as any) as any).publish(pubArgs);
-          } catch (pubErr) {
-            strapi.log.warn(`[bulk-updater] Auto-publish failed for ${newDocId}:`, pubErr);
-          }
-        }
-
-        try {
-          await recordContentHistoryVersion(strapi, {
-            uid,
-            documentId: newDocId,
-            userId: user?.id,
-            statusOverride: shouldPublishNew ? 'published' : (isDraftAndPublish ? 'draft' : undefined),
-          });
-        } catch {}
-
-        stats.created++;
-        if (!docId) {
-          stats.newWithoutDocId++;
-        }
-        for (const attrKey of Object.keys(payload)) {
-          stats.diffs.push({
-            uid,
-            collectionName: ct.info?.displayName || uid,
-            documentId: newDocId,
-            label: created?.title || created?.name || `New Entry #${newDocId}`,
-            attribute: attrKey,
-            oldValue: null,
-            newValue: payload[attrKey],
-            status: 'created',
-            message: docId
-              ? `Created "${attrKey}" as new entry (documentId "${docId}" not found in database - row ${rowNumber})`
-              : `Created "${attrKey}" as new entry (no documentId provided in CSV - row ${rowNumber})`,
-          });
+            docId,
+            row,
+            rowNumber,
+            options,
+            effectiveLocale,
+            isEditing,
+            isDraftAndPublish,
+            stats
+          );
         }
       }
     } catch (err: any) {
+      stats.skipped++;
+      if (stats.failed !== undefined) stats.failed++;
+      const errMsg = extractDetailedErrorMessage(err);
       stats.errors.push({
         row: rowNumber,
         documentId: docId || undefined,
-        error: extractDetailedErrorMessage(err),
+        error: errMsg,
+      });
+      stats.diffs.push({
+        uid,
+        collectionName: ct.info?.displayName || uid,
+        documentId: docId || `(Row #${rowNumber})`,
+        label: `Row #${rowNumber}`,
+        attribute: '(record)',
+        oldValue: null,
+        newValue: null,
+        status: 'error',
+        message: `Failed to process row ${rowNumber}: ${errMsg}`,
       });
     }
   }
@@ -1805,55 +1670,74 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       throw new Error(`Content type ${uid} not found`);
     }
 
-    const attrs = ct.attributes || {};
-    const excluded = ['createdAt', 'updatedAt', 'publishedAt', 'createdBy', 'updatedBy', 'localizations'];
+    const schema = discoverSchema(strapi, uid);
+    const headers = [METADATA_COLUMN_KEY, ...schema.allExportKeys];
+    const sampleRow: string[] = [
+      JSON.stringify({
+        schemaVersion: CURRENT_SCHEMA_VERSION,
+        contentType: uid,
+        documentId: '',
+        locale: schema.isLocalized ? 'en' : undefined,
+        exportedAt: new Date().toISOString(),
+      }),
+    ];
 
-    // Base columns: documentId (optional for create, required for update)
-    const headers = ['documentId'];
-    const sampleRow: string[] = ['(Leave empty to create new, or enter existing docId)'];
-
-    for (const [attrName, attrDef] of Object.entries(attrs) as any[]) {
-      if (excluded.includes(attrName)) continue;
-      if (attrDef.type === 'relation') continue;
-      if (attrDef.type === 'component' || attrDef.type === 'dynamiczone') continue;
-
-      headers.push(attrName);
-      let sampleVal = '';
-      switch (attrDef.type) {
-        case 'string':
-        case 'text':
-        case 'richtext':
-          sampleVal = `Sample ${attrName}`;
-          break;
-        case 'integer':
-        case 'biginteger':
-        case 'float':
-        case 'decimal':
-          sampleVal = '10';
-          break;
-        case 'boolean':
-          sampleVal = 'true';
-          break;
-        case 'email':
-          sampleVal = 'sample@example.com';
-          break;
-        case 'enumeration':
-          sampleVal = attrDef.enum?.[0] || 'option1';
-          break;
-        case 'customField':
-          sampleVal = 'value';
-          break;
-        default:
+    for (const key of schema.allExportKeys) {
+      if (key === 'documentId') {
+        sampleRow.push('(Leave empty to create new, or enter existing docId)');
+      } else if (key === 'locale') {
+        sampleRow.push('en');
+      } else {
+        const field = schema.fields[key];
+        let sampleVal = '';
+        if (field) {
+          switch (field.category) {
+            case 'scalar':
+              sampleVal = field.rawType === 'boolean' ? 'true' : field.rawType === 'integer' ? '10' : `Sample ${key}`;
+              break;
+            case 'blocks':
+              sampleVal = JSON.stringify([{ type: 'paragraph', children: [{ type: 'text', text: `Sample ${key}` }] }]);
+              break;
+            case 'component_single':
+              sampleVal = JSON.stringify({ sampleField: 'Sample value' });
+              break;
+            case 'component_repeatable':
+              sampleVal = JSON.stringify([{ label: 'Sample item', url: '/' }]);
+              break;
+            case 'dynamiczone':
+              sampleVal = JSON.stringify(
+                field.dzComponents && field.dzComponents.length > 0
+                  ? [{ __component: field.dzComponents[0], title: 'Sample' }]
+                  : []
+              );
+              break;
+            case 'relation_to_one':
+              sampleVal = JSON.stringify({ documentId: 'target-doc-id' });
+              break;
+            case 'relation_to_many':
+              sampleVal = JSON.stringify([{ documentId: 'target-doc-id-1' }]);
+              break;
+            case 'media_single':
+              sampleVal = JSON.stringify({ id: 1, url: '/uploads/sample.png' });
+              break;
+            case 'media_to_many':
+              sampleVal = JSON.stringify([{ id: 1, url: '/uploads/sample.png' }]);
+              break;
+            default:
+              sampleVal = 'sample';
+          }
+        } else {
           sampleVal = 'sample';
+        }
+        sampleRow.push(sampleVal);
       }
-      sampleRow.push(sampleVal);
     }
 
     const csvContent =
       '\uFEFF' +
-      headers.map(escapeCsvValue).join(',') +
+      headers.map(escapeCsvCell).join(',') +
       '\r\n' +
-      sampleRow.map(escapeCsvValue).join(',') +
+      sampleRow.map(escapeCsvCell).join(',') +
       '\r\n';
 
     return {
@@ -1863,10 +1747,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     };
   },
 
-  /**
-   * Exports entries of a collection to CSV with deep nested component support,
-   * RFC-4180 CRLF line endings, and UTF-8 BOM for 100% Microsoft Excel compatibility.
-   */
   async exportCollectionCsv(
     uid: string,
     options: {
@@ -1883,21 +1763,17 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       throw new Error(`Content type ${uid} not found`);
     }
 
-    const allComponents = strapi.components || {};
+    const schema = discoverSchema(strapi, uid);
+    const deepPopulate = buildLosslessPopulate(strapi, uid);
 
-    // 1. Discover all exportable fields, including nested components
-    const fields = discoverExportFields(ct, allComponents);
-
-    // 2. Build database query filters
+    // Build database query filters
     const filters: Record<string, any> = {};
     const { attribute, filterOperator, filterQuery, search, documentIds } = options;
 
-    // Filter by specific selected document IDs if provided
     if (documentIds && Array.isArray(documentIds) && documentIds.length > 0) {
       filters.documentId = { $in: documentIds };
     }
 
-    // Apply attribute condition filter with nested component support
     if (attribute && filterOperator && filterOperator !== 'none') {
       const isNested = attribute.includes('.');
       if (filterOperator === 'empty') {
@@ -1933,7 +1809,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       }
     }
 
-    // Text search filter
     if (search && search.trim() !== '') {
       const q = search.trim();
       const searchConditions: any[] = [];
@@ -1954,16 +1829,14 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       }
     }
 
-    // 3. Build deep populate tree so nested components and relations are retrieved
-    const deepPopulate = buildDeepPopulate(ct.attributes || {}, allComponents);
-
-    // 4. Retrieve entries and generate RFC-4180 CRLF rows with UTF-8 BOM
+    const headers = [METADATA_COLUMN_KEY, ...schema.allExportKeys];
     const lines: string[] = [];
-    lines.push(fields.map((f) => escapeCsvValue(f.key)).join(','));
+    lines.push(headers.map(escapeCsvCell).join(','));
 
     let totalExported = 0;
     const maxLimit = options.limit && options.limit > 0 ? options.limit : Infinity;
     const BATCH_SIZE = 200;
+    const exportedAt = new Date().toISOString();
 
     if (ct.kind === 'singleType') {
       const findFirstArgs: any = {};
@@ -1972,7 +1845,27 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       }
       const doc = await (strapi.documents(uid as any) as any).findFirst(findFirstArgs);
       if (doc) {
-        const rowValues = fields.map((f) => escapeCsvValue(getNestedExportValue(doc, f.key)));
+        const rowValues: string[] = [];
+        const metadata: BulkUpdaterMetadata = {
+          schemaVersion: CURRENT_SCHEMA_VERSION,
+          contentType: uid,
+          documentId: String(doc.documentId || doc.id || ''),
+          locale: doc.locale || undefined,
+          exportedAt,
+        };
+        rowValues.push(escapeCsvCell(metadata));
+
+        for (const key of schema.allExportKeys) {
+          if (key === 'documentId') {
+            rowValues.push(escapeCsvCell(doc.documentId || doc.id || ''));
+          } else if (key === 'locale') {
+            rowValues.push(escapeCsvCell(doc.locale || ''));
+          } else {
+            const field = schema.fields[key];
+            const rawVal = doc[key];
+            rowValues.push(escapeCsvCell(field ? serializeFieldValue(rawVal, field) : rawVal));
+          }
+        }
         lines.push(rowValues.join(','));
         totalExported = 1;
       }
@@ -1980,12 +1873,11 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       let currentPage = 1;
       let hasMore = true;
 
-      // Safe sorting clause: prefer createdAt, then id, otherwise undefined
       const sortClause = ct.attributes?.createdAt
         ? { createdAt: 'desc' }
         : ct.attributes?.id
-          ? { id: 'desc' }
-          : undefined;
+        ? { id: 'desc' }
+        : undefined;
 
       while (hasMore && totalExported < maxLimit) {
         const remaining = maxLimit - totalExported;
@@ -2011,7 +1903,27 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         }
 
         for (const entry of chunkEntries) {
-          const rowValues = fields.map((f) => escapeCsvValue(getNestedExportValue(entry, f.key)));
+          const rowValues: string[] = [];
+          const metadata: BulkUpdaterMetadata = {
+            schemaVersion: CURRENT_SCHEMA_VERSION,
+            contentType: uid,
+            documentId: String(entry.documentId || entry.id || ''),
+            locale: entry.locale || undefined,
+            exportedAt,
+          };
+          rowValues.push(escapeCsvCell(metadata));
+
+          for (const key of schema.allExportKeys) {
+            if (key === 'documentId') {
+              rowValues.push(escapeCsvCell(entry.documentId || entry.id || ''));
+            } else if (key === 'locale') {
+              rowValues.push(escapeCsvCell(entry.locale || ''));
+            } else {
+              const field = schema.fields[key];
+              const rawVal = entry[key];
+              rowValues.push(escapeCsvCell(field ? serializeFieldValue(rawVal, field) : rawVal));
+            }
+          }
           lines.push(rowValues.join(','));
           totalExported++;
           if (totalExported >= maxLimit) {
@@ -2026,13 +1938,10 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           currentPage++;
         }
 
-        // Cooperative non-blocking yield to Node.js event loop
-        // Allows other concurrent requests, health checks, and dashboard queries to execute smoothly
         await new Promise((resolve) => setImmediate(resolve));
       }
     }
 
-    // Prepend UTF-8 BOM and terminate lines with CRLF for seamless Excel import
     const csvContent = '\uFEFF' + lines.join('\r\n') + '\r\n';
     const filename = `${ct.info?.singularName || uid}_export_${new Date().toISOString().slice(0, 10)}.csv`;
 
@@ -2040,13 +1949,10 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       filename,
       csvContent,
       count: totalExported,
-      fields: fields.map((f) => f.key),
+      fields: headers,
     };
   },
 
-  /**
-   * Exports violations of a specific rule directly into a CSV
-   */
   async exportViolationsCsv(ruleId: string) {
     const validationRulesService = strapi.plugin('bulk-updater').service('validationRules');
     const scanReport = await validationRulesService.scanViolations(ruleId);
@@ -2624,7 +2530,17 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
       // 4. Complete Validation & Quota Rules Check across entire proposed entity
       if (activeRules.length > 0) {
-        const proposedEntity = existing ? deepMergeEntities(existing, payload) : payload;
+        let proposedPayload: any = {};
+        try {
+          proposedPayload = await buildDocumentUpdatePayload(
+            strapi,
+            uid,
+            existing,
+            row,
+            { isPartialUpdate: mode === 'update' }
+          );
+        } catch {}
+        const proposedEntity = existing ? deepMergeEntities(existing, proposedPayload) : proposedPayload;
         const valResult = await validateEntityQuotas(strapi, uid, proposedEntity, activeRules);
         if (!valResult.isValid) {
           errors.push({
@@ -2730,7 +2646,13 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         continue;
       }
 
-      const payload = parseRowToPayload(strapi, attrs, row);
+      const payload = await buildDocumentUpdatePayload(
+        strapi,
+        uid,
+        existing,
+        row,
+        { isPartialUpdate: mode === 'update' }
+      );
 
       if (existing) {
         const resolvedDocId = existing.documentId || docId;

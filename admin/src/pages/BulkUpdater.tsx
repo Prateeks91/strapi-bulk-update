@@ -104,6 +104,7 @@ interface AuditRecord {
   rolledBackAt: string | null;
   rolledBackBy: string | null;
   executedAt: string;
+  isLatestEligible?: boolean;
 }
 
 interface ExecutionWindowInfo {
@@ -1253,7 +1254,20 @@ const BulkUpdater: React.FC = () => {
   const [expandedDiffBatchId, setExpandedDiffBatchId] = useState<string | null>(null);
   const [auditNotice, setAuditNotice] = useState<string | null>(null);
 
-  const latestActiveBatch = auditHistory.find((rec) => !rec.isRolledBack);
+  const sortedAuditHistory = useMemo(() => {
+    return [...auditHistory].sort((a, b) => {
+      const timeA = a.executedAt || (a as any).createdAt ? new Date(a.executedAt || (a as any).createdAt).getTime() : 0;
+      const validTimeA = Number.isNaN(timeA) ? 0 : timeA;
+      const timeB = b.executedAt || (b as any).createdAt ? new Date(b.executedAt || (b as any).createdAt).getTime() : 0;
+      const validTimeB = Number.isNaN(timeB) ? 0 : timeB;
+      if (validTimeB !== validTimeA) return validTimeB - validTimeA;
+      if (typeof a.id === 'number' && typeof b.id === 'number') return b.id - a.id;
+      return String(b.id || b.batchId || '').localeCompare(String(a.id || a.batchId || ''));
+    });
+  }, [auditHistory]);
+
+  const latestCompletedBatch = sortedAuditHistory.length > 0 ? sortedAuditHistory[0] : null;
+  const latestActiveBatch = latestCompletedBatch && !latestCompletedBatch.isRolledBack ? latestCompletedBatch : null;
 
   const applyModelsData = (data: any) => {
     if (!data) return;
@@ -4619,9 +4633,9 @@ const BulkUpdater: React.FC = () => {
             </Box>
           )}
 
-          {auditHistory.length > 0 && (
+          {sortedAuditHistory.length > 0 && (
             <Box className="bulk-updater-table-container" style={{ width: '100%', maxWidth: '100%', minWidth: 0, overflowX: 'auto' }}>
-              <Table colCount={6} rowCount={auditHistory.length + 1} style={{ width: '100%' }}>
+              <Table colCount={6} rowCount={sortedAuditHistory.length + 1} style={{ width: '100%' }}>
                 <Thead>
                   <Tr>
                     <Th style={{ minWidth: 140 }}>
@@ -4645,9 +4659,15 @@ const BulkUpdater: React.FC = () => {
                   </Tr>
                 </Thead>
                 <Tbody>
-                  {auditHistory.map((rec) => {
+                  {sortedAuditHistory.map((rec) => {
                     const isExpanded = expandedDiffBatchId === rec.batchId;
                     const dateStr = new Date(rec.executedAt).toLocaleString();
+                    const isLatestEligible = Boolean(
+                      rec.isLatestEligible ??
+                        (latestCompletedBatch &&
+                          rec.batchId === latestCompletedBatch.batchId &&
+                          !latestCompletedBatch.isRolledBack)
+                    );
 
                     return (
                       <React.Fragment key={rec.batchId}>
@@ -4772,14 +4792,30 @@ const BulkUpdater: React.FC = () => {
                                 {isExpanded ? 'Hide Diffs' : 'View Diffs'}
                               </Button>
                               {!rec.isRolledBack && (
-                                <Button
-                                  variant="danger"
-                                  size="S"
-                                  loading={rollingBackBatchId === rec.batchId}
-                                  onClick={() => handleRollback(rec.batchId)}
-                                >
-                                  Rollback
-                                </Button>
+                                isLatestEligible ? (
+                                  <Button
+                                    variant="danger"
+                                    size="S"
+                                    loading={rollingBackBatchId === rec.batchId}
+                                    onClick={() => handleRollback(rec.batchId)}
+                                  >
+                                    Rollback
+                                  </Button>
+                                ) : (
+                                  <span
+                                    title="Only the latest completed update can be rolled back."
+                                    style={{ display: 'inline-flex', cursor: 'not-allowed' }}
+                                  >
+                                    <Button
+                                      variant="danger"
+                                      size="S"
+                                      disabled
+                                      style={{ opacity: 0.4, pointerEvents: 'none' }}
+                                    >
+                                      Rollback
+                                    </Button>
+                                  </span>
+                                )
                               )}
                             </Flex>
                           </Td>

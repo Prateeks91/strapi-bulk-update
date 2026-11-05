@@ -140,6 +140,17 @@ export function isValidDocId(val: any): boolean {
 
 export function extractDocId(row: Record<string, any>): string {
   if (!row || typeof row !== 'object') return '';
+
+  const metaRaw = row.__bulk_updater_metadata || row['__bulk_updater_metadata'];
+  if (metaRaw) {
+    try {
+      const meta = typeof metaRaw === 'object' ? metaRaw : JSON.parse(metaRaw);
+      if (meta?.documentId && isValidDocId(String(meta.documentId).trim())) {
+        return String(meta.documentId).trim();
+      }
+    } catch {}
+  }
+
   const candidates = [
     row.documentId,
     row.document_id,
@@ -162,4 +173,3 @@ export function extractDocId(row: Record<string, any>): string {
   }
   return '';
 }
-
