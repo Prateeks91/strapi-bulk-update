@@ -13,6 +13,7 @@ import contentHistoryService, { recordContentHistoryVersion } from './services/c
 export * from './services/csv/index';
 export { extractHeadingsFromRichText, validateEntityQuotas, deepMergeEntities } from './services/validation-rules';
 export { sortAuditRecordsDesc, withRollbackLock } from './services/audit';
+export { buildCollectionQueryFilters, getAllNestedValues } from './services/bulk-updater';
 
 import { errors } from '@strapi/utils';
 

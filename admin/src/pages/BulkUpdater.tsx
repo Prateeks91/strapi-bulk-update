@@ -1069,24 +1069,10 @@ const BulkUpdater: React.FC = () => {
   const LAST_ATTR_KEY = 'strapi_bulk_updater_last_attr';
   const LAST_COLLECTION_KEY = 'strapi_bulk_updater_last_collection';
 
-  const getInitialCollectionUid = (): string => {
-    try {
-      const stored = localStorage.getItem(LAST_COLLECTION_KEY);
-      if (stored) return stored;
-    } catch {}
-    return '';
-  };
-  const [selectedCollectionUid, setSelectedCollectionUid] = useState<string>(getInitialCollectionUid);
+  const [selectedCollectionUid, setSelectedCollectionUid] = useState<string>('');
 
   // Selected state
-  const getInitialAttribute = (): string => {
-    try {
-      const stored = localStorage.getItem(LAST_ATTR_KEY);
-      if (stored) return stored;
-    } catch {}
-    return '';
-  };
-  const [selectedAttribute, setSelectedAttribute] = useState<string>(getInitialAttribute);
+  const [selectedAttribute, setSelectedAttribute] = useState<string>('');
   const [attributeValue, setAttributeValue] = useState<string>('');
   const [selectedEntries, setSelectedEntries] = useState<Record<string, boolean>>({});
   const [expandedDzEntries, setExpandedDzEntries] = useState<Record<string, boolean>>({});
@@ -1175,6 +1161,7 @@ const BulkUpdater: React.FC = () => {
   const [filterOperator, setFilterOperator] = useState<FilterOperator>('none');
   const [filterQuery, setFilterQuery] = useState<string>('');
   const [entrySearch, setEntrySearch] = useState<string>('');
+  const abortControllersRef = useRef<Record<string, AbortController>>({});
   type StatusFilter = 'all' | 'pending_review' | 'draft' | 'published' | 'modified' | 'unknown';
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
 
@@ -1320,32 +1307,17 @@ const BulkUpdater: React.FC = () => {
     }
 
     let resolvedColUid = selectedCollectionUid;
-    let storedCol: string | null = null;
-    try {
-      storedCol = localStorage.getItem(LAST_COLLECTION_KEY);
-    } catch {}
-
-    if (!resolvedColUid || !cols.some((c) => c.uid === resolvedColUid)) {
-      resolvedColUid = (storedCol && cols.some((c) => c.uid === storedCol)) ? storedCol : (cols[0]?.uid || '');
+    if (resolvedColUid && !cols.some((c) => c.uid === resolvedColUid)) {
+      resolvedColUid = '';
     }
     setSelectedCollectionUid(resolvedColUid);
-    try {
-      if (resolvedColUid) localStorage.setItem(LAST_COLLECTION_KEY, resolvedColUid);
-    } catch {}
 
-    const activeCol = cols.find((c) => c.uid === resolvedColUid) || cols[0];
+    const activeCol = resolvedColUid ? cols.find((c) => c.uid === resolvedColUid) : null;
     const activeAttrs = activeCol?.attributes || [];
     setAttributes(activeAttrs);
 
-    let storedAttr: string | null = null;
-    try {
-      storedAttr = localStorage.getItem(LAST_ATTR_KEY);
-    } catch {}
-
     const resolvedAttr =
-      storedAttr && activeAttrs.includes(storedAttr)
-        ? storedAttr
-        : (selectedAttribute && activeAttrs.includes(selectedAttribute) ? selectedAttribute : '');
+      selectedAttribute && activeAttrs.includes(selectedAttribute) ? selectedAttribute : '';
 
     setSelectedAttribute(resolvedAttr);
     if (resolvedAttr && data.relationsMeta && data.relationsMeta[resolvedAttr]) {
@@ -1444,7 +1416,15 @@ const BulkUpdater: React.FC = () => {
         params.set('sortOrder', sortOrder);
       }
 
-      const res = await get(`/bulk-updater/collections/${colUid}/entries?${params.toString()}`);
+      if (abortControllersRef.current[colUid]) {
+        abortControllersRef.current[colUid].abort();
+      }
+      const controller = new AbortController();
+      abortControllersRef.current[colUid] = controller;
+
+      const res = await get(`/bulk-updater/collections/${colUid}/entries?${params.toString()}`, {
+        signal: controller.signal,
+      });
       if (res.data && (res.data.success || res.data.entries !== undefined)) {
         const fetchedEntries: Entry[] = res.data.entries || [];
         const pageNum = res.data.pagination?.page ?? targetPage ?? 1;
@@ -1612,6 +1592,9 @@ const BulkUpdater: React.FC = () => {
 
   const handleCollectionChange = (newUid: string) => {
     if (newUid === selectedCollectionUid) return;
+    if (abortControllersRef.current) {
+      Object.values(abortControllersRef.current).forEach((ctrl) => ctrl.abort());
+    }
     setSelectedCollectionUid(newUid);
     try {
       if (newUid) {
@@ -1729,19 +1712,6 @@ const BulkUpdater: React.FC = () => {
   const memoizedSearchComboboxOptions = useMemo(() => {
     return (
       <>
-        <ComboboxOption
-          value="__default__"
-          textValue={`Same as Update Attribute (${selectedAttribute || 'None'}) default`}
-        >
-          <Flex justifyContent="space-between" alignItems="center" width="100%" gap={2}>
-            <Typography variant="omega" fontStyle="italic" textColor="neutral600">
-              -- Same as Update Attribute ({selectedAttribute || 'None'}) --
-            </Typography>
-            <Badge backgroundColor="neutral150" textColor="neutral600" size="S">
-              Default
-            </Badge>
-          </Flex>
-        </ComboboxOption>
         {depthFilteredAttributes.map((attr) => {
           const rel = relationsMeta[attr];
           const depth = getAttrDepth(attr);
@@ -1773,21 +1743,19 @@ const BulkUpdater: React.FC = () => {
   const handleSearchAttributeChange = (newAttr: string) => {
     const finalAttr = newAttr === '__default__' ? '' : newAttr;
     setSearchAttribute(finalAttr);
-    if (collections.length > 0) {
-      collections.forEach((col) => {
-        loadCollectionPage(
-          col.uid,
-          1,
-          undefined,
-          undefined,
-          undefined,
-          filterOperator,
-          filterQuery,
-          entrySearch,
-          true,
-          finalAttr
-        );
-      });
+    if (selectedCollectionUid) {
+      loadCollectionPage(
+        selectedCollectionUid,
+        1,
+        undefined,
+        undefined,
+        undefined,
+        filterOperator,
+        filterQuery,
+        entrySearch,
+        true,
+        finalAttr
+      );
     }
   };
 
@@ -3028,7 +2996,7 @@ const BulkUpdater: React.FC = () => {
                     <Combobox
                       key={`top-col-${selectedCollectionUid}`}
                       autocomplete={{ type: 'list', filter: 'contains' }}
-                      placeholder="Search Collection Type..."
+                      placeholder="Select Collection Type..."
                       value={selectedCollectionUid || undefined}
                       clearLabel="Clear collection selection"
                       onClear={() => handleCollectionChange('')}
@@ -3165,8 +3133,8 @@ const BulkUpdater: React.FC = () => {
                       <Combobox
                         key={`search-attr-${selectedCollectionUid}`}
                         autocomplete={{ type: 'list', filter: 'contains' }}
-                        placeholder={searchAttribute || `Same as Update (${selectedAttribute || 'None'})`}
-                        value={searchAttribute || '__default__'}
+                        placeholder="Select Search Attribute..."
+                        value={searchAttribute || undefined}
                         clearLabel="Reset search attribute"
                         onClear={() => handleSearchAttributeChange('')}
                         onFocus={(e: React.FocusEvent<HTMLInputElement>) => {
@@ -3186,8 +3154,9 @@ const BulkUpdater: React.FC = () => {
                   {/* Operator Select */}
                   <Box style={{ width: 200, minWidth: 170 }}>
                     <SingleSelect
-                      label={effectiveSearchAttribute ? `Condition for "${effectiveSearchAttribute}"` : 'Filter condition'}
+                      label={searchAttribute ? `Condition for "${searchAttribute}"` : 'Filter condition'}
                       value={filterOperator}
+                      disabled={!searchAttribute}
                       onChange={(val) => setFilterOperator(String(val) as FilterOperator)}
                     >
                       <SingleSelectOption value="none">Show All (No Value Filter)</SingleSelectOption>
@@ -4049,7 +4018,7 @@ const BulkUpdater: React.FC = () => {
                   <Combobox
                     key={`update-attr-${selectedCollectionUid}`}
                     autocomplete={{ type: 'list', filter: 'contains' }}
-                    placeholder="Search attribute by name or relation..."
+                    placeholder="Select Attribute to Update..."
                     value={selectedAttribute || undefined}
                     clearLabel="Clear attribute selection"
                     onClear={() => handleAttributeChange('')}
