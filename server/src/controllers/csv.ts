@@ -21,7 +21,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
   async exportCollection(ctx: any) {
     try {
       const { uid } = ctx.params;
-      const { search, attribute, filterOperator, filterQuery, limit, documentIds } = {
+      const { search, attribute, searchAttribute, filterOperator, filterQuery, limit, documentIds } = {
         ...ctx.query,
         ...(ctx.request?.body || {}),
       };
@@ -40,6 +40,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       const result = await csvService.exportCollectionCsv(uid, {
         search: search ? String(search) : undefined,
         attribute: attribute ? String(attribute) : undefined,
+        searchAttribute: searchAttribute ? String(searchAttribute) : undefined,
         filterOperator: filterOperator ? String(filterOperator) : undefined,
         filterQuery: filterQuery !== undefined ? String(filterQuery) : undefined,
         limit: limit ? Number(limit) : undefined,

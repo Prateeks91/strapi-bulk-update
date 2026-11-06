@@ -7,6 +7,8 @@ import {
   type PendingBatch,
   resolveRecordPublicationStatus,
   evaluateShouldPublish,
+  buildCollectionQueryFilters,
+  getAllNestedValues,
 } from './bulk-updater';
 import { extractHeadingsFromRichText, validateEntityQuotas, deepMergeEntities } from './validation-rules';
 import {
@@ -1752,6 +1754,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     options: {
       search?: string;
       attribute?: string;
+      searchAttribute?: string;
       filterOperator?: string;
       filterQuery?: string;
       limit?: number;
@@ -1766,72 +1769,86 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     const schema = discoverSchema(strapi, uid);
     const deepPopulate = buildLosslessPopulate(strapi, uid);
 
-    // Build database query filters
-    const filters: Record<string, any> = {};
-    const { attribute, filterOperator, filterQuery, search, documentIds } = options;
-
-    if (documentIds && Array.isArray(documentIds) && documentIds.length > 0) {
-      filters.documentId = { $in: documentIds };
-    }
-
-    if (attribute && filterOperator && filterOperator !== 'none') {
-      const isNested = attribute.includes('.');
-      if (filterOperator === 'empty') {
-        if (isNested) {
-          const [parent, child] = attribute.split('.');
-          filters[parent] = { [child]: { $null: true } };
-        } else {
-          filters[attribute] = { $null: true };
-        }
-      } else if (filterOperator === 'not_empty') {
-        if (isNested) {
-          const [parent, child] = attribute.split('.');
-          filters[parent] = { [child]: { $notNull: true } };
-        } else {
-          filters[attribute] = { $notNull: true };
-        }
-      } else if (filterQuery !== undefined && filterQuery !== '') {
-        const opMap: Record<string, string> = {
-          equals: '$eq',
-          notEquals: '$ne',
-          contains: '$containsi',
-          notContains: '$notContainsi',
-          startsWith: '$startsWith',
-          endsWith: '$endsWith',
-        };
-        const strapiOp = opMap[filterOperator] || '$eq';
-        if (isNested) {
-          const [parent, child] = attribute.split('.');
-          filters[parent] = { [child]: { [strapiOp]: filterQuery } };
-        } else {
-          filters[attribute] = { [strapiOp]: filterQuery };
-        }
-      }
-    }
-
-    if (search && search.trim() !== '') {
-      const q = search.trim();
-      const searchConditions: any[] = [];
-      const searchFields = ['name', 'title', 'email', 'slug', 'description'].filter(
-        (f) => ct.attributes?.[f] && ['string', 'text', 'email'].includes(ct.attributes[f].type)
-      );
-
-      for (const field of searchFields) {
-        searchConditions.push({ [field]: { $containsi: q } });
-      }
-
-      if (searchConditions.length > 0) {
-        if (filters && Object.keys(filters).length > 0) {
-          filters.$and = [{ $or: searchConditions }];
-        } else {
-          filters.$or = searchConditions;
-        }
-      }
-    }
-
     const headers = [METADATA_COLUMN_KEY, ...schema.allExportKeys];
     const lines: string[] = [];
     lines.push(headers.map(escapeCsvCell).join(','));
+
+    // Build database query filters using shared filter engine (100% parity with Workspace)
+    const filterMeta = buildCollectionQueryFilters(strapi, ct, {
+      attribute: options.attribute,
+      searchAttribute: options.searchAttribute || options.attribute,
+      filterOperator: options.filterOperator,
+      filterQuery: options.filterQuery,
+      search: options.search,
+      documentIds: options.documentIds,
+    });
+
+    if (!filterMeta.colHasAttribute && filterMeta.normOp && filterMeta.normOp !== 'none') {
+      // Attribute does not exist on collection: return empty CSV (headers only)
+      return {
+        filename: `${ct.info?.singularName || uid}_export_${new Date().toISOString().slice(0, 10)}.csv`,
+        csvContent: '\uFEFF' + lines.join('\r\n') + '\r\n',
+        count: 0,
+        fields: headers,
+      };
+    }
+
+    const filters = filterMeta.filters;
+    const isRootDz = filterMeta.isRootDz;
+    const normOp = filterMeta.normOp;
+    const targetFilterAttr = filterMeta.targetFilterAttr;
+
+    const passesDzFilter = (entry: any): boolean => {
+      if (!isRootDz || !normOp || normOp === 'none') return true;
+      const matches = getAllNestedValues(entry, targetFilterAttr);
+      if (normOp === 'empty') {
+        return matches.length === 0 || matches.every((m) => {
+          const v = m.value;
+          if (v === undefined || v === null) return true;
+          if (Array.isArray(v)) return v.length === 0;
+          if (typeof v === 'object') return Object.keys(v).length === 0;
+          return String(v).trim() === '';
+        });
+      }
+      if (normOp === 'notempty') {
+        return matches.some((m) => {
+          const v = m.value;
+          if (v === undefined || v === null) return false;
+          if (Array.isArray(v)) return v.length > 0;
+          if (typeof v === 'object') return Object.keys(v).length > 0;
+          return String(v).trim() !== '';
+        });
+      }
+
+      const qVal = (filterMeta.filterQuery || '').trim().toLowerCase();
+      const testSingleValue = (v: any): boolean => {
+        if (v === undefined || v === null) return false;
+        if (Array.isArray(v)) return v.some(testSingleValue);
+        if (typeof v === 'object') {
+          return (
+            testSingleValue(v.name) ||
+            testSingleValue(v.title) ||
+            testSingleValue(v.email) ||
+            testSingleValue(v.username) ||
+            testSingleValue(v.documentId) ||
+            testSingleValue(v.id) ||
+            testSingleValue(v.slug)
+          );
+        }
+        const valStr = String(v).trim().toLowerCase();
+        switch (normOp) {
+          case 'equals': return valStr === qVal;
+          case 'notequals': return valStr !== qVal;
+          case 'contains': return valStr.includes(qVal);
+          case 'notcontains': return !valStr.includes(qVal);
+          case 'startswith': return valStr.startsWith(qVal);
+          case 'endswith': return valStr.endsWith(qVal);
+          default: return valStr.includes(qVal);
+        }
+      };
+
+      return matches.some((m) => testSingleValue(m.value));
+    };
 
     let totalExported = 0;
     const maxLimit = options.limit && options.limit > 0 ? options.limit : Infinity;
@@ -1839,12 +1856,14 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     const exportedAt = new Date().toISOString();
 
     if (ct.kind === 'singleType') {
-      const findFirstArgs: any = {};
+      const findFirstArgs: any = {
+        filters: Object.keys(filters).length > 0 ? filters : undefined,
+      };
       if (deepPopulate) {
         findFirstArgs.populate = deepPopulate;
       }
       const doc = await (strapi.documents(uid as any) as any).findFirst(findFirstArgs);
-      if (doc) {
+      if (doc && passesDzFilter(doc)) {
         const rowValues: string[] = [];
         const metadata: BulkUpdaterMetadata = {
           schemaVersion: CURRENT_SCHEMA_VERSION,
@@ -1903,6 +1922,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         }
 
         for (const entry of chunkEntries) {
+          if (!passesDzFilter(entry)) {
+            continue;
+          }
           const rowValues: string[] = [];
           const metadata: BulkUpdaterMetadata = {
             schemaVersion: CURRENT_SCHEMA_VERSION,

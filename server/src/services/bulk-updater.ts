@@ -862,6 +862,205 @@ export function buildDeepFilter(pathParts: string[], condition: any): any {
   };
 }
 
+/**
+ * Shared query filter builder for both Bulk Updater Workspace and CSV Export
+ * Guarantees 100% semantic parity for attribute filters, operators, relations, dynamic zones, and search
+ */
+export function buildCollectionQueryFilters(
+  strapi: any,
+  contentType: any,
+  options: {
+    attribute?: string;
+    searchAttribute?: string;
+    filterOperator?: string;
+    filterQuery?: string;
+    search?: string;
+    documentIds?: string[];
+  } = {}
+) {
+  const filters: Record<string, any> = {};
+  const attrs = contentType?.attributes || {};
+  const targetFilterAttr = options.searchAttribute || options.attribute || '';
+  const normOp = (options.filterOperator || '').toLowerCase().replace(/_/g, '');
+  const q = (options.filterQuery || '').trim();
+
+  if (options.documentIds && Array.isArray(options.documentIds) && options.documentIds.length > 0) {
+    filters.documentId = { $in: options.documentIds };
+  }
+
+  let colHasAttribute = false;
+  let isNestedAttr = false;
+  let isRootDz = false;
+  let parts: string[] = [];
+  let resolvedFilterAttr = targetFilterAttr;
+
+  if (targetFilterAttr) {
+    const resolvedField = resolveContentTypeField(contentType, targetFilterAttr);
+    if (resolvedField) {
+      resolvedFilterAttr = resolvedField;
+      colHasAttribute = true;
+    } else {
+      const parsed = parseDynamicZonePath(targetFilterAttr);
+      if (parsed.rootKey && contentType.attributes?.[parsed.rootKey]?.type === 'dynamiczone') {
+        isRootDz = true;
+        colHasAttribute = true;
+        isNestedAttr = true;
+        parts = parsed.cleanPath.split('.');
+      } else if (targetFilterAttr.includes('.') || targetFilterAttr.includes('[')) {
+        isNestedAttr = isDeepComponentField(contentType, strapi?.components || {}, targetFilterAttr);
+        if (isNestedAttr) {
+          colHasAttribute = true;
+          parts = parsed.cleanPath.split('.');
+        }
+      }
+    }
+  }
+
+  if (normOp && normOp !== 'none' && targetFilterAttr) {
+    if (!colHasAttribute) {
+      return {
+        filters,
+        colHasAttribute: false,
+        isRootDz: false,
+        targetFilterAttr,
+        normOp,
+        filterQuery: q,
+      };
+    }
+
+    let condition: any = undefined;
+    const targetAttrSchema = isNestedAttr
+      ? getLeafAttributeSchema(contentType, strapi?.components || {}, targetFilterAttr)
+      : attrs[resolvedFilterAttr];
+    const isRelation = targetAttrSchema?.type === 'relation';
+    const isStringLike = ['string', 'text', 'email', 'richtext', 'uid'].includes(targetAttrSchema?.type);
+
+    if (isRelation) {
+      const targetUid = targetAttrSchema?.target;
+      const targetContentType = targetUid && strapi?.contentTypes ? strapi.contentTypes[targetUid] : undefined;
+      const targetAttrs = targetContentType?.attributes || {};
+      const targetStringAttrs = Object.keys(targetAttrs).filter((k) =>
+        ['string', 'text', 'email', 'uid'].includes(targetAttrs[k]?.type)
+      );
+
+      if (normOp === 'empty') {
+        condition = { documentId: { $null: true } };
+      } else if (normOp === 'notempty') {
+        condition = { documentId: { $notNull: true } };
+      } else if (q !== '') {
+        const orConditions: any[] = [];
+        targetStringAttrs.slice(0, 5).forEach((k) => {
+          if (normOp === 'equals') {
+            orConditions.push({ [k]: { $eqi: q } });
+          } else if (normOp === 'startswith') {
+            orConditions.push({ [k]: { $startsWithi: q } });
+          } else if (normOp === 'endswith') {
+            orConditions.push({ [k]: { $endsWithi: q } });
+          } else if (normOp === 'notequals') {
+            orConditions.push({ [k]: { $nei: q } });
+          } else if (normOp === 'notcontains') {
+            orConditions.push({ [k]: { $notContainsi: q } });
+          } else {
+            orConditions.push({ [k]: { $containsi: q } });
+          }
+        });
+        orConditions.push({ documentId: { $eq: q } });
+        if (/^\d+$/.test(q)) {
+          orConditions.push({ id: { $eq: Number(q) } });
+        }
+        condition = orConditions.length === 1 ? orConditions[0] : { $or: orConditions };
+      }
+    } else if (normOp === 'empty') {
+      condition = isStringLike ? { $or: [{ $null: true }, { $eq: '' }] } : { $null: true };
+    } else if (normOp === 'notempty') {
+      condition = isStringLike ? { $and: [{ $notNull: true }, { $ne: '' }] } : { $notNull: true };
+    } else if (q !== '') {
+      let typedVal: any = q;
+      const isNumeric = ['integer', 'biginteger', 'float', 'decimal', 'number'].includes(targetAttrSchema?.type);
+      const isBoolean = targetAttrSchema?.type === 'boolean';
+      if (isNumeric && /^-?\d+(\.\d+)?$/.test(q)) {
+        typedVal = Number(q);
+      } else if (isBoolean) {
+        if (q.toLowerCase() === 'true') typedVal = true;
+        else if (q.toLowerCase() === 'false') typedVal = false;
+      }
+
+      switch (normOp) {
+        case 'equals':
+          condition = isStringLike ? { $eqi: q } : { $eq: typedVal };
+          break;
+        case 'notequals':
+          condition = isStringLike ? { $nei: q } : { $ne: typedVal };
+          break;
+        case 'contains':
+          condition = { $containsi: q };
+          break;
+        case 'notcontains':
+          condition = { $notContainsi: q };
+          break;
+        case 'startswith':
+          condition = { $startsWithi: q };
+          break;
+        case 'endswith':
+          condition = { $endsWithi: q };
+          break;
+      }
+    }
+
+    if (condition !== undefined) {
+      if (isNestedAttr) {
+        if (isRootDz) {
+          // Dynamic zone evaluated in-memory
+        } else {
+          const deepFilter = buildDeepFilter(parts, condition);
+          Object.assign(filters, deepFilter);
+        }
+      } else {
+        if (normOp === 'empty' && isStringLike) {
+          filters.$or = [
+            { [resolvedFilterAttr]: { $null: true } },
+            { [resolvedFilterAttr]: { $eq: '' } },
+          ];
+        } else if (normOp === 'notempty' && isStringLike) {
+          filters[resolvedFilterAttr] = { $notNull: true, $ne: '' };
+        } else {
+          filters[resolvedFilterAttr] = condition;
+        }
+      }
+    }
+  }
+
+  if (options.search && options.search.trim() !== '') {
+    const searchQ = options.search.trim();
+    const searchableAttrs = Object.keys(attrs).filter((k) =>
+      ['string', 'text', 'email', 'uid'].includes(attrs[k]?.type)
+    );
+
+    if (searchableAttrs.length > 0) {
+      const orList = searchableAttrs.slice(0, 6).map((k) => ({
+        [k]: { $containsi: searchQ },
+      }));
+
+      if (Object.keys(filters).length > 0) {
+        const existingFilters = { ...filters };
+        Object.keys(filters).forEach((k) => delete filters[k]);
+        filters.$and = [existingFilters, { $or: orList }];
+      } else {
+        filters.$or = orList;
+      }
+    }
+  }
+
+  return {
+    filters,
+    colHasAttribute: true,
+    isRootDz,
+    targetFilterAttr,
+    normOp,
+    filterQuery: q,
+  };
+}
+
 export interface ExecutionWindowConfig {
   enabled: boolean;
   timeZone: string;
@@ -2441,7 +2640,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       const start = (currentPage - 1) * limit;
 
       const isSingleType = contentType.kind === 'singleType';
-      const targetFilterAttr = searchAttribute || attribute;
 
       // 1. Signature-based caching verification
       const signature = await getCollectionSignature(strapi, uid);
@@ -2460,187 +2658,39 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
       let result: any;
 
-      // Build database filters pushdown
-      const filters: Record<string, any> = {};
+      // Build database filters pushdown using shared filter engine
+      const filterMeta = buildCollectionQueryFilters(strapi, contentType, {
+        attribute,
+        searchAttribute,
+        filterOperator,
+        filterQuery,
+        search,
+      });
 
-      const attrs = contentType.attributes || {};
-      let colHasAttribute = false;
-      let isNestedAttr = false;
-      let isRootDz = false;
-      let parts: string[] = [];
-
-      let resolvedFilterAttr = targetFilterAttr;
-      if (targetFilterAttr) {
-        const resolvedField = resolveContentTypeField(contentType, targetFilterAttr);
-        if (resolvedField) {
-          resolvedFilterAttr = resolvedField;
-          colHasAttribute = true;
-        } else {
-          const parsed = parseDynamicZonePath(targetFilterAttr);
-          if (parsed.rootKey && contentType.attributes?.[parsed.rootKey]?.type === 'dynamiczone') {
-            isRootDz = true;
-            colHasAttribute = true;
-            isNestedAttr = true;
-            parts = parsed.cleanPath.split('.');
-          } else if (targetFilterAttr.includes('.') || targetFilterAttr.includes('[')) {
-            isNestedAttr = isDeepComponentField(contentType, strapi.components, targetFilterAttr);
-            if (isNestedAttr) {
-              colHasAttribute = true;
-              parts = parsed.cleanPath.split('.');
-            }
-          }
-        }
+      if (!filterMeta.colHasAttribute && filterMeta.normOp && filterMeta.normOp !== 'none') {
+        // Collection does not possess this attribute: return 0 matching entries
+        result = {
+          uid,
+          status: 'success',
+          displayName: contentType.info?.displayName || uid,
+          isSingleType,
+          draftAndPublish: Boolean(contentType.options?.draftAndPublish),
+          entries: [],
+          pagination: {
+            page: 1,
+            pageSize: limit,
+            total: 0,
+            pageCount: 0,
+          },
+        };
+        queryCache.set(cacheKey, { signature, data: result, timestamp: Date.now() });
+        return { ...result, cached: false, etag };
       }
 
-      const normOp = (filterOperator || '').toLowerCase().replace(/_/g, '');
-
-      // If a specific attribute filter is active, check if the collection actually has the attribute
-      if (normOp && normOp !== 'none') {
-        if (!colHasAttribute) {
-          // Collection does not possess this attribute: return 0 matching entries
-          result = {
-            uid,
-            status: 'success',
-            displayName: contentType.info?.displayName || uid,
-            isSingleType,
-            draftAndPublish: Boolean(contentType.options?.draftAndPublish),
-            entries: [],
-            pagination: {
-              page: 1,
-              pageSize: limit,
-              total: 0,
-              pageCount: 0,
-            },
-          };
-          queryCache.set(cacheKey, { signature, data: result, timestamp: Date.now() });
-          return { ...result, cached: false, etag };
-        }
-
-        let condition: any = undefined;
-        const q = (filterQuery || '').trim();
-
-        const targetAttrSchema = isNestedAttr
-          ? getLeafAttributeSchema(contentType, strapi.components, targetFilterAttr)
-          : attrs[resolvedFilterAttr];
-        const isRelation = targetAttrSchema?.type === 'relation';
-        const isStringLike = ['string', 'text', 'email', 'richtext', 'uid'].includes(targetAttrSchema?.type);
-
-        if (isRelation) {
-          const targetUid = targetAttrSchema?.target;
-          const targetContentType = targetUid ? strapi.contentTypes[targetUid] : undefined;
-          const targetAttrs = targetContentType?.attributes || {};
-          const targetStringAttrs = Object.keys(targetAttrs).filter((k) =>
-            ['string', 'text', 'email', 'uid'].includes(targetAttrs[k]?.type)
-          );
-
-          if (normOp === 'empty') {
-            condition = { documentId: { $null: true } };
-          } else if (normOp === 'notempty') {
-            condition = { documentId: { $notNull: true } };
-          } else if (q !== '') {
-            const orConditions: any[] = [];
-            targetStringAttrs.slice(0, 5).forEach((k) => {
-              if (normOp === 'equals') {
-                orConditions.push({ [k]: { $eqi: q } });
-              } else if (normOp === 'startswith') {
-                orConditions.push({ [k]: { $startsWithi: q } });
-              } else if (normOp === 'endswith') {
-                orConditions.push({ [k]: { $endsWithi: q } });
-              } else if (normOp === 'notequals') {
-                orConditions.push({ [k]: { $nei: q } });
-              } else if (normOp === 'notcontains') {
-                orConditions.push({ [k]: { $notContainsi: q } });
-              } else {
-                orConditions.push({ [k]: { $containsi: q } });
-              }
-            });
-            orConditions.push({ documentId: { $eq: q } });
-            if (/^\d+$/.test(q)) {
-              orConditions.push({ id: { $eq: Number(q) } });
-            }
-            condition = orConditions.length === 1 ? orConditions[0] : { $or: orConditions };
-          }
-        } else if (normOp === 'empty') {
-          condition = isStringLike ? { $or: [{ $null: true }, { $eq: '' }] } : { $null: true };
-        } else if (normOp === 'notempty') {
-          condition = isStringLike ? { $and: [{ $notNull: true }, { $ne: '' }] } : { $notNull: true };
-        } else if (q !== '') {
-          let typedVal: any = q;
-          const isNumeric = ['integer', 'biginteger', 'float', 'decimal', 'number'].includes(targetAttrSchema?.type);
-          const isBoolean = targetAttrSchema?.type === 'boolean';
-          if (isNumeric && /^-?\d+(\.\d+)?$/.test(q)) {
-            typedVal = Number(q);
-          } else if (isBoolean) {
-            if (q.toLowerCase() === 'true') typedVal = true;
-            else if (q.toLowerCase() === 'false') typedVal = false;
-          }
-
-          switch (normOp) {
-            case 'equals':
-              condition = isStringLike ? { $eqi: q } : { $eq: typedVal };
-              break;
-            case 'notequals':
-              condition = isStringLike ? { $nei: q } : { $ne: typedVal };
-              break;
-            case 'contains':
-              condition = { $containsi: q };
-              break;
-            case 'notcontains':
-              condition = { $notContainsi: q };
-              break;
-            case 'startswith':
-              condition = { $startsWithi: q };
-              break;
-            case 'endswith':
-              condition = { $endsWithi: q };
-              break;
-          }
-        }
-
-        if (condition !== undefined) {
-          if (isNestedAttr) {
-            if (isRootDz) {
-              // Dynamic zones cannot be filtered via database pushdown in Strapi 5 (causes "Invalid key <zone>").
-              // Evaluated in-memory across all components after fetching entries.
-            } else {
-              const deepFilter = buildDeepFilter(parts, condition);
-              Object.assign(filters, deepFilter);
-            }
-          } else {
-            if (normOp === 'empty' && isStringLike) {
-              filters.$or = [
-                { [resolvedFilterAttr]: { $null: true } },
-                { [resolvedFilterAttr]: { $eq: '' } },
-              ];
-            } else if (normOp === 'notempty' && isStringLike) {
-              filters[resolvedFilterAttr] = { $notNull: true, $ne: '' };
-            } else {
-              filters[resolvedFilterAttr] = condition;
-            }
-          }
-        }
-      }
-
-      if (search && search.trim() !== '') {
-        const q = search.trim();
-        const searchableAttrs = Object.keys(attrs).filter((k) =>
-          ['string', 'text', 'email', 'uid'].includes(attrs[k]?.type)
-        );
-
-        if (searchableAttrs.length > 0) {
-          const orList = searchableAttrs.slice(0, 6).map((k) => ({
-            [k]: { $containsi: q },
-          }));
-
-          if (Object.keys(filters).length > 0) {
-            const existingFilters = { ...filters };
-            Object.keys(filters).forEach((k) => delete filters[k]);
-            filters.$and = [existingFilters, { $or: orList }];
-          } else {
-            filters.$or = orList;
-          }
-        }
-      }
+      const filters = filterMeta.filters;
+      const isRootDz = filterMeta.isRootDz;
+      const normOp = filterMeta.normOp;
+      const targetFilterAttr = filterMeta.targetFilterAttr;
 
       const populateOption = buildDeepPopulate(contentType.attributes, strapi.components);
 

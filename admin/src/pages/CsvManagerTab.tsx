@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useFetchClient, useNotification } from '@strapi/strapi/admin';
 import {
   Box,
@@ -34,15 +34,48 @@ interface CollectionModel {
   totalEntries?: number;
 }
 
+interface RelationMeta {
+  targetUid: string;
+  targetDisplayName: string;
+  relationType: string;
+  isMulti: boolean;
+}
+
+interface AttributeMeta {
+  depth: number;
+  type: string;
+  component?: string;
+  isRelation?: boolean;
+}
+
 export default function CsvManagerTab() {
   const { get, post } = useFetchClient();
   const { toggleNotification } = useNotification();
+
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const countAbortControllerRef = useRef<AbortController | null>(null);
 
   const [collections, setCollections] = useState<CollectionModel[]>([]);
   const [loadingCollections, setLoadingCollections] = useState<boolean>(true);
   const [selectedUid, setSelectedUid] = useState<string>('');
   const [collectionEntries, setCollectionEntries] = useState<Entry[]>([]);
   const [pendingBatches, setPendingBatches] = useState<PendingBatch[]>([]);
+
+  const [relationsMeta, setRelationsMeta] = useState<Record<string, RelationMeta>>({});
+  const [attributesMeta, setAttributesMeta] = useState<Record<string, AttributeMeta>>({});
+
+  // Search and Filter states for CSV Export (100% parity with Bulk Updater Workspace)
+  type FilterOperator = 'none' | 'empty' | 'not_empty' | 'equals' | 'contains' | 'starts_with';
+  const [searchAttribute, setSearchAttribute] = useState<string>('');
+  const [filterOperator, setFilterOperator] = useState<FilterOperator>('none');
+  const [filterQuery, setFilterQuery] = useState<string>('');
+  const [entrySearch, setEntrySearch] = useState<string>('');
+  const [matchingCount, setMatchingCount] = useState<number | null>(null);
+  const [countLoading, setCountLoading] = useState<boolean>(false);
+
+  // Relation filter search options
+  const [searchRelationOptions, setSearchRelationOptions] = useState<Array<{ documentId: string; label: string }>>([]);
+  const [searchRelationOptionsLoading, setSearchRelationOptionsLoading] = useState<boolean>(false);
 
   // Export filters and loading states (0 = Unlimited / All records)
   const [exportLimit, setExportLimit] = useState<number>(0);
@@ -139,10 +172,14 @@ export default function CsvManagerTab() {
       if (modelsRes.data?.collections) {
         loadedCollections = modelsRes.data.collections;
         setCollections(loadedCollections);
-        if (loadedCollections.length > 0) {
-          const firstUid = loadedCollections[0].uid;
-          setSelectedUid(firstUid);
-        }
+      }
+
+      if (modelsRes.data?.relationsMeta) {
+        setRelationsMeta(modelsRes.data.relationsMeta);
+      }
+
+      if (modelsRes.data?.attributesMeta) {
+        setAttributesMeta(modelsRes.data.attributesMeta);
       }
 
       if (rulesRes.data?.rules) {
@@ -161,6 +198,115 @@ export default function CsvManagerTab() {
       setLoadingCollections(false);
     }
   };
+
+  const getAttrDepth = (attr: string): number =>
+    attributesMeta[attr]?.depth ?? (attr.includes('.') ? attr.split('.').length - 1 : 0);
+
+  useEffect(() => {
+    if (searchAttribute && relationsMeta[searchAttribute]) {
+      fetchSearchRelationOptions(relationsMeta[searchAttribute].targetUid);
+    } else {
+      setSearchRelationOptions([]);
+    }
+  }, [searchAttribute, relationsMeta]);
+
+  const fetchSearchRelationOptions = async (targetUid: string) => {
+    try {
+      setSearchRelationOptionsLoading(true);
+      const res = await get(`/bulk-updater/relation-options?targetUid=${encodeURIComponent(targetUid)}`);
+      if (res.data && res.data.success) {
+        setSearchRelationOptions(res.data.options || []);
+      }
+    } catch {
+      setSearchRelationOptions([]);
+    } finally {
+      setSearchRelationOptionsLoading(false);
+    }
+  };
+
+  const handleCollectionChange = (newUid: string) => {
+    if (newUid === selectedUid) return;
+
+    if (countAbortControllerRef.current) {
+      countAbortControllerRef.current.abort();
+    }
+
+    setSelectedUid(newUid);
+
+    // Reset collection-dependent import state
+    setAllParsedRecords([]);
+    setCsvRawText('');
+    setFileName('');
+    setPreviewPage(1);
+    setImportProgress(null);
+    setImportResult(null);
+    setPreflightReport(null);
+    setPreflightLoading(false);
+    setImporting(false);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+
+    // Reset search & filter criteria
+    setSearchAttribute('');
+    setFilterOperator('none');
+    setFilterQuery('');
+    setEntrySearch('');
+    setMatchingCount(null);
+    setCountLoading(Boolean(newUid));
+  };
+
+  useEffect(() => {
+    if (!selectedUid) {
+      setMatchingCount(null);
+      setCountLoading(false);
+      return;
+    }
+
+    setCountLoading(true);
+    const timer = setTimeout(async () => {
+      if (countAbortControllerRef.current) {
+        countAbortControllerRef.current.abort();
+      }
+      const controller = new AbortController();
+      countAbortControllerRef.current = controller;
+
+      try {
+        const params = new URLSearchParams({
+          page: '1',
+          pageSize: '1',
+        });
+        if (searchAttribute) {
+          params.set('attribute', searchAttribute);
+          params.set('searchAttribute', searchAttribute);
+        }
+        if (filterOperator && filterOperator !== 'none') {
+          params.set('filterOperator', filterOperator);
+          if (filterQuery) params.set('filterQuery', filterQuery);
+        }
+        if (entrySearch && entrySearch.trim()) {
+          params.set('search', entrySearch.trim());
+        }
+
+        const res = await get(`/bulk-updater/collections/${selectedUid}/entries?${params.toString()}`, {
+          signal: controller.signal,
+        });
+
+        if (res.data) {
+          const total = res.data.pagination?.total ?? (Array.isArray(res.data.entries) ? res.data.entries.length : 0);
+          setMatchingCount(total);
+        }
+      } catch (err: any) {
+        if (!isAbortError(err)) {
+          // Keep prior count or null
+        }
+      } finally {
+        setCountLoading(false);
+      }
+    }, 300);
+
+    return () => clearTimeout(timer);
+  }, [selectedUid, searchAttribute, filterOperator, filterQuery, entrySearch]);
 
   const fetchAndEnrichEntries = async (
     colUid: string,
@@ -263,7 +409,18 @@ export default function CsvManagerTab() {
     if (!selectedUid || exportingCollection) return;
     try {
       setExportingCollection(true);
-      const res = await get(`/bulk-updater/csv/export/${selectedUid}?limit=${exportLimit}`);
+      const queryParams = new URLSearchParams();
+      if (exportLimit > 0) queryParams.set('limit', String(exportLimit));
+      if (searchAttribute) queryParams.set('searchAttribute', searchAttribute);
+      if (filterOperator && filterOperator !== 'none') {
+        queryParams.set('filterOperator', filterOperator);
+        if (filterQuery) queryParams.set('filterQuery', filterQuery);
+      }
+      if (entrySearch && entrySearch.trim()) {
+        queryParams.set('search', entrySearch.trim());
+      }
+
+      const res = await get(`/bulk-updater/csv/export/${selectedUid}?${queryParams.toString()}`);
       const csvStr = res.data?.csvContent || (typeof res.data === 'string' ? res.data : '');
       const filename = res.data?.filename || `${selectedUid.split('.').pop()}_export.csv`;
       downloadCsvFile(csvStr, filename);
@@ -597,23 +754,15 @@ export default function CsvManagerTab() {
                 key={`csv-col-${selectedUid}`}
                 value={selectedUid || undefined}
                 autocomplete={{ type: 'list', filter: 'contains' }}
-                placeholder="Search & select a collection..."
+                placeholder="Select Collection Type..."
                 disabled={loadingCollections}
                 clearLabel="Clear collection selection"
-                onClear={() => {
-                  setSelectedUid('');
-                  setImportResult(null);
-                  setImportProgress(null);
-                }}
+                onClear={() => handleCollectionChange('')}
                 onFocus={(e: React.FocusEvent<HTMLInputElement>) => {
                   e.target.select();
                 }}
                 onChange={(val: any) => {
-                  if (val && typeof val === 'string') {
-                    setSelectedUid(val);
-                    setImportResult(null);
-                    setImportProgress(null);
-                  }
+                  handleCollectionChange(val ? String(val) : '');
                 }}
               >
                 {collections.map((col) => (
@@ -642,8 +791,176 @@ export default function CsvManagerTab() {
             1. Export Data to CSV
           </Typography>
           <Typography variant="pi" textColor="neutral600" marginBottom={4}>
-            Extract entire collections without artificial limits (streams 10,000+ records in paged chunks) or pinpoint records violating validation quotas.
+            Extract entire collections or filtered subsets without artificial limits (streams 10,000+ records in paged chunks) or pinpoint records violating validation quotas.
           </Typography>
+
+          {/* Search and Filter Section (100% parity with Bulk Updater Workspace) */}
+          {selectedUid ? (
+            <Box padding={4} background="neutral0" hasRadius marginBottom={4} style={{ border: '1px solid #eaeaef' }}>
+              <Flex justifyContent="space-between" alignItems="center" marginBottom={3}>
+                <Typography variant="sigma" textColor="neutral700" textTransform="uppercase">
+                  Search &amp; Filter Collection Before Export
+                </Typography>
+                <Flex gap={2} alignItems="center">
+                  {countLoading ? (
+                    <Badge backgroundColor="neutral150" textColor="neutral700" size="S">
+                      Calculating matching records...
+                    </Badge>
+                  ) : matchingCount !== null ? (
+                    <Badge
+                      backgroundColor={matchingCount > 0 ? 'success100' : 'warning100'}
+                      textColor={matchingCount > 0 ? 'success700' : 'warning700'}
+                      size="S"
+                    >
+                      {matchingCount.toLocaleString()} matching records found
+                    </Badge>
+                  ) : null}
+                  {(searchAttribute || filterOperator !== 'none' || entrySearch.trim()) && (
+                    <Button
+                      variant="ghost"
+                      size="S"
+                      onClick={() => {
+                        setSearchAttribute('');
+                        setFilterOperator('none');
+                        setFilterQuery('');
+                        setEntrySearch('');
+                      }}
+                    >
+                      Clear Filters
+                    </Button>
+                  )}
+                </Flex>
+              </Flex>
+
+              <Flex gap={3} alignItems="flex-end" wrap="wrap">
+                {/* Search Attribute Combobox */}
+                <Box style={{ width: 280, minWidth: 230 }}>
+                  <Typography variant="pi" fontWeight="bold" textColor="neutral800" marginBottom={1} display="block">
+                    Search Attribute
+                  </Typography>
+                  <Combobox
+                    key={`csv-search-attr-${selectedUid}`}
+                    autocomplete={{ type: 'list', filter: 'contains' }}
+                    placeholder="Select Search Attribute..."
+                    value={searchAttribute || undefined}
+                    clearLabel="Reset search attribute"
+                    onClear={() => setSearchAttribute('')}
+                    onFocus={(e: React.FocusEvent<HTMLInputElement>) => {
+                      e.target.select();
+                    }}
+                    onChange={(val: any) => {
+                      if (val && typeof val === 'string' && val !== '__none__') {
+                        setSearchAttribute(val);
+                      }
+                    }}
+                  >
+                    {(selectedCol?.attributes || []).map((attr) => {
+                      const rel = relationsMeta[attr];
+                      const depth = getAttrDepth(attr);
+                      const badgeText = rel ? `relation ${rel.targetDisplayName}` : depth > 0 ? `L${depth} component` : '';
+                      const textValue = badgeText ? `${attr} ${badgeText}` : attr;
+                      return (
+                        <ComboboxOption key={`search_${attr}`} value={attr} textValue={textValue}>
+                          <Flex justifyContent="space-between" alignItems="center" width="100%" gap={2}>
+                            <Typography variant="omega" fontWeight={attr === searchAttribute ? 'bold' : 'regular'}>
+                              {attr}
+                            </Typography>
+                            {rel ? (
+                              <Badge backgroundColor="secondary100" textColor="secondary700" size="S">
+                                relation ➔ {rel.targetDisplayName}
+                              </Badge>
+                            ) : depth > 0 ? (
+                              <Badge backgroundColor={depth === 1 ? 'neutral150' : depth === 2 ? 'primary100' : 'secondary100'} textColor={depth === 1 ? 'neutral700' : depth === 2 ? 'primary700' : 'secondary700'} size="S">
+                                L{depth} component
+                              </Badge>
+                            ) : null}
+                          </Flex>
+                        </ComboboxOption>
+                      );
+                    })}
+                  </Combobox>
+                </Box>
+
+                {/* Operator Select */}
+                <Box style={{ width: 200, minWidth: 170 }}>
+                  <Typography variant="pi" fontWeight="bold" textColor="neutral800" marginBottom={1} display="block">
+                    {searchAttribute ? `Condition for "${searchAttribute}"` : 'Filter condition'}
+                  </Typography>
+                  <SingleSelect
+                    value={filterOperator}
+                    disabled={!searchAttribute}
+                    onChange={(val) => setFilterOperator(String(val) as FilterOperator)}
+                  >
+                    <SingleSelectOption value="none">Show All (No Value Filter)</SingleSelectOption>
+                    <SingleSelectOption value="empty">Is Empty or Null</SingleSelectOption>
+                    <SingleSelectOption value="not_empty">Is Not Empty</SingleSelectOption>
+                    <SingleSelectOption value="equals">Equals Exact Text</SingleSelectOption>
+                    <SingleSelectOption value="contains">Contains Substring</SingleSelectOption>
+                    <SingleSelectOption value="starts_with">Starts With</SingleSelectOption>
+                  </SingleSelect>
+                </Box>
+
+                {/* Value query input if needed */}
+                {(filterOperator === 'equals' || filterOperator === 'contains' || filterOperator === 'starts_with') && (
+                  <Box style={{ flex: 1, minWidth: 200 }}>
+                    <Typography variant="pi" fontWeight="bold" textColor="neutral800" marginBottom={1} display="block">
+                      {searchAttribute ? `Value for "${searchAttribute}"` : 'Value to match'}
+                    </Typography>
+                    {searchAttribute && relationsMeta[searchAttribute] ? (
+                      <Combobox
+                        autocomplete={{ type: 'list', filter: 'contains' }}
+                        placeholder={
+                          searchRelationOptionsLoading
+                            ? 'Loading entities...'
+                            : `Search & pick ${relationsMeta[searchAttribute].targetDisplayName} or type text...`
+                        }
+                        value={filterQuery}
+                        onClear={() => setFilterQuery('')}
+                        onChange={(val: any) => {
+                          if (typeof val === 'string') {
+                            setFilterQuery(val);
+                          }
+                        }}
+                        onInputChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+                          setFilterQuery(e.target.value);
+                        }}
+                      >
+                        {searchRelationOptions.map((opt) => (
+                          <ComboboxOption key={opt.documentId} value={opt.label} textValue={opt.label}>
+                            {opt.label}
+                          </ComboboxOption>
+                        ))}
+                      </Combobox>
+                    ) : (
+                      <TextInput
+                        placeholder="Type value to match..."
+                        value={filterQuery}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFilterQuery(e.target.value)}
+                      />
+                    )}
+                  </Box>
+                )}
+
+                {/* Full-text search across entries */}
+                <Box style={{ flex: 1, minWidth: 200 }}>
+                  <Typography variant="pi" fontWeight="bold" textColor="neutral800" marginBottom={1} display="block">
+                    Full-text Entry Search
+                  </Typography>
+                  <TextInput
+                    placeholder="Search title, name, or text across records..."
+                    value={entrySearch}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setEntrySearch(e.target.value)}
+                  />
+                </Box>
+              </Flex>
+            </Box>
+          ) : (
+            <Box padding={4} background="neutral0" hasRadius marginBottom={4} style={{ border: '1px solid #eaeaef', textAlign: 'center' }}>
+              <Typography variant="pi" textColor="neutral500">
+                Please select a Target Collection Type above to configure search filters and export data.
+              </Typography>
+            </Box>
+          )}
 
           <Flex gap={4} wrap="wrap" alignItems="flex-end" marginTop={3}>
             {/* Custom Download Limit with Typeable Input */}
@@ -710,11 +1027,17 @@ export default function CsvManagerTab() {
               variant="default"
               startIcon={<Download />}
               onClick={handleExportCollection}
-              disabled={!selectedUid || exportingCollection}
+              disabled={!selectedUid || exportingCollection || matchingCount === 0}
               loading={exportingCollection}
             >
               {exportingCollection
                 ? 'Preparing CSV download...'
+                : countLoading
+                ? 'Export (...) Records (.csv)'
+                : matchingCount !== null
+                ? exportLimit > 0 && matchingCount > exportLimit
+                  ? `Export First ${exportLimit.toLocaleString()} of (${matchingCount.toLocaleString()}) Records (.csv)`
+                  : `Export (${matchingCount.toLocaleString()}) ${selectedCol?.displayName || 'Collection'} Records (.csv)`
                 : `Export ${exportLimit === 0 ? 'All' : exportLimit.toLocaleString()} ${selectedCol?.displayName || 'Collection'} Records (.csv)`}
             </Button>
 
@@ -806,6 +1129,7 @@ export default function CsvManagerTab() {
               type="file"
               accept=".csv"
               id="csv-file-input"
+              ref={fileInputRef}
               style={{ display: 'none' }}
               onChange={handleFileUpload}
             />
