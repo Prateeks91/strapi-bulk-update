@@ -21,7 +21,14 @@ import {
   ComboboxOption,
 } from '@strapi/design-system';
 import { Download, Upload, ArrowClockwise, Check, ChevronLeft, ChevronRight, Eye } from '@strapi/icons';
-import { parseCsv, extractDocId } from '../utils/csvParser';
+import {
+  parseCsvWithHeaders,
+  extractDocId,
+  buildErrorCsv,
+  formatErrorCsvFilename,
+  sanitizeUserErrorMessage,
+  type FailedCsvRowEntry,
+} from '../utils/csvParser';
 import { isAbortError } from '../utils/isAbortError';
 import { getEntryLifecycleStatus, Entry, PendingBatch } from '../utils/lifecycleStatus';
 
@@ -90,7 +97,7 @@ export default function CsvManagerTab() {
   // Import states
   const [importMode, setImportMode] = useState<'auto' | 'update' | 'create_or_override'>('auto');
   const [publishOnImport, setPublishOnImport] = useState<boolean>(true);
-  const [csvRawText, setCsvRawText] = useState<string>('');
+  const [originalHeaders, setOriginalHeaders] = useState<string[]>([]);
   const [fileName, setFileName] = useState<string>('');
   const [allParsedRecords, setAllParsedRecords] = useState<Array<Record<string, string>>>([]);
   const [previewPage, setPreviewPage] = useState<number>(1);
@@ -108,6 +115,13 @@ export default function CsvManagerTab() {
     liveErrors: number;
   } | null>(null);
   const [importResult, setImportResult] = useState<any>(null);
+  const [errorReport, setErrorReport] = useState<{
+    uid: string;
+    batchId: string;
+    headers: string[];
+    failedRows: FailedCsvRowEntry[];
+  } | null>(null);
+  const activeBatchIdRef = useRef<string | null>(null);
 
   // Enterprise Guardrail State (Execution Windows, Business Hours, Maker-Checker 4-Eyes, Pre-Flight Dry Run)
   const [executionWindow, setExecutionWindow] = useState<{
@@ -231,15 +245,17 @@ export default function CsvManagerTab() {
       countAbortControllerRef.current.abort();
     }
 
+    activeBatchIdRef.current = null;
     setSelectedUid(newUid);
 
     // Reset collection-dependent import state
     setAllParsedRecords([]);
-    setCsvRawText('');
+    setOriginalHeaders([]);
     setFileName('');
     setPreviewPage(1);
     setImportProgress(null);
     setImportResult(null);
+    setErrorReport(null);
     setPreflightReport(null);
     setPreflightLoading(false);
     setImporting(false);
@@ -487,52 +503,93 @@ export default function CsvManagerTab() {
     const file = e.target.files?.[0];
     if (!file) return;
 
+    activeBatchIdRef.current = null;
     setFileName(file.name);
     setImportResult(null);
     setImportProgress(null);
+    setPreflightReport(null);
+    setErrorReport(null);
+    setOriginalHeaders([]);
 
     const reader = new FileReader();
     reader.onload = (event) => {
       const text = event.target?.result as string;
-      setCsvRawText(text);
-
       try {
-        const records = parseCsv(text);
-        const enriched = enrichCsvRowsWithLifecycle(records, collectionEntries);
-        setAllParsedRecords(enriched);
+        const { headers, records } = parseCsvWithHeaders(text);
+        setOriginalHeaders(headers);
+        setAllParsedRecords(records);
         setPreviewPage(1);
       } catch (err) {
+        setOriginalHeaders([]);
         setAllParsedRecords([]);
       }
     };
     reader.readAsText(file);
   };
 
+  const handleDownloadErrorCsv = () => {
+    if (
+      !errorReport ||
+      errorReport.uid !== selectedUid ||
+      errorReport.failedRows.length === 0
+    ) {
+      return;
+    }
+    const { csvContent } = buildErrorCsv({
+      headers: errorReport.headers,
+      failedRows: errorReport.failedRows,
+    });
+    const targetType = selectedCol?.singularName || selectedUid;
+    const errFilename = formatErrorCsvFilename(targetType);
+    downloadCsvFile(csvContent, errFilename);
+  };
+
   // Chunked batch import engine (batches of 100 rows prevent HTTP 413 "Request entity too large")
   const handleExecuteImport = async () => {
     if (!selectedUid || allParsedRecords.length === 0) return;
 
-    // Ensure CSV workflow receives the enriched entries before processing
-    let currentEntries = collectionEntries;
-    if (currentEntries.length === 0) {
-      currentEntries = await fetchAndEnrichEntries(selectedUid);
-    }
-    const enrichedRecords = enrichCsvRowsWithLifecycle(allParsedRecords, currentEntries);
-
-    const totalRows = enrichedRecords.length;
-    const CHUNK_SIZE = 100;
-    const totalChunks = Math.ceil(totalRows / CHUNK_SIZE);
+    const runUid = selectedUid;
+    const runHeaders = originalHeaders;
+    const originalRecordsSnapshot = allParsedRecords;
     const batchId = `csv_batch_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    activeBatchIdRef.current = batchId;
 
     try {
       setImporting(true);
       setImportResult(null);
+      setErrorReport(null);
+
+      // Ensure CSV workflow receives the enriched entries before processing
+      let currentEntries = collectionEntries;
+      if (currentEntries.length === 0) {
+        currentEntries = await fetchAndEnrichEntries(runUid);
+      }
+      if (activeBatchIdRef.current !== batchId) return;
+
+      const enrichedRecords = enrichCsvRowsWithLifecycle(originalRecordsSnapshot, currentEntries);
+
+      const totalRows = enrichedRecords.length;
+      const CHUNK_SIZE = 100;
+      const totalChunks = Math.ceil(totalRows / CHUNK_SIZE);
 
       let liveCreated = 0;
       let liveUpdated = 0;
       let liveSkipped = 0;
+      let liveNewWithoutDocId = 0;
       let liveErrors = 0;
       let finalResultData: any = null;
+
+      const accumulatedErrors: Array<{ row: number; documentId?: string; error: string }> = [];
+      const accumulatedFailedRows: FailedCsvRowEntry[] = [];
+      const accumulatedDiffs: any[] = [];
+
+      const mapOriginalRowForIndex = (rowNum: number, backendOrigRow?: Record<string, any>) => {
+        const idx = typeof rowNum === 'number' ? rowNum - 2 : -1;
+        if (idx >= 0 && idx < originalRecordsSnapshot.length) {
+          return originalRecordsSnapshot[idx];
+        }
+        return backendOrigRow && typeof backendOrigRow === 'object' ? backendOrigRow : {};
+      };
 
       setImportProgress({
         currentChunk: 0,
@@ -547,6 +604,8 @@ export default function CsvManagerTab() {
       });
 
       for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
+        if (activeBatchIdRef.current !== batchId) return;
+
         const startIdx = chunkIdx * CHUNK_SIZE;
         const endIdx = Math.min(startIdx + CHUNK_SIZE, totalRows);
         const chunkRows = enrichedRecords.slice(startIdx, endIdx);
@@ -554,53 +613,173 @@ export default function CsvManagerTab() {
         const isLast = chunkIdx === totalChunks - 1;
         const startRowNumber = startIdx + 2;
 
-        const res = await post('/bulk-updater/csv/import-chunk', {
-          uid: selectedUid,
-          rows: chunkRows,
-          batchId,
-          isFirstChunk: isFirst,
-          isLastChunk: isLast,
-          startRowNumber,
-          mode: importMode,
-          publish: publishOnImport,
-          publishStrategy,
-          unreviewedConsent,
-        });
+        try {
+          const res = await post('/bulk-updater/csv/import-chunk', {
+            uid: runUid,
+            rows: chunkRows,
+            batchId,
+            isFirstChunk: isFirst,
+            isLastChunk: isLast,
+            startRowNumber,
+            mode: importMode,
+            publish: publishOnImport,
+            publishStrategy,
+            unreviewedConsent,
+            ...(isFirst && runHeaders.length > 0 ? { originalHeaders: runHeaders } : {}),
+          });
 
-        if (!res.data || !res.data.success) {
-          throw new Error(res.data?.error || `Chunk ${chunkIdx + 1} failed to process`);
-        }
+          if (activeBatchIdRef.current !== batchId) return;
 
-        const chunkStats = res.data.chunkStats;
-        if (chunkStats) {
-          liveCreated += chunkStats.created || 0;
-          liveUpdated += chunkStats.updated || 0;
-          liveSkipped += chunkStats.skipped || 0;
-          liveErrors += chunkStats.errors?.length || 0;
-        }
+          if (!res.data || !res.data.success) {
+            throw new Error(res.data?.error || `Chunk ${chunkIdx + 1} failed to process`);
+          }
 
-        const currentProgressPercent = Math.round(((chunkIdx + 1) / totalChunks) * 100);
+          const chunkStats = res.data.chunkStats;
+          if (chunkStats) {
+            liveCreated += chunkStats.created || 0;
+            liveUpdated += chunkStats.updated || 0;
+            liveSkipped += chunkStats.skipped || 0;
+            liveNewWithoutDocId += chunkStats.newWithoutDocId || 0;
+            liveErrors += chunkStats.errors?.length || 0;
 
-        setImportProgress({
-          currentChunk: chunkIdx + 1,
-          totalChunks,
-          percent: currentProgressPercent,
-          processedRows: endIdx,
-          totalRows,
-          liveCreated,
-          liveUpdated,
-          liveSkipped,
-          liveErrors,
-        });
+            if (Array.isArray(chunkStats.errors)) {
+              accumulatedErrors.push(...chunkStats.errors);
+            }
+            if (Array.isArray(chunkStats.failedRows) && chunkStats.failedRows.length > 0) {
+              for (const f of chunkStats.failedRows) {
+                accumulatedFailedRows.push({
+                  row: f.row,
+                  documentId: f.documentId,
+                  error: f.error,
+                  originalRow: mapOriginalRowForIndex(f.row, f.originalRow),
+                });
+              }
+            } else if (Array.isArray(chunkStats.errors) && chunkStats.errors.length > 0) {
+              for (const errItem of chunkStats.errors) {
+                accumulatedFailedRows.push({
+                  row: errItem.row,
+                  documentId: errItem.documentId,
+                  error: errItem.error,
+                  originalRow: mapOriginalRowForIndex(errItem.row),
+                });
+              }
+            }
+            if (Array.isArray(chunkStats.diffs)) {
+              accumulatedDiffs.push(...chunkStats.diffs);
+            }
+          }
 
-        if (isLast) {
-          finalResultData = res.data;
+          const currentProgressPercent = Math.round(((chunkIdx + 1) / totalChunks) * 100);
+
+          setImportProgress({
+            currentChunk: chunkIdx + 1,
+            totalChunks,
+            percent: currentProgressPercent,
+            processedRows: endIdx,
+            totalRows,
+            liveCreated,
+            liveUpdated,
+            liveSkipped,
+            liveErrors,
+          });
+
+          if (isLast) {
+            finalResultData = res.data;
+          }
+        } catch (chunkErr: any) {
+          if (isAbortError(chunkErr)) return;
+          if (activeBatchIdRef.current !== batchId) return;
+
+          const apiErrMsg = sanitizeUserErrorMessage(
+            chunkErr?.response?.data?.error?.message ||
+              chunkErr?.response?.data?.error ||
+              chunkErr?.message ||
+              `Chunk ${chunkIdx + 1} failed to process`
+          );
+
+          // Record every row in this failed chunk so no backend/API errors are lost
+          for (let j = startIdx; j < endIdx; j++) {
+            const rowNum = j + 2;
+            const rawRow = originalRecordsSnapshot[j] || {};
+            const rowDocId = extractDocId(rawRow) || undefined;
+            accumulatedErrors.push({
+              row: rowNum,
+              ...(rowDocId ? { documentId: rowDocId } : {}),
+              error: apiErrMsg,
+            });
+            accumulatedFailedRows.push({
+              row: rowNum,
+              ...(rowDocId ? { documentId: rowDocId } : {}),
+              error: apiErrMsg,
+              originalRow: rawRow,
+            });
+            liveSkipped++;
+            liveErrors++;
+          }
+
+          setImportResult({
+            success: false,
+            batchId,
+            stats: {
+              total: totalRows,
+              created: liveCreated,
+              updated: liveUpdated,
+              skipped: liveSkipped,
+              newWithoutDocId: liveNewWithoutDocId,
+              errors: accumulatedErrors,
+              diffs: accumulatedDiffs,
+            },
+          });
+
+          if (accumulatedFailedRows.length > 0) {
+            setErrorReport({
+              uid: runUid,
+              batchId,
+              headers: runHeaders,
+              failedRows: accumulatedFailedRows,
+            });
+          }
+
+          throw new Error(apiErrMsg);
         }
       }
+
+      if (activeBatchIdRef.current !== batchId) return;
 
       if (finalResultData && finalResultData.stats) {
         setImportResult(finalResultData);
         const stats = finalResultData.stats;
+
+        const finalFailedRows: FailedCsvRowEntry[] =
+          accumulatedFailedRows.length > 0
+            ? accumulatedFailedRows
+            : Array.isArray(stats.failedRows) && stats.failedRows.length > 0
+            ? stats.failedRows.map((f: any) => ({
+                row: f.row,
+                documentId: f.documentId,
+                error: f.error,
+                originalRow: mapOriginalRowForIndex(f.row, f.originalRow),
+              }))
+            : Array.isArray(stats.errors)
+            ? stats.errors.map((errItem: any) => ({
+                row: errItem.row,
+                documentId: errItem.documentId,
+                error: errItem.error,
+                originalRow: mapOriginalRowForIndex(errItem.row),
+              }))
+            : [];
+
+        if (finalFailedRows.length > 0) {
+          setErrorReport({
+            uid: runUid,
+            batchId: finalResultData.batchId || batchId,
+            headers: runHeaders,
+            failedRows: finalFailedRows,
+          });
+        } else {
+          setErrorReport(null);
+        }
+
         let notifMsg = `CSV Import complete: ${stats.created} created, ${stats.updated} updated across ${stats.total} records.`;
         if (stats.newWithoutDocId && stats.newWithoutDocId > 0) {
           notifMsg += ` (${stats.newWithoutDocId} new entries created due to omitted documentId)`;
@@ -617,7 +796,9 @@ export default function CsvManagerTab() {
         message: err.message || 'Error processing CSV import batch',
       });
     } finally {
-      setImporting(false);
+      if (activeBatchIdRef.current === batchId || activeBatchIdRef.current === null) {
+        setImporting(false);
+      }
     }
   };
 
@@ -1496,6 +1677,24 @@ export default function CsvManagerTab() {
                         ...and {importResult.stats.errors.length - 10} more error{importResult.stats.errors.length - 10 > 1 ? 's' : ''}
                       </Typography>
                     )}
+                    {errorReport &&
+                      errorReport.uid === selectedUid &&
+                      (!importResult.batchId || errorReport.batchId === importResult.batchId) &&
+                      errorReport.failedRows.length > 0 && (
+                        <Flex marginTop={3} gap={2} alignItems="center" wrap="wrap">
+                          <Button
+                            variant="danger-light"
+                            size="S"
+                            startIcon={<Download />}
+                            onClick={handleDownloadErrorCsv}
+                          >
+                            Download Error CSV ({errorReport.failedRows.length.toLocaleString()} failed row{errorReport.failedRows.length > 1 ? 's' : ''})
+                          </Button>
+                          <Typography variant="pi" textColor="neutral600">
+                            Contains only failed rows with all original columns preserved and an Error column.
+                          </Typography>
+                        </Flex>
+                      )}
                   </Box>
                 )}
 

@@ -130,7 +130,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
   async importChunk(ctx: any) {
     try {
-      const { uid, rows, batchId, isFirstChunk, isLastChunk, startRowNumber, mode, publish, publishStrategy, unreviewedConsent } = ctx.request.body;
+      const { uid, rows, batchId, isFirstChunk, isLastChunk, startRowNumber, mode, publish, publishStrategy, unreviewedConsent, originalHeaders } = ctx.request.body;
       if (!uid) {
         ctx.status = 400;
         ctx.body = { success: false, error: 'Target collection UID is required.' };
@@ -152,6 +152,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         publish: publish !== false,
         publishStrategy: publishStrategy === 'all' ? 'all' : 'safe',
         unreviewedConsent: Boolean(unreviewedConsent),
+        originalHeaders: Array.isArray(originalHeaders) ? originalHeaders.map(String) : undefined,
         user: ctx.state.user,
       });
 
