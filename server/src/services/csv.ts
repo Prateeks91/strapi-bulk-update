@@ -23,6 +23,11 @@ import {
   extractMetadataFromRow,
   buildDocumentUpdatePayload,
   verifyDocumentIntegrity,
+  buildErrorCsv,
+  formatErrorCsvFilename,
+  sanitizeUserErrorMessage,
+  type FailedCsvRowRecord,
+  type ErrorCsvOutput,
 } from './csv/index';
 
 /**
@@ -572,6 +577,8 @@ export interface ProcessRowsStats {
   failed?: number;
   newWithoutDocId: number;
   errors: Array<{ row: number; error: string; documentId?: string }>;
+  failedRows?: FailedCsvRowRecord[];
+  errorCsv?: ErrorCsvOutput & { filename: string };
   diffs: Array<any>;
 }
 
@@ -586,9 +593,79 @@ interface CsvImportSession {
   failed?: number;
   newWithoutDocId: number;
   errors: Array<{ row: number; error: string; documentId?: string }>;
+  failedRows: FailedCsvRowRecord[];
+  originalHeaders?: string[];
   diffs: Array<any>;
   publishStrategy?: 'safe' | 'all';
   unreviewedConsent?: boolean;
+}
+
+function extractOriginalRowSlice(
+  row: Record<string, string>,
+  originalHeaders?: string[]
+): Record<string, string> {
+  if (!row || typeof row !== 'object') return {};
+  if (Array.isArray(originalHeaders) && originalHeaders.length > 0) {
+    const clean: Record<string, string> = {};
+    for (const h of originalHeaders) {
+      clean[h] = row[h] !== undefined && row[h] !== null ? String(row[h]) : '';
+    }
+    return clean;
+  }
+  return { ...row };
+}
+
+function mergeFailedRows(
+  target: FailedCsvRowRecord[],
+  incoming: FailedCsvRowRecord[]
+) {
+  for (const item of incoming) {
+    if (!item || typeof item !== 'object') continue;
+    const existing = target.find((f) => f.row === item.row);
+    if (existing) {
+      const existingParts = existing.error.split('; ').filter(Boolean);
+      const nextMsg = sanitizeUserErrorMessage(item.error);
+      if (!existingParts.includes(nextMsg)) {
+        existingParts.push(nextMsg);
+        existing.error = existingParts.join('; ');
+      }
+    } else {
+      target.push({
+        row: item.row,
+        documentId: item.documentId,
+        error: sanitizeUserErrorMessage(item.error),
+        originalRow: item.originalRow || {},
+      });
+    }
+  }
+}
+
+function recordFailedCsvRow(
+  stats: ProcessRowsStats,
+  rowNumber: number,
+  originalRow: Record<string, string>,
+  errorMsg: string,
+  documentId?: string,
+  originalHeaders?: string[]
+) {
+  const safeMsg = sanitizeUserErrorMessage(errorMsg);
+  stats.errors.push(
+    documentId !== undefined
+      ? { row: rowNumber, documentId, error: safeMsg }
+      : { row: rowNumber, error: safeMsg }
+  );
+
+  if (!stats.failedRows) {
+    stats.failedRows = [];
+  }
+  mergeFailedRows(stats.failedRows, [
+    {
+      row: rowNumber,
+      documentId,
+      error: safeMsg,
+      originalRow: extractOriginalRowSlice(originalRow, originalHeaders),
+    },
+  ]);
 }
 
 const csvImportSessions = new Map<string, CsvImportSession>();
@@ -1181,11 +1258,14 @@ async function executeUpdateMutation(
   if (!valResult.isValid) {
     stats.skipped++;
     if (stats.failed !== undefined) stats.failed++;
-    stats.errors.push({
-      row: rowNumber,
-      documentId: resolvedDocId,
-      error: valResult.errorMessage,
-    });
+    recordFailedCsvRow(
+      stats,
+      rowNumber,
+      row,
+      valResult.errorMessage,
+      resolvedDocId,
+      options.originalHeaders
+    );
     stats.diffs.push({
       uid,
       collectionName: ct.info?.displayName || uid,
@@ -1291,11 +1371,14 @@ async function executeCreateMutation(
   if (!valResultNew.isValid) {
     stats.skipped++;
     if (stats.failed !== undefined) stats.failed++;
-    stats.errors.push({
-      row: rowNumber,
-      documentId: docId || 'new',
-      error: valResultNew.errorMessage,
-    });
+    recordFailedCsvRow(
+      stats,
+      rowNumber,
+      row,
+      valResultNew.errorMessage,
+      docId || 'new',
+      options.originalHeaders
+    );
     stats.diffs.push({
       uid,
       collectionName: ct.info?.displayName || uid,
@@ -1373,10 +1456,11 @@ export async function processCsvRows(
     publishStrategy?: 'safe' | 'all';
     unreviewedConsent?: boolean;
     user?: any;
+    originalHeaders?: string[];
   }
 ): Promise<ProcessRowsStats> {
   const attrs = ct.attributes || {};
-  const { mode = 'auto', publish = true, publishStrategy = 'safe', user } = options;
+  const { mode = 'auto', publish = true, publishStrategy = 'safe', user, originalHeaders } = options;
   const isDraftAndPublish = Boolean(ct.options?.draftAndPublish);
 
   // Pre-fetch published counterparts for all rows with docId in chunk
@@ -1409,6 +1493,7 @@ export async function processCsvRows(
     failed: 0,
     newWithoutDocId: 0,
     errors: [],
+    failedRows: [],
     diffs: [],
   };
 
@@ -1437,21 +1522,28 @@ export async function processCsvRows(
       if (mode === 'update') {
         if (!docId) {
           stats.skipped++;
-          stats.errors.push({
-            row: rowNumber,
-            error: 'Missing or invalid documentId for Update mode. (Tip: Use Smart Auto-Detect mode to auto-add entries without document IDs).',
-          });
+          recordFailedCsvRow(
+            stats,
+            rowNumber,
+            row,
+            'Missing or invalid documentId for Update mode. (Tip: Use Smart Auto-Detect mode to auto-add entries without document IDs).',
+            undefined,
+            originalHeaders
+          );
           continue;
         }
 
         const existing = await findExistingDocument(strapi, uid, docId, effectiveLocale);
         if (!existing) {
           stats.skipped++;
-          stats.errors.push({
-            row: rowNumber,
-            documentId: docId,
-            error: `Document with ID "${docId}" not found in database.`,
-          });
+          recordFailedCsvRow(
+            stats,
+            rowNumber,
+            row,
+            `Document with ID "${docId}" not found in database.`,
+            docId,
+            originalHeaders
+          );
           continue;
         }
 
@@ -1549,12 +1641,15 @@ export async function processCsvRows(
     } catch (err: any) {
       stats.skipped++;
       if (stats.failed !== undefined) stats.failed++;
-      const errMsg = extractDetailedErrorMessage(err);
-      stats.errors.push({
-        row: rowNumber,
-        documentId: docId || undefined,
-        error: errMsg,
-      });
+      const errMsg = sanitizeUserErrorMessage(extractDetailedErrorMessage(err));
+      recordFailedCsvRow(
+        stats,
+        rowNumber,
+        row,
+        errMsg,
+        docId || undefined,
+        originalHeaders
+      );
       stats.diffs.push({
         uid,
         collectionName: ct.info?.displayName || uid,
@@ -2129,6 +2224,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       publishStrategy?: 'safe' | 'all';
       unreviewedConsent?: boolean;
       user?: any;
+      originalHeaders?: string[];
     }
   ) {
     const ct = strapi.contentTypes[uid];
@@ -2153,15 +2249,22 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         failed: 0,
         newWithoutDocId: 0,
         errors: [],
+        failedRows: [],
+        originalHeaders: Array.isArray(options.originalHeaders) ? options.originalHeaders : undefined,
         diffs: [],
         publishStrategy: options.publishStrategy,
         unreviewedConsent: options.unreviewedConsent,
       };
       csvImportSessions.set(batchId, session);
+    } else if (!session.originalHeaders && Array.isArray(options.originalHeaders)) {
+      session.originalHeaders = options.originalHeaders;
     }
 
     const startRowNumber = options.startRowNumber || (session.total + 2);
-    const chunkStats = await processCsvRows(strapi, ct, uid, rows || [], startRowNumber, options);
+    const chunkStats = await processCsvRows(strapi, ct, uid, rows || [], startRowNumber, {
+      ...options,
+      originalHeaders: session.originalHeaders,
+    });
 
     session.total += chunkStats.total;
     session.created += chunkStats.created;
@@ -2170,6 +2273,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     session.failed = (session.failed || 0) + (chunkStats.failed || 0);
     session.newWithoutDocId += chunkStats.newWithoutDocId;
     session.errors.push(...chunkStats.errors);
+    if (chunkStats.failedRows && chunkStats.failedRows.length > 0) {
+      mergeFailedRows(session.failedRows, chunkStats.failedRows);
+    }
     session.diffs.push(...chunkStats.diffs);
 
     if (options.isLastChunk) {
@@ -2192,7 +2298,19 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         }
       } catch {}
 
-      const aggregateStats = {
+      let errorCsv: (ErrorCsvOutput & { filename: string }) | undefined;
+      if (session.failedRows.length > 0) {
+        const built = buildErrorCsv({
+          headers: session.originalHeaders,
+          failedRows: session.failedRows,
+        });
+        errorCsv = {
+          filename: formatErrorCsvFilename(ct.info?.singularName || uid),
+          ...built,
+        };
+      }
+
+      const aggregateStats: ProcessRowsStats = {
         total: session.total,
         created: session.created,
         updated: session.updated,
@@ -2200,6 +2318,8 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         failed: session.failed || 0,
         newWithoutDocId: session.newWithoutDocId,
         errors: session.errors,
+        failedRows: session.failedRows,
+        ...(errorCsv ? { errorCsv } : {}),
         diffs: session.diffs,
       };
 
@@ -2241,13 +2361,42 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       throw new Error(`Content type ${uid} not found`);
     }
 
-    const parsedRows = parseCsv(csvText);
-    if (!parsedRows || parsedRows.length === 0) {
+    const matrix = parseCsvRows(csvText);
+    if (!matrix || matrix.length < 2) {
       throw new Error('CSV is empty or could not be parsed.');
     }
 
+    const originalHeaders = matrix[0].map((h) => h.trim());
+    const parsedRows: Array<Record<string, string>> = [];
+    for (let i = 1; i < matrix.length; i++) {
+      const rowCells = matrix[i];
+      const record: Record<string, string> = {};
+      originalHeaders.forEach((h, idx) => {
+        let val = rowCells[idx] !== undefined ? rowCells[idx] : '';
+        if (typeof val === 'string' && /^'[=+@-]/.test(val)) {
+          val = val.substring(1);
+        }
+        record[h] = val;
+      });
+      parsedRows.push(record);
+    }
+
     const batchId = `csv_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-    const stats = await processCsvRows(strapi, ct, uid, parsedRows, 2, options);
+    const stats = await processCsvRows(strapi, ct, uid, parsedRows, 2, {
+      ...options,
+      originalHeaders,
+    });
+
+    if (stats.failedRows && stats.failedRows.length > 0) {
+      const built = buildErrorCsv({
+        headers: originalHeaders,
+        failedRows: stats.failedRows,
+      });
+      stats.errorCsv = {
+        filename: formatErrorCsvFilename(ct.info?.singularName || uid),
+        ...built,
+      };
+    }
 
     try {
       const bulkService = strapi.plugin('bulk-updater').service('bulkUpdater');
@@ -2288,6 +2437,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       publishStrategy?: 'safe' | 'all';
       unreviewedConsent?: boolean;
       user?: any;
+      originalHeaders?: string[];
     } = {},
     checkerUser?: any
   ) {
@@ -2301,6 +2451,17 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       ...options,
       user: effectiveUser,
     });
+
+    if (stats.failedRows && stats.failedRows.length > 0) {
+      const built = buildErrorCsv({
+        headers: options.originalHeaders,
+        failedRows: stats.failedRows,
+      });
+      stats.errorCsv = {
+        filename: formatErrorCsvFilename(ct.info?.singularName || uid),
+        ...built,
+      };
+    }
 
     await recordCsvAuditLog(
       strapi,
