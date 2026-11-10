@@ -348,3 +348,168 @@ export function extractMetadataFromRow(row: Record<string, any>): BulkUpdaterMet
 
   return null;
 }
+
+export interface FailedCsvRowRecord {
+  row: number;
+  documentId?: string;
+  error: string;
+  originalRow: Record<string, any>;
+}
+
+export interface ErrorCsvOutput {
+  csvContent: string;
+  headers: string[];
+  errorColumnName: string;
+  errorCount: number;
+}
+
+/**
+ * Removes stack trace lines and unsafe internal details from error messages
+ */
+export function sanitizeUserErrorMessage(msg: any): string {
+  if (msg === null || msg === undefined) return 'Error processing row';
+  const raw = typeof msg === 'string' ? msg : String(msg);
+  // Strip accidental Node stack frames ("    at fn (/path/...)")
+  const cleanedLines = raw
+    .split(/\r?\n/)
+    .filter((line) => !/^\s+at\s+.+(\(.+\)|:\d+:\d+)\s*$/.test(line))
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const result = cleanedLines.join(' ').trim();
+  return result || 'Error processing row';
+}
+
+/**
+ * Resolves a non-colliding Error column header name at the end of existing CSV headers
+ */
+export function resolveErrorColumnName(existingHeaders: string[]): string {
+  const existingLower = new Set(
+    existingHeaders.map((h) => String(h || '').trim().toLowerCase())
+  );
+  if (!existingLower.has('error')) {
+    return 'Error';
+  }
+  if (!existingLower.has('import error')) {
+    return 'Import Error';
+  }
+  let suffix = 2;
+  while (existingLower.has(`import error (${suffix})`)) {
+    suffix++;
+  }
+  return `Import Error (${suffix})`;
+}
+
+/**
+ * Formats a safe timestamped filename: error_collectionType_YYYYMMDD_HHmmss.csv
+ */
+export function formatErrorCsvFilename(
+  collectionTypeOrUid?: string,
+  date: Date = new Date()
+): string {
+  const rawSegment = collectionTypeOrUid
+    ? String(collectionTypeOrUid).split('.').pop() || String(collectionTypeOrUid)
+    : 'collection';
+  const safeType =
+    rawSegment
+      .replace(/[^a-zA-Z0-9_-]+/g, '_')
+      .replace(/^_+|_+$/g, '') || 'collection';
+
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const stamp = `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}_${pad(
+    date.getHours()
+  )}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+  return `error_${safeType}_${stamp}.csv`;
+}
+
+/**
+ * Generates an RFC-4180 compliant Error CSV containing only failed original rows
+ * with their original columns preserved and an appended Error column.
+ */
+export function buildErrorCsv(options: {
+  headers?: string[];
+  failedRows: FailedCsvRowRecord[];
+}): ErrorCsvOutput {
+  const { headers, failedRows } = options || {};
+  if (!Array.isArray(failedRows) || failedRows.length === 0) {
+    return {
+      csvContent: '',
+      headers: headers ? [...headers] : [],
+      errorColumnName: 'Error',
+      errorCount: 0,
+    };
+  }
+
+  // Deduplicate by row number, preserving multiple distinct messages per row cleanly
+  const groupedByRow = new Map<
+    number,
+    { row: number; documentId?: string; messages: string[]; originalRow: Record<string, any> }
+  >();
+
+  for (const item of failedRows) {
+    if (!item || typeof item !== 'object') continue;
+    const rowNum = typeof item.row === 'number' && !isNaN(item.row) ? item.row : groupedByRow.size + 2;
+    const msg = sanitizeUserErrorMessage(item.error);
+    const existing = groupedByRow.get(rowNum);
+    if (existing) {
+      if (!existing.messages.includes(msg)) {
+        existing.messages.push(msg);
+      }
+    } else {
+      groupedByRow.set(rowNum, {
+        row: rowNum,
+        documentId: item.documentId,
+        messages: [msg],
+        originalRow: item.originalRow && typeof item.originalRow === 'object' ? item.originalRow : {},
+      });
+    }
+  }
+
+  const orderedEntries = Array.from(groupedByRow.values()).sort((a, b) => a.row - b.row);
+  if (orderedEntries.length === 0) {
+    return {
+      csvContent: '',
+      headers: headers ? [...headers] : [],
+      errorColumnName: 'Error',
+      errorCount: 0,
+    };
+  }
+
+  // Preserve exact original header order or infer ordered keys from failed rows
+  let baseHeaders: string[] = [];
+  if (Array.isArray(headers) && headers.length > 0) {
+    baseHeaders = [...headers];
+  } else {
+    const keySet = new Set<string>();
+    for (const entry of orderedEntries) {
+      for (const k of Object.keys(entry.originalRow || {})) {
+        if (!keySet.has(k)) {
+          keySet.add(k);
+          baseHeaders.push(k);
+        }
+      }
+    }
+  }
+
+  const errorColumnName = resolveErrorColumnName(baseHeaders);
+  const finalHeaders = [...baseHeaders, errorColumnName];
+
+  const lines: string[] = [];
+  lines.push(finalHeaders.map(escapeCsvCell).join(','));
+
+  for (const entry of orderedEntries) {
+    const cells = baseHeaders.map((h) => {
+      const val = entry.originalRow ? entry.originalRow[h] : '';
+      return escapeCsvCell(val === undefined || val === null ? '' : val);
+    });
+    cells.push(escapeCsvCell(entry.messages.join('; ')));
+    lines.push(cells.join(','));
+  }
+
+  const csvContent = '\uFEFF' + lines.join('\r\n') + '\r\n';
+  return {
+    csvContent,
+    headers: finalHeaders,
+    errorColumnName,
+    errorCount: orderedEntries.length,
+  };
+}
