@@ -14,7 +14,7 @@ import {
   Td,
   Loader,
 } from '@strapi/design-system';
-import { Check, ArrowRight } from '@strapi/icons';
+import { Check } from '@strapi/icons';
 
 export interface PreviewDiffItem {
   uid: string;
@@ -22,12 +22,14 @@ export interface PreviewDiffItem {
   documentId: string;
   label: string;
   attribute: string;
+  occurrenceKey?: string;
   oldValue: any;
   newValue: any;
   oldDisplay: string;
   newDisplay: string;
   hasChange: boolean;
-  status: 'will_update' | 'unchanged' | 'will_skip';
+  status: 'will_update' | 'unchanged' | 'will_skip' | 'will_error';
+  validationError?: string;
   message: string;
 }
 
@@ -36,6 +38,7 @@ export interface PreviewSummary {
   willUpdate: number;
   unchanged: number;
   skipped: number;
+  willError?: number;
 }
 
 interface BulkUpdatePreviewModalProps {
@@ -44,11 +47,13 @@ interface BulkUpdatePreviewModalProps {
   onProceed: () => void;
   loading: boolean;
   previewData: {
+    editMode?: 'common' | 'grid';
     summary: PreviewSummary;
     diffs: PreviewDiffItem[];
   } | null;
   attribute: string;
   targetValueDisplay: string;
+  editMode?: 'common' | 'grid';
   publishOnApproval?: boolean;
   lifecycleStats?: {
     published: number;
@@ -67,10 +72,11 @@ const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
   previewData,
   attribute,
   targetValueDisplay,
+  editMode = 'common',
   publishOnApproval = true,
   lifecycleStats,
 }) => {
-  const [filterTab, setFilterTab] = useState<'all' | 'will_update' | 'unchanged' | 'will_skip'>('all');
+  const [filterTab, setFilterTab] = useState<'all' | 'will_update' | 'unchanged' | 'will_skip' | 'will_error'>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
 
   const filteredDiffs = useMemo(() => {
@@ -88,6 +94,7 @@ const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
           d.label.toLowerCase().includes(q) ||
           d.documentId.toLowerCase().includes(q) ||
           d.collectionName.toLowerCase().includes(q) ||
+          String(d.attribute || '').toLowerCase().includes(q) ||
           String(d.oldDisplay || '').toLowerCase().includes(q) ||
           String(d.newDisplay || '').toLowerCase().includes(q)
       );
@@ -97,6 +104,9 @@ const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
   }, [previewData, filterTab, searchQuery]);
 
   if (!isOpen) return null;
+
+  const isGridMode = editMode === 'grid' || previewData?.editMode === 'grid';
+  const willErrorCount = previewData?.summary?.willError || 0;
 
   return (
     <div
@@ -119,7 +129,7 @@ const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
         hasRadius
         shadow="popupShadow"
         style={{
-          maxWidth: 1040,
+          maxWidth: 1120,
           width: '95%',
           maxHeight: 'calc(100vh - 48px)',
           display: 'flex',
@@ -148,6 +158,11 @@ const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
                 <Badge backgroundColor="primary100" textColor="primary700">
                   Target: {attribute}
                 </Badge>
+                {isGridMode && (
+                  <Badge backgroundColor="secondary100" textColor="secondary700">
+                    GRID EDITING MODE
+                  </Badge>
+                )}
               </Flex>
               <Typography variant="pi" textColor="neutral600">
                 Inspect exact before &amp; after values across target records before applying changes to the database.
@@ -155,12 +170,20 @@ const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
             </Box>
 
             <Flex gap={2} alignItems="center" wrap="wrap">
-              <Typography variant="pi" textColor="neutral600">
-                New Value:
-              </Typography>
-              <Badge backgroundColor="success100" textColor="success700">
-                {targetValueDisplay || '(empty)'}
-              </Badge>
+              {!isGridMode ? (
+                <>
+                  <Typography variant="pi" textColor="neutral600">
+                    New Value:
+                  </Typography>
+                  <Badge backgroundColor="success100" textColor="success700">
+                    {targetValueDisplay || '(empty)'}
+                  </Badge>
+                </>
+              ) : (
+                <Badge backgroundColor="secondary100" textColor="secondary700">
+                  {targetValueDisplay || 'Per-Record & Component Grid Edits'}
+                </Badge>
+              )}
               <Badge
                 backgroundColor={publishOnApproval !== false ? 'success100' : 'warning100'}
                 textColor={publishOnApproval !== false ? 'success700' : 'warning700'}
@@ -199,6 +222,20 @@ const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
             </Box>
           ) : (
             <>
+              {/* Validation / Quota Error Warning Banner */}
+              {willErrorCount > 0 && (
+                <Box marginBottom={4} padding={3} background="danger100" hasRadius style={{ border: '1px solid #f5c0b8' }}>
+                  <Flex gap={2} alignItems="center">
+                    <Typography variant="pi" fontWeight="bold" textColor="danger700">
+                      ⚠️ Validation / Quota Violation Detected:
+                    </Typography>
+                    <Typography variant="pi" textColor="danger700">
+                      {willErrorCount} item(s) failed schema or quota validation rules. Inspect the rows marked &quot;Validation Error&quot; below; invalid records will be rejected during batch execution and retained for editing.
+                    </Typography>
+                  </Flex>
+                </Box>
+              )}
+
               {/* Unreviewed Content Notice */}
               {publishOnApproval && lifecycleStats && lifecycleStats.unreviewedCount > 0 && (
                 <Box marginBottom={4} padding={3} background="warning100" hasRadius style={{ border: '1px solid #f5c0b8' }}>
@@ -214,7 +251,7 @@ const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
                 </Box>
               )}
 
-              {/* 4 Summary KPI Cards */}
+              {/* Summary KPI Cards */}
               <Flex gap={3} marginBottom={4} wrap="wrap">
                 <Box
                   padding={3}
@@ -269,7 +306,7 @@ const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
                     textColor={previewData.summary.skipped > 0 ? 'warning700' : 'neutral600'}
                     display="block"
                   >
-                    WILL SKIP (NO FIELD)
+                    WILL SKIP
                   </Typography>
                   <Typography
                     variant="beta"
@@ -279,6 +316,22 @@ const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
                     {previewData.summary.skipped}
                   </Typography>
                 </Box>
+
+                {willErrorCount > 0 && (
+                  <Box
+                    padding={3}
+                    background="danger100"
+                    hasRadius
+                    style={{ flex: 1, minWidth: 140, border: '1px solid #ffa39e' }}
+                  >
+                    <Typography variant="sigma" textColor="danger700" display="block">
+                      VALIDATION ERRORS
+                    </Typography>
+                    <Typography variant="beta" fontWeight="bold" textColor="danger700">
+                      {willErrorCount}
+                    </Typography>
+                  </Box>
+                )}
               </Flex>
 
               {/* Filter Tabs & Search Bar */}
@@ -289,7 +342,7 @@ const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
                     size="S"
                     onClick={() => setFilterTab('all')}
                   >
-                    All ({previewData.summary.total})
+                    All ({isGridMode ? previewData.diffs.length : previewData.summary.total})
                   </Button>
                   <Button
                     variant={filterTab === 'will_update' ? 'default' : 'tertiary'}
@@ -314,6 +367,15 @@ const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
                       Skipped ({previewData.summary.skipped})
                     </Button>
                   )}
+                  {willErrorCount > 0 && (
+                    <Button
+                      variant={filterTab === 'will_error' ? 'default' : 'tertiary'}
+                      size="S"
+                      onClick={() => setFilterTab('will_error')}
+                    >
+                      Errors ({willErrorCount})
+                    </Button>
+                  )}
                 </Flex>
 
                 <Box style={{ width: 260 }}>
@@ -336,30 +398,35 @@ const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
                   overflowX: 'auto',
                 }}
               >
-                <Table colCount={5} rowCount={filteredDiffs.length + 1} style={{ width: '100%', minWidth: 780 }}>
+                <Table colCount={6} rowCount={filteredDiffs.length + 1} style={{ width: '100%', minWidth: 880 }}>
                   <Thead>
                     <Tr>
-                      <Th style={{ width: 150 }}>
+                      <Th style={{ width: 140 }}>
                         <Typography variant="sigma" textColor="neutral600">
                           COLLECTION
                         </Typography>
                       </Th>
-                      <Th style={{ minWidth: 200 }}>
+                      <Th style={{ minWidth: 185 }}>
                         <Typography variant="sigma" textColor="neutral600">
                           RECORD IDENTIFIER
                         </Typography>
                       </Th>
-                      <Th style={{ minWidth: 180 }}>
+                      <Th style={{ minWidth: 165 }}>
+                        <Typography variant="sigma" textColor="neutral600">
+                          ATTRIBUTE / BLOCK
+                        </Typography>
+                      </Th>
+                      <Th style={{ minWidth: 170 }}>
                         <Typography variant="sigma" textColor="neutral600">
                           CURRENT VALUE (BEFORE)
                         </Typography>
                       </Th>
-                      <Th style={{ minWidth: 180 }}>
+                      <Th style={{ minWidth: 170 }}>
                         <Typography variant="sigma" textColor="neutral600">
                           NEW VALUE (AFTER)
                         </Typography>
                       </Th>
-                      <Th style={{ width: 140, textAlign: 'right' }}>
+                      <Th style={{ width: 150, textAlign: 'right' }}>
                         <Typography variant="sigma" textColor="neutral600">
                           IMPACT
                         </Typography>
@@ -369,15 +436,15 @@ const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
                   <Tbody>
                     {filteredDiffs.length === 0 ? (
                       <Tr>
-                        <Td colSpan={5} style={{ textAlign: 'center', padding: '24px' }}>
+                        <Td colSpan={6} style={{ textAlign: 'center', padding: '24px' }}>
                           <Typography textColor="neutral600">
                             No records match the current filter or search criteria.
                           </Typography>
                         </Td>
                       </Tr>
                     ) : (
-                      filteredDiffs.map((diff) => (
-                        <Tr key={`${diff.uid}-${diff.documentId}`}>
+                      filteredDiffs.map((diff, idx) => (
+                        <Tr key={`${diff.uid}-${diff.documentId}-${diff.attribute || 'root'}-${idx}`}>
                           <Td>
                             <Badge backgroundColor="neutral150" textColor="neutral700">
                               {diff.collectionName}
@@ -394,6 +461,11 @@ const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
                             </Box>
                           </Td>
                           <Td>
+                            <Typography variant="pi" fontWeight="semiBold" textColor="primary700">
+                              {diff.attribute || attribute}
+                            </Typography>
+                          </Td>
+                          <Td>
                             <Typography
                               variant="omega"
                               style={{
@@ -406,7 +478,11 @@ const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
                             </Typography>
                           </Td>
                           <Td>
-                            {diff.status === 'will_skip' ? (
+                            {diff.status === 'will_error' ? (
+                              <Typography variant="pi" textColor="danger700" fontWeight="bold">
+                                {diff.validationError || diff.message}
+                              </Typography>
+                            ) : diff.status === 'will_skip' ? (
                               <Typography variant="pi" textColor="warning700">
                                 — Skipped (field absent) —
                               </Typography>
@@ -434,6 +510,11 @@ const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
                             {diff.status === 'will_skip' && (
                               <Badge backgroundColor="warning100" textColor="warning700">
                                 ⚠ Will Skip
+                              </Badge>
+                            )}
+                            {diff.status === 'will_error' && (
+                              <Badge backgroundColor="danger100" textColor="danger700">
+                                ✕ Error
                               </Badge>
                             )}
                           </Td>
@@ -469,7 +550,7 @@ const BulkUpdatePreviewModal: React.FC<BulkUpdatePreviewModalProps> = ({
                 onClose();
                 onProceed();
               }}
-              disabled={loading || !previewData || previewData.summary.total === 0}
+              disabled={loading || !previewData || previewData.summary.total === 0 || (isGridMode && previewData.summary.willUpdate === 0)}
             >
               Proceed to Execute ({previewData?.summary.willUpdate || 0} updates)
             </Button>

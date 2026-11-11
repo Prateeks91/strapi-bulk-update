@@ -64,6 +64,18 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     }
   },
 
+  async getMediaOptions(ctx: any) {
+    try {
+      const { search } = ctx.query;
+      const service = strapi.plugin('bulk-updater').service('bulkUpdater');
+      const data = await service.getMediaOptions(search ? String(search) : undefined);
+      ctx.body = { success: true, ...data };
+    } catch (err: any) {
+      ctx.status = 500;
+      ctx.body = { success: false, error: err.message };
+    }
+  },
+
   async batchUpdate(ctx: any) {
     try {
       const service = strapi.plugin('bulk-updater').service('bulkUpdater');

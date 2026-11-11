@@ -28,6 +28,16 @@ import CsvManagerTab from './CsvManagerTab';
 import ProcessingDashboardModal from '../components/ProcessingDashboardModal';
 import BulkUpdatePreviewModal from '../components/BulkUpdatePreviewModal';
 import CheckerReviewModal from '../components/CheckerReviewModal';
+import { GridCellEditor, ComponentOccurrencesDrawer } from '../components/GridCellEditor';
+import {
+  AttributeMetaRich,
+  EnumeratedClientOccurrence,
+  GridEditsState,
+  GridRecordEdits,
+  ValidationRuleMeta,
+  enumerateClientOccurrences,
+  serializeGridTargets,
+} from '../utils/gridEdit';
 import { isAbortError } from '../utils/isAbortError';
 import { getEntryLifecycleStatus } from '../utils/lifecycleStatus';
 export { getEntryLifecycleStatus } from '../utils/lifecycleStatus';
@@ -58,7 +68,7 @@ interface CollectionModel {
   pluralName: string;
   displayName: string;
   attributes: string[];
-  attributesMeta?: Record<string, { depth: number; type: string; component?: string; isRelation?: boolean }>;
+  attributesMeta?: Record<string, AttributeMetaRich>;
   relations?: Record<string, RelationMeta>;
   totalEntries?: number;
   entries: Entry[];
@@ -127,6 +137,7 @@ interface PendingBatch {
   createdBy: { id?: string | number; email?: string; firstname?: string; lastname?: string; username?: string };
   payload: {
     action?: string;
+    editMode?: 'common' | 'grid';
     attribute: string;
     value: string;
     selectedEntries?: Array<{ uid: string; documentId: string; dynamicZoneIndexes?: number[] }>;
@@ -760,6 +771,18 @@ export function formatDisplayValue(val: any): string {
  * Flat helper: Renders a single cell content using clean early returns.
  * Zero deep nesting.
  */
+interface GridCellRenderContext {
+  gridEditMode: boolean;
+  selectedAttrMeta?: AttributeMetaRich;
+  recordEdits?: any;
+  relationOptions?: Array<{ documentId: string; label: string }>;
+  relationOptionsLoading?: boolean;
+  relationIsMulti?: boolean;
+  validationRules?: ValidationRuleMeta[];
+  onCommitEdit: (entry: Entry, colUid: string, occ: EnumeratedClientOccurrence, val: any, error: string | null) => void;
+  onResetEdit: (colUid: string, documentId: string, occKey: string) => void;
+}
+
 function renderCellContent(
   colDef: ColumnDef,
   entry: Entry,
@@ -773,7 +796,8 @@ function renderCellContent(
   pendingBatches: PendingBatch[] = [],
   isDzExpanded = false,
   onToggleExpandDz?: () => void,
-  filterQuery = ''
+  filterQuery = '',
+  gridCtx?: GridCellRenderContext
 ): React.ReactNode {
   switch (colDef.key) {
     case 'select':
@@ -789,7 +813,18 @@ function renderCellContent(
       const dzField = Object.keys(entry).find(
         (k) => Array.isArray(entry[k]) && entry[k].length > 0 && entry[k].some((item: any) => item && item.__component)
       );
-      const dzItemsCount = dzField ? entry[dzField].length : 0;
+      const selectedRootKey = selectedAttribute ? selectedAttribute.split('[')[0].split('.')[0] : '';
+      const repeatableRoot =
+        !dzField &&
+        gridCtx?.gridEditMode &&
+        selectedRootKey &&
+        gridCtx?.selectedAttrMeta?.rootRepeatable &&
+        Array.isArray(entry[selectedRootKey]) &&
+        entry[selectedRootKey].length > 0
+          ? selectedRootKey
+          : undefined;
+      const expandField = dzField || repeatableRoot;
+      const dzItemsCount = expandField ? entry[expandField].length : 0;
 
       return (
         <Box>
@@ -815,8 +850,8 @@ function renderCellContent(
                 }}
               >
                 {isDzExpanded
-                  ? `▲ Hide ${dzField} (${dzItemsCount} blocks)`
-                  : `▼ View ${dzField} (${dzItemsCount} blocks)`}
+                  ? `▲ Hide ${expandField} (${dzItemsCount} ${dzField ? 'blocks' : 'items'})`
+                  : `▼ ${gridCtx?.gridEditMode ? 'Edit' : 'View'} ${expandField} (${dzItemsCount} ${dzField ? 'blocks' : 'items'})`}
               </Button>
             </Box>
           )}
@@ -896,6 +931,107 @@ function renderCellContent(
     }
 
     case 'target_attr': {
+      if (gridCtx?.gridEditMode) {
+        if (selectedAttribute && !hasAttr) {
+          return (
+            <Badge backgroundColor="neutral200" textColor="neutral600">
+              Ignored (absent in schema)
+            </Badge>
+          );
+        }
+
+        const occs = enumerateClientOccurrences(
+          entry,
+          selectedAttribute,
+          col?.attributes,
+          gridCtx.selectedAttrMeta
+        );
+
+        if (occs.length === 0) {
+          return (
+            <Typography variant="pi" textColor="neutral500" style={{ fontStyle: 'italic' }}>
+              (no applicable block / item)
+            </Typography>
+          );
+        }
+
+        if (occs.length === 1 && !occs[0].segments.some((s) => s.index !== undefined)) {
+          const occ = occs[0];
+          const editObj = gridCtx.recordEdits?.occurrences?.[occ.occurrenceKey];
+          return (
+            <GridCellEditor
+              entry={entry}
+              attribute={selectedAttribute}
+              occurrence={occ}
+              attrMeta={gridCtx.selectedAttrMeta}
+              editedValue={editObj?.value}
+              isDirty={Boolean(editObj)}
+              validationError={editObj?.validationError}
+              relationOptions={gridCtx.relationOptions}
+              relationOptionsLoading={gridCtx.relationOptionsLoading}
+              relationIsMulti={gridCtx.relationIsMulti}
+              validationRules={gridCtx.validationRules}
+              recordEdits={gridCtx.recordEdits}
+              colAttributes={col?.attributes}
+              onCommit={(o, val, err) => gridCtx.onCommitEdit(entry, col.uid, o, val, err)}
+              onReset={(k) => gridCtx.onResetEdit(col.uid, entry.documentId, k)}
+            />
+          );
+        }
+
+        const maxInline = 3;
+        const visibleOccs = occs.slice(0, maxInline);
+        return (
+          <Flex direction="column" gap={2} alignItems="flex-start">
+            {visibleOccs.map((occ) => {
+              const editObj = gridCtx.recordEdits?.occurrences?.[occ.occurrenceKey];
+              return (
+                <Box key={occ.occurrenceKey} style={{ width: '100%' }}>
+                  <Flex gap={1} alignItems="center" marginBottom={1}>
+                    <Badge size="S" backgroundColor={editObj ? 'primary100' : 'neutral200'} textColor={editObj ? 'primary700' : 'neutral800'}>
+                      #{occ.index} {occ.componentName || 'Item'}
+                    </Badge>
+                    {occ.componentId !== undefined && (
+                      <Typography variant="pi" textColor="neutral500" style={{ fontSize: '0.68rem' }}>
+                        id:{occ.componentId}
+                      </Typography>
+                    )}
+                    {editObj && (
+                      <Badge size="S" backgroundColor="secondary100" textColor="secondary700">
+                        Edited
+                      </Badge>
+                    )}
+                  </Flex>
+                  <GridCellEditor
+                    compact
+                    entry={entry}
+                    attribute={selectedAttribute}
+                    occurrence={occ}
+                    attrMeta={gridCtx.selectedAttrMeta}
+                    editedValue={editObj?.value}
+                    isDirty={Boolean(editObj)}
+                    validationError={editObj?.validationError}
+                    relationOptions={gridCtx.relationOptions}
+                    relationOptionsLoading={gridCtx.relationOptionsLoading}
+                    relationIsMulti={gridCtx.relationIsMulti}
+                    validationRules={gridCtx.validationRules}
+                    recordEdits={gridCtx.recordEdits}
+                    colAttributes={col?.attributes}
+                    onCommit={(o, val, err) => gridCtx.onCommitEdit(entry, col.uid, o, val, err)}
+                    onReset={(k) => gridCtx.onResetEdit(col.uid, entry.documentId, k)}
+                  />
+                </Box>
+              );
+            })}
+            {occs.length > maxInline && onToggleExpandDz && (
+              <Button variant="tertiary" size="S" onClick={onToggleExpandDz}>
+                {isDzExpanded ? `▲ Collapse drawer` : `▼ Edit all ${occs.length} occurrences in drawer`}
+              </Button>
+            )}
+          </Flex>
+        );
+      }
+
       const matches = getAllNestedValues(entry, selectedAttribute, col?.attributes);
       if (matches.length === 0) {
         return (
@@ -1144,7 +1280,13 @@ const BulkUpdater: React.FC = () => {
   // Search Attribute (separate from update attribute)
   const [searchAttribute, setSearchAttribute] = useState<string>('');
   const [searchAttributeInput, setSearchAttributeInput] = useState<string>('');
-  const [attributesMeta, setAttributesMeta] = useState<Record<string, { depth: number; type: string; component?: string; isRelation?: boolean }>>({});
+  const [attributesMeta, setAttributesMeta] = useState<Record<string, AttributeMetaRich>>({});
+
+  // Optional Grid Editing Mode state
+  const [gridEditMode, setGridEditMode] = useState<boolean>(false);
+  const [gridEdits, setGridEdits] = useState<GridEditsState>({});
+  const [gridFilterModifiedOnly, setGridFilterModifiedOnly] = useState<boolean>(false);
+  const [validationRules, setValidationRules] = useState<ValidationRuleMeta[]>([]);
 
   const effectiveSearchAttribute = searchAttribute || selectedAttribute;
 
@@ -1532,10 +1674,22 @@ const BulkUpdater: React.FC = () => {
     }
   };
 
+  const fetchValidationRules = async () => {
+    try {
+      const res = await get('/bulk-updater/validation-rules');
+      if (res.data?.success && Array.isArray(res.data.rules)) {
+        setValidationRules(res.data.rules);
+      }
+    } catch {
+      // Ignore gracefully if validation rules are unconfigured
+    }
+  };
+
   useEffect(() => {
     fetchModels();
     fetchAuditHistory();
     fetchPendingBatches();
+    fetchValidationRules();
   }, []);
 
   useEffect(() => {
@@ -1562,7 +1716,18 @@ const BulkUpdater: React.FC = () => {
           Boolean(useRegex && regexPattern.trim());
 
         if (isFilterActiveNow) {
-          setSelectedEntries({});
+          if (gridEditMode) {
+            // Preserve selection for rows that already contain unsaved grid edits across filters/pages
+            setSelectedEntries((prev) => {
+              const retained: Record<string, boolean> = {};
+              Object.keys(gridEdits).forEach((k) => {
+                if (prev[k]) retained[k] = true;
+              });
+              return retained;
+            });
+          } else {
+            setSelectedEntries({});
+          }
         }
 
         loadCollectionPage(
@@ -1590,12 +1755,141 @@ const BulkUpdater: React.FC = () => {
     return collections.find((c) => c.uid === selectedCollectionUid) || null;
   }, [collections, selectedCollectionUid]);
 
+  const activeAttrMeta = useMemo<AttributeMetaRich | undefined>(() => {
+    if (!selectedAttribute) return undefined;
+    const base = selectedCol?.attributesMeta?.[selectedAttribute] || attributesMeta[selectedAttribute];
+    const relMeta = selectedCol?.relations?.[selectedAttribute] || relationsMeta[selectedAttribute];
+    if (!base && !relMeta) return undefined;
+    if (relMeta && (!base || !base.isRelation)) {
+      return {
+        ...(base || { depth: 0, type: 'relation' }),
+        isRelation: true,
+        relationType: relMeta.relationType,
+        target: relMeta.targetUid,
+      };
+    }
+    return base;
+  }, [selectedAttribute, selectedCol, attributesMeta, relationsMeta]);
+
+  const totalDirtyRecordsCount = useMemo(() => Object.keys(gridEdits).length, [gridEdits]);
+  const totalDirtyCellsCount = useMemo(
+    () =>
+      (Object.values(gridEdits) as GridRecordEdits[]).reduce<number>(
+        (sum: number, rec: GridRecordEdits) => sum + Object.keys(rec.occurrences || {}).length,
+        0
+      ),
+    [gridEdits]
+  );
+
+  const gridSerialized = useMemo(
+    () => serializeGridTargets(gridEdits, selectedEntries, collectionPages, activeAttrMeta),
+    [gridEdits, selectedEntries, collectionPages, activeAttrMeta]
+  );
+
+  const handleGridCellCommit = React.useCallback(
+    (entry: Entry, colUid: string, occ: EnumeratedClientOccurrence, newValue: any, validationError: string | null) => {
+      const key = `${colUid}${KEY_SEP}${entry.documentId}`;
+      const recordLabel = entry.name || entry.title || entry.email || `Entry #${entry.id || entry.documentId}`;
+      setGridEdits((prev) => {
+        const existingRec = prev[key] || {
+          uid: colUid,
+          documentId: entry.documentId,
+          locale: entry.locale,
+          status: entry.status,
+          publishedAt: entry.publishedAt,
+          recordLabel,
+          occurrences: {},
+        };
+        return {
+          ...prev,
+          [key]: {
+            ...existingRec,
+            occurrences: {
+              ...existingRec.occurrences,
+              [occ.occurrenceKey]: {
+                occurrenceKey: occ.occurrenceKey,
+                displayPath: occ.displayPath,
+                segments: occ.segments,
+                originalValue: occ.value,
+                value: newValue,
+                fieldType: activeAttrMeta?.type || 'string',
+                validationError,
+                touchedAt: Date.now(),
+              },
+            },
+          },
+        };
+      });
+      setSelectedEntries((prev) => (prev[key] ? prev : { ...prev, [key]: true }));
+    },
+    [activeAttrMeta?.type]
+  );
+
+  const handleGridCellReset = React.useCallback((colUid: string, documentId: string, occKey: string) => {
+    const key = `${colUid}${KEY_SEP}${documentId}`;
+    setGridEdits((prev) => {
+      const existingRec = prev[key];
+      if (!existingRec) return prev;
+      const nextOccs = { ...existingRec.occurrences };
+      delete nextOccs[occKey];
+      if (Object.keys(nextOccs).length === 0) {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      }
+      return {
+        ...prev,
+        [key]: {
+          ...existingRec,
+          occurrences: nextOccs,
+        },
+      };
+    });
+  }, []);
+
+  const handleToggleGridEditMode = (checked: boolean) => {
+    if (!checked && totalDirtyCellsCount > 0) {
+      if (!window.confirm(`Disable Grid Editing Mode and discard ${totalDirtyCellsCount} unsaved edit(s)?`)) {
+        return;
+      }
+      setGridEdits({});
+    }
+    setGridEditMode(checked);
+    setGridFilterModifiedOnly(false);
+    if (checked) {
+      // Regex Replace is mutually exclusive with per-cell manual Grid Editing
+      if (useRegex) setUseRegex(false);
+      setRegexPattern('');
+      if (selectedCollectionUid) {
+        setCollectionColumnVisibility((prev) => {
+          const existing = prev[selectedCollectionUid];
+          if (existing && !existing.includes('target_attr')) {
+            return { ...prev, [selectedCollectionUid]: [...existing, 'target_attr'] };
+          }
+          return prev;
+        });
+      }
+    }
+  };
+
   const handleCollectionChange = (newUid: string) => {
     if (newUid === selectedCollectionUid) return;
+    if (totalDirtyCellsCount > 0) {
+      if (
+        !window.confirm(
+          `You have ${totalDirtyCellsCount} unsaved Grid Edit(s) in the current collection. Switching collections will discard them. Continue?`
+        )
+      ) {
+        return;
+      }
+    }
     if (abortControllersRef.current) {
-      Object.values(abortControllersRef.current).forEach((ctrl) => ctrl.abort());
+      Object.values(abortControllersRef.current).forEach((ctrl) => (ctrl as AbortController)?.abort());
     }
     setSelectedCollectionUid(newUid);
+    setGridEdits({});
+    setSelectedDzBlocks({});
+    setExpandedDzEntries({});
     try {
       if (newUid) {
         localStorage.setItem(LAST_COLLECTION_KEY, newUid);
@@ -1634,6 +1928,16 @@ const BulkUpdater: React.FC = () => {
   // Handle attribute selection change: updates selectedAttribute without clearing search/filters/selected entries
   const handleAttributeChange = (newAttr: string) => {
     if (newAttr !== selectedAttribute) {
+      if (totalDirtyCellsCount > 0) {
+        if (
+          !window.confirm(
+            `You have ${totalDirtyCellsCount} unsaved Grid Edit(s) for "${selectedAttribute}". Switching Target Attribute will discard them. Continue?`
+          )
+        ) {
+          return;
+        }
+      }
+      setGridEdits({});
       setSelectedAttribute(newAttr);
       try {
         if (newAttr) {
@@ -1659,7 +1963,9 @@ const BulkUpdater: React.FC = () => {
   }, [selectedCol]);
 
   const getAttrDepth = (attr: string): number =>
-    attributesMeta[attr]?.depth ?? (attr.includes('.') ? attr.split('.').length - 1 : 0);
+    selectedCol?.attributesMeta?.[attr]?.depth ??
+    attributesMeta[attr]?.depth ??
+    (attr.includes('.') ? attr.split('.').length - 1 : 0);
 
   const availableColAttributes = useMemo(() => {
     return selectedCol?.attributes || attributes || [];
@@ -1668,7 +1974,7 @@ const BulkUpdater: React.FC = () => {
   // Depth-filtered attributes based on user-configured componentDepth (1 to 5)
   const depthFilteredAttributes = useMemo(() => {
     return availableColAttributes.filter((attr) => getAttrDepth(attr) <= componentDepth);
-  }, [availableColAttributes, componentDepth, attributesMeta]);
+  }, [availableColAttributes, componentDepth, attributesMeta, selectedCol]);
 
   // Memoized Combobox options for Update Attribute
   const memoizedComboboxOptions = useMemo(() => {
@@ -1918,7 +2224,10 @@ const BulkUpdater: React.FC = () => {
 
   const getVisibleEntries = (col: CollectionModel) => {
     const pageState = collectionPages[col.uid];
-    const raw = pageState ? pageState.entries : (col.entries || []);
+    let raw = pageState ? pageState.entries : (col.entries || []);
+    if (gridEditMode && gridFilterModifiedOnly) {
+      raw = raw.filter((entry) => Boolean(gridEdits[`${col.uid}${KEY_SEP}${entry.documentId}`]));
+    }
     if (statusFilter === 'all') return raw;
     return raw.filter((entry) => {
       const lifecycle = getEntryLifecycleStatus(entry, col, pendingBatches);
@@ -1933,7 +2242,7 @@ const BulkUpdater: React.FC = () => {
       count += getVisibleEntries(col).length;
     });
     return count;
-  }, [filteredCollections, collectionPages, isFilterActive, statusFilter, pendingBatches]);
+  }, [filteredCollections, collectionPages, isFilterActive, statusFilter, pendingBatches, gridEditMode, gridFilterModifiedOnly, gridEdits]);
 
   const selectAllMatching = () => {
     const updated = { ...selectedEntries };
@@ -1964,7 +2273,17 @@ const BulkUpdater: React.FC = () => {
     setEntrySearch('');
     setStatusFilter('all');
     setRegexPattern('');
-    setSelectedEntries({});
+    if (gridEditMode) {
+      setSelectedEntries((prev) => {
+        const retained: Record<string, boolean> = {};
+        Object.keys(gridEdits).forEach((k) => {
+          if (prev[k]) retained[k] = true;
+        });
+        return retained;
+      });
+    } else {
+      setSelectedEntries({});
+    }
     collections.forEach((col) => {
       loadCollectionPage(col.uid, 1, undefined, undefined, undefined, 'none', '', '', false, '');
     });
@@ -2015,65 +2334,81 @@ const BulkUpdater: React.FC = () => {
     setSelectedEntries({});
   };
 
-  const getSelectedBreakdown = () => {
+  const getSelectedBreakdown = (onlyKeys?: string[]) => {
     const breakdown: Record<string, number> = {};
-    Object.keys(selectedEntries).forEach((key) => {
-      if (selectedEntries[key]) {
-        const parts = key.split(KEY_SEP);
-        if (parts.length === 2) {
-          const uid = parts[0];
-          const col = collections.find((c) => c.uid === uid);
-          const name = col?.displayName || uid;
-          breakdown[name] = (breakdown[name] || 0) + 1;
-        }
+    const keysToCount = onlyKeys || Object.keys(selectedEntries).filter((k) => selectedEntries[k]);
+    keysToCount.forEach((key) => {
+      const parts = key.split(KEY_SEP);
+      if (parts.length === 2) {
+        const uid = parts[0];
+        const col = collections.find((c) => c.uid === uid);
+        const name = col?.displayName || uid;
+        breakdown[name] = (breakdown[name] || 0) + 1;
       }
     });
     return breakdown;
   };
 
+  const computeLifecycleStatsForKeys = React.useCallback(
+    (keys: string[]) => {
+      let published = 0;
+      let modified = 0;
+      let draft = 0;
+      let pendingReview = 0;
+      let unknown = 0;
+
+      keys.forEach((key) => {
+        const parts = key.split(KEY_SEP);
+        if (parts.length !== 2) return;
+        const [uid, docId] = parts;
+        const col = collections.find((c) => c.uid === uid) || null;
+        const entry =
+          collectionPages[uid]?.entries?.find((e: Entry) => e.documentId === docId || String(e.id) === docId) ||
+          col?.entries?.find((e: Entry) => e.documentId === docId || String(e.id) === docId);
+
+        if (col && col.draftAndPublish === false) {
+          published++;
+        } else if (entry) {
+          const { status } = getEntryLifecycleStatus(entry, col, pendingBatches);
+          if (status === 'published') published++;
+          else if (status === 'modified') modified++;
+          else if (status === 'draft') draft++;
+          else if (status === 'pending_review') pendingReview++;
+          else unknown++;
+        } else {
+          draft++;
+        }
+      });
+
+      const unreviewedCount = draft + modified + pendingReview + unknown;
+      return {
+        published,
+        modified,
+        draft,
+        pendingReview,
+        unknown,
+        unreviewedCount,
+        total: published + modified + draft + pendingReview + unknown,
+      };
+    },
+    [collections, collectionPages, pendingBatches]
+  );
+
   // Lifecycle status breakdown across selected entries
-  const selectedLifecycleStats = useMemo(() => {
-    let published = 0;
-    let modified = 0;
-    let draft = 0;
-    let pendingReview = 0;
-    let unknown = 0;
+  const selectedLifecycleStats = useMemo(
+    () => computeLifecycleStatsForKeys(Object.keys(selectedEntries).filter((k) => selectedEntries[k])),
+    [selectedEntries, computeLifecycleStatsForKeys]
+  );
 
-    Object.keys(selectedEntries).forEach((key) => {
-      if (!selectedEntries[key]) return;
-      const parts = key.split(KEY_SEP);
-      if (parts.length !== 2) return;
-      const [uid, docId] = parts;
-      const col = collections.find((c) => c.uid === uid) || null;
-      const entry =
-        collectionPages[uid]?.entries?.find((e: Entry) => e.documentId === docId || String(e.id) === docId) ||
-        col?.entries?.find((e: Entry) => e.documentId === docId || String(e.id) === docId);
+  const gridTargetKeys = useMemo(
+    () => gridSerialized.targets.map((t) => `${t.uid}${KEY_SEP}${t.documentId}`),
+    [gridSerialized]
+  );
 
-      if (col && col.draftAndPublish === false) {
-        published++;
-      } else if (entry) {
-        const { status } = getEntryLifecycleStatus(entry, col, pendingBatches);
-        if (status === 'published') published++;
-        else if (status === 'modified') modified++;
-        else if (status === 'draft') draft++;
-        else if (status === 'pending_review') pendingReview++;
-        else unknown++;
-      } else {
-        draft++;
-      }
-    });
-
-    const unreviewedCount = draft + modified + pendingReview + unknown;
-    return {
-      published,
-      modified,
-      draft,
-      pendingReview,
-      unknown,
-      unreviewedCount,
-      total: published + modified + draft + pendingReview + unknown,
-    };
-  }, [selectedEntries, collections, collectionPages, pendingBatches]);
+  const updateModalLifecycleStats = useMemo(
+    () => (gridEditMode ? computeLifecycleStatsForKeys(gridTargetKeys) : selectedLifecycleStats),
+    [gridEditMode, gridTargetKeys, computeLifecycleStatsForKeys, selectedLifecycleStats]
+  );
 
   // Open Confirmation Modal
   const handleOpenConfirmModal = () => {
@@ -2085,13 +2420,30 @@ const BulkUpdater: React.FC = () => {
       return;
     }
 
-    const totalSelected = Object.values(selectedEntries).filter(Boolean).length;
-    if (totalSelected === 0) {
-      toggleNotification({
-        type: 'warning',
-        message: 'Please select at least one collection type or entry to update',
-      });
-      return;
+    if (gridEditMode) {
+      if (gridSerialized.targets.length === 0) {
+        toggleNotification({
+          type: 'warning',
+          message: 'Please edit at least one selected cell or block in the grid before updating',
+        });
+        return;
+      }
+      if (gridSerialized.hasValidationErrors) {
+        toggleNotification({
+          type: 'danger',
+          message: 'Please resolve inline validation errors highlighted in red before updating',
+        });
+        return;
+      }
+    } else {
+      const totalSelected = Object.values(selectedEntries).filter(Boolean).length;
+      if (totalSelected === 0) {
+        toggleNotification({
+          type: 'warning',
+          message: 'Please select at least one collection type or entry to update',
+        });
+        return;
+      }
     }
 
     setPublishStrategy('safe');
@@ -2109,35 +2461,53 @@ const BulkUpdater: React.FC = () => {
       return;
     }
 
-    const targets: Array<{ uid: string; documentId: string; dynamicZoneIndexes?: number[] }> = [];
-    Object.keys(selectedEntries).forEach((key) => {
-      if (selectedEntries[key]) {
-        const parts = key.split(KEY_SEP);
-        if (parts.length === 2) {
-          const colUid = parts[0];
-          const docId = parts[1];
-          const targetObj: any = { uid: colUid, documentId: docId };
-          if (selectedDzBlocks[key] && selectedDzBlocks[key].length > 0) {
-            targetObj.dynamicZoneIndexes = selectedDzBlocks[key];
-          }
-          const colPage = collectionPages[colUid];
-          const cachedEntry = colPage?.entries?.find((e: any) => e.documentId === docId);
-          if (cachedEntry) {
-            if (cachedEntry.status) targetObj.status = cachedEntry.status;
-            if (cachedEntry.publishedAt) targetObj.publishedAt = cachedEntry.publishedAt;
-            if (cachedEntry.locale) targetObj.locale = cachedEntry.locale;
-          }
-          targets.push(targetObj);
-        }
+    let targets: any[] = [];
+    if (gridEditMode) {
+      if (gridSerialized.hasValidationErrors) {
+        toggleNotification({
+          type: 'danger',
+          message: 'Please fix inline validation errors before previewing changes',
+        });
+        return;
       }
-    });
-
-    if (targets.length === 0) {
-      toggleNotification({
-        type: 'warning',
-        message: 'Please select at least one collection type or entry to preview',
+      targets = gridSerialized.targets;
+      if (targets.length === 0) {
+        toggleNotification({
+          type: 'warning',
+          message: 'Please modify and select at least one grid cell or block to preview',
+        });
+        return;
+      }
+    } else {
+      Object.keys(selectedEntries).forEach((key) => {
+        if (selectedEntries[key]) {
+          const parts = key.split(KEY_SEP);
+          if (parts.length === 2) {
+            const colUid = parts[0];
+            const docId = parts[1];
+            const targetObj: any = { uid: colUid, documentId: docId };
+            if (selectedDzBlocks[key] && selectedDzBlocks[key].length > 0) {
+              targetObj.dynamicZoneIndexes = selectedDzBlocks[key];
+            }
+            const colPage = collectionPages[colUid];
+            const cachedEntry = colPage?.entries?.find((e: any) => e.documentId === docId);
+            if (cachedEntry) {
+              if (cachedEntry.status) targetObj.status = cachedEntry.status;
+              if (cachedEntry.publishedAt) targetObj.publishedAt = cachedEntry.publishedAt;
+              if (cachedEntry.locale) targetObj.locale = cachedEntry.locale;
+            }
+            targets.push(targetObj);
+          }
+        }
       });
-      return;
+
+      if (targets.length === 0) {
+        toggleNotification({
+          type: 'warning',
+          message: 'Please select at least one collection type or entry to preview',
+        });
+        return;
+      }
     }
 
     setShowPreviewModal(true);
@@ -2146,10 +2516,11 @@ const BulkUpdater: React.FC = () => {
     try {
       const res = await post('/bulk-updater/preview', {
         attribute: selectedAttribute,
-        value: attributeValue,
+        value: gridEditMode ? '' : attributeValue,
+        editMode: gridEditMode ? 'grid' : 'common',
         selectedEntries: targets,
-        isRegex: useRegex,
-        regexPattern,
+        isRegex: gridEditMode ? false : useRegex,
+        regexPattern: gridEditMode ? '' : regexPattern,
         publishOnApproval,
       });
 
@@ -2176,28 +2547,36 @@ const BulkUpdater: React.FC = () => {
     executionMode: 'immediate' | 'queue_offpeak' | 'maker_checker',
     forceImmediate = false
   ) => {
-    const targets: Array<{ uid: string; documentId: string; dynamicZoneIndexes?: number[] }> = [];
-    Object.keys(selectedEntries).forEach((key) => {
-      if (selectedEntries[key]) {
-        const parts = key.split(KEY_SEP);
-        if (parts.length === 2) {
-          const colUid = parts[0];
-          const docId = parts[1];
-          const targetObj: any = { uid: colUid, documentId: docId };
-          if (selectedDzBlocks[key] && selectedDzBlocks[key].length > 0) {
-            targetObj.dynamicZoneIndexes = selectedDzBlocks[key];
+    let targets: any[] = [];
+    if (gridEditMode) {
+      targets = gridSerialized.targets;
+    } else {
+      Object.keys(selectedEntries).forEach((key) => {
+        if (selectedEntries[key]) {
+          const parts = key.split(KEY_SEP);
+          if (parts.length === 2) {
+            const colUid = parts[0];
+            const docId = parts[1];
+            const targetObj: any = { uid: colUid, documentId: docId };
+            if (selectedDzBlocks[key] && selectedDzBlocks[key].length > 0) {
+              targetObj.dynamicZoneIndexes = selectedDzBlocks[key];
+            }
+            const colPage = collectionPages[colUid];
+            const cachedEntry = colPage?.entries?.find((e: any) => e.documentId === docId);
+            if (cachedEntry) {
+              if (cachedEntry.status) targetObj.status = cachedEntry.status;
+              if (cachedEntry.publishedAt) targetObj.publishedAt = cachedEntry.publishedAt;
+              if (cachedEntry.locale) targetObj.locale = cachedEntry.locale;
+            }
+            targets.push(targetObj);
           }
-          const colPage = collectionPages[colUid];
-          const cachedEntry = colPage?.entries?.find((e: any) => e.documentId === docId);
-          if (cachedEntry) {
-            if (cachedEntry.status) targetObj.status = cachedEntry.status;
-            if (cachedEntry.publishedAt) targetObj.publishedAt = cachedEntry.publishedAt;
-            if (cachedEntry.locale) targetObj.locale = cachedEntry.locale;
-          }
-          targets.push(targetObj);
         }
-      }
-    });
+      });
+    }
+
+    const displaySummaryVal = gridEditMode
+      ? `Grid Editing (${gridSerialized.totalEditCount} edits across ${targets.length} records)`
+      : attributeValue;
 
     try {
       setUpdating(true);
@@ -2215,7 +2594,7 @@ const BulkUpdater: React.FC = () => {
         status: 'processing',
         executionMode,
         attribute: selectedAttribute,
-        value: attributeValue,
+        value: displaySummaryVal,
         totalTargets: targets.length,
         processedCount: 0,
         updatedCount: 0,
@@ -2231,10 +2610,11 @@ const BulkUpdater: React.FC = () => {
 
       const payload = {
         attribute: selectedAttribute,
-        value: attributeValue,
+        value: gridEditMode ? '' : attributeValue,
+        editMode: gridEditMode ? 'grid' : 'common',
         selectedEntries: targets,
-        isRegex: useRegex,
-        regexPattern: regexPattern,
+        isRegex: gridEditMode ? false : useRegex,
+        regexPattern: gridEditMode ? '' : regexPattern,
         executionMode,
         makerNotes: makerNotesInput,
         forceImmediate,
@@ -2249,12 +2629,14 @@ const BulkUpdater: React.FC = () => {
       setIsSubmittingBatch(false);
 
       if (res.data && res.data.success) {
-        setSelectedEntries({});
-        setSelectedDzBlocks({});
         const finalBatchId = res.data.batchId;
         setDashboardBatchId(finalBatchId);
 
         if (res.data.pending) {
+          setSelectedEntries({});
+          setSelectedDzBlocks({});
+          if (gridEditMode) setGridEdits({});
+
           setDashboardJob({
             id: finalBatchId,
             createdAt: new Date().toISOString(),
@@ -2262,7 +2644,7 @@ const BulkUpdater: React.FC = () => {
             executionMode,
             scheduledFor: res.data.scheduledFor,
             attribute: selectedAttribute,
-            value: attributeValue,
+            value: displaySummaryVal,
             totalTargets: targets.length,
             processedCount: 0,
             updatedCount: 0,
@@ -2281,7 +2663,34 @@ const BulkUpdater: React.FC = () => {
           });
           await fetchPendingBatches();
         } else {
-          setLastResults(res.data.results || []);
+          const resultList: any[] = res.data.results || [];
+          if (gridEditMode) {
+            const failedKeys = new Set<string>(
+              resultList
+                .filter((r) => r.status === 'error' && r.uid && r.documentId)
+                .map((r) => `${r.uid}${KEY_SEP}${r.documentId}`)
+            );
+            setGridEdits((prev) => {
+              const next: GridEditsState = {};
+              for (const k of Object.keys(prev)) {
+                if (failedKeys.has(k)) next[k] = prev[k];
+              }
+              return next;
+            });
+            setSelectedEntries((prev) => {
+              const next: Record<string, boolean> = {};
+              for (const k of Object.keys(prev)) {
+                if (failedKeys.has(k) && prev[k]) next[k] = true;
+              }
+              return next;
+            });
+            setSelectedDzBlocks({});
+          } else {
+            setSelectedEntries({});
+            setSelectedDzBlocks({});
+          }
+
+          setLastResults(resultList);
           setUpdateSummary({
             updatedCount: res.data.updatedCount || 0,
             skippedCount: res.data.skippedCount || 0,
@@ -2295,15 +2704,15 @@ const BulkUpdater: React.FC = () => {
             status: res.data.status || 'successful',
             executionMode: 'immediate',
             attribute: selectedAttribute,
-            value: attributeValue,
+            value: res.data.value || displaySummaryVal,
             totalTargets: res.data.totalTargets || targets.length,
-            processedCount: res.data.results?.length || targets.length,
+            processedCount: resultList.length || targets.length,
             updatedCount: res.data.updatedCount || 0,
             skippedCount: res.data.skippedCount || 0,
             failedCount: res.data.failedCount || 0,
             isLive: res.data.isLive !== false && (res.data.updatedCount > 0),
             publishOnApproval,
-            results: res.data.results || [],
+            results: resultList,
           });
 
           toggleNotification({
@@ -3265,16 +3674,17 @@ const BulkUpdater: React.FC = () => {
                     <Flex gap={2} alignItems="center">
                       <Checkbox
                         checked={useRegex}
+                        disabled={gridEditMode}
                         onCheckedChange={(checked: boolean) => setUseRegex(Boolean(checked))}
                       >
                         <Typography fontWeight="bold">Enable Regex Search &amp; Replace</Typography>
                       </Checkbox>
                       <Badge
-                        backgroundColor={useRegex ? 'secondary100' : 'neutral200'}
-                        textColor={useRegex ? 'secondary700' : 'neutral600'}
+                        backgroundColor={gridEditMode ? 'neutral200' : useRegex ? 'secondary100' : 'neutral200'}
+                        textColor={gridEditMode ? 'neutral600' : useRegex ? 'secondary700' : 'neutral600'}
                         size="S"
                       >
-                        {useRegex ? 'REGEX SEARCH ACTIVE' : 'REGEX OFF'}
+                        {gridEditMode ? 'DISABLED IN GRID EDIT' : useRegex ? 'REGEX SEARCH ACTIVE' : 'REGEX OFF'}
                       </Badge>
                     </Flex>
                     {useRegex && (
@@ -3730,6 +4140,72 @@ const BulkUpdater: React.FC = () => {
                       </Flex>
                     </Flex>
 
+                    {/* Inline Grid Editing Active Banner & Quick Controls */}
+                    {gridEditMode && (
+                      <Box
+                        padding={3}
+                        marginBottom={3}
+                        background="primary100"
+                        hasRadius
+                        style={{ border: '1px solid #d9d8ff' }}
+                      >
+                        <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={2}>
+                          <Flex gap={2} alignItems="center" wrap="wrap">
+                            <Badge backgroundColor="primary600" textColor="neutral0">
+                              GRID EDITING MODE
+                            </Badge>
+                            <Typography variant="pi" fontWeight="bold" textColor="primary700">
+                              {selectedAttribute
+                                ? `Editing "${selectedAttribute}" directly per record & component block`
+                                : 'Select an "Attribute to Update" below to enable inline cell editors'}
+                            </Typography>
+                            <Badge backgroundColor="neutral0" textColor="primary700">
+                              {totalDirtyCellsCount} edit{totalDirtyCellsCount === 1 ? '' : 's'} across {totalDirtyRecordsCount} record{totalDirtyRecordsCount === 1 ? '' : 's'}
+                            </Badge>
+                          </Flex>
+                          <Flex gap={2} alignItems="center" wrap="wrap">
+                            {(activeAttrMeta?.rootType === 'dynamiczone' || activeAttrMeta?.rootRepeatable) && visibleEntries.length > 0 && (
+                              <Button
+                                variant="secondary"
+                                size="S"
+                                onClick={() => {
+                                  const allVisibleKeys = visibleEntries.map((e) => `${col.uid}${KEY_SEP}${e.documentId}`);
+                                  const anyCollapsed = allVisibleKeys.some((k) => !expandedDzEntries[k]);
+                                  setExpandedDzEntries((prev) => {
+                                    const next = { ...prev };
+                                    allVisibleKeys.forEach((k) => {
+                                      next[k] = anyCollapsed;
+                                    });
+                                    return next;
+                                  });
+                                }}
+                              >
+                                {visibleEntries.some((e) => !expandedDzEntries[`${col.uid}${KEY_SEP}${e.documentId}`])
+                                  ? 'Expand All Blocks'
+                                  : 'Collapse All Blocks'}
+                              </Button>
+                            )}
+                            <Button
+                              variant={gridFilterModifiedOnly ? 'default' : 'tertiary'}
+                              size="S"
+                              onClick={() => setGridFilterModifiedOnly((v) => !v)}
+                              disabled={totalDirtyRecordsCount === 0 && !gridFilterModifiedOnly}
+                            >
+                              {gridFilterModifiedOnly ? 'Showing Modified Only' : 'Filter: Modified Only'}
+                            </Button>
+                            <Button
+                              variant="danger-light"
+                              size="S"
+                              disabled={totalDirtyCellsCount === 0}
+                              onClick={() => setGridEdits({})}
+                            >
+                              Discard All Edits
+                            </Button>
+                          </Flex>
+                        </Flex>
+                      </Box>
+                    )}
+
                     {/* Entries Table */}
                     <Box className="bulk-updater-table-container" style={{ width: '100%', maxWidth: '100%', minWidth: 0, overflowX: 'auto' }}>
                       <Table colCount={activeColumns.length} rowCount={visibleEntries.length + 1} style={{ width: '100%' }}>
@@ -3766,12 +4242,44 @@ const BulkUpdater: React.FC = () => {
                               const dzFields = Object.keys(entry).filter(
                                 (k) => Array.isArray(entry[k]) && entry[k].length > 0 && entry[k].some((item: any) => item && item.__component)
                               );
+                              const selectedRootKey = selectedAttribute ? selectedAttribute.split('[')[0].split('.')[0] : '';
+                              const expandableArrayFields =
+                                gridEditMode &&
+                                selectedRootKey &&
+                                activeAttrMeta?.rootRepeatable &&
+                                !dzFields.includes(selectedRootKey) &&
+                                Array.isArray(entry[selectedRootKey]) &&
+                                entry[selectedRootKey].length > 0
+                                  ? [...dzFields, selectedRootKey]
+                                  : dzFields;
+
+                              const recordEdits = gridEdits[key];
+                              const gridCtx: GridCellRenderContext | undefined = gridEditMode
+                                ? {
+                                    gridEditMode: true,
+                                    selectedAttrMeta: activeAttrMeta,
+                                    recordEdits,
+                                    relationOptions,
+                                    relationOptionsLoading,
+                                    relationIsMulti: Boolean(relationsMeta[selectedAttribute]?.isMulti),
+                                    validationRules,
+                                    onCommitEdit: handleGridCellCommit,
+                                    onResetEdit: handleGridCellReset,
+                                  }
+                                : undefined;
+
+                              const rowOccs =
+                                gridEditMode && isDzExpanded && selectedAttribute
+                                  ? enumerateClientOccurrences(entry, selectedAttribute, col?.attributes, activeAttrMeta)
+                                  : [];
 
                               return (
                                 <React.Fragment key={key}>
                                   <Tr
                                     style={{
-                                      backgroundColor: isSelected
+                                      backgroundColor: recordEdits
+                                        ? 'rgba(73, 69, 255, 0.10)'
+                                        : isSelected
                                         ? 'rgba(73, 69, 255, 0.14)'
                                         : isMatch
                                         ? 'rgba(46, 213, 115, 0.08)'
@@ -3798,119 +4306,50 @@ const BulkUpdater: React.FC = () => {
                                           pendingBatches,
                                           isDzExpanded,
                                           onToggleExpandDz,
-                                          filterQuery
+                                          filterQuery,
+                                          gridCtx
                                         )}
                                       </Td>
                                     ))}
                                   </Tr>
 
-                                  {/* Dynamic Zone Expandable Drawer Sub-Table */}
-                                  {isDzExpanded && dzFields.map((dzKey) => {
-                                    const blocks = entry[dzKey] || [];
-                                    const targetParsed = parseDynamicZonePath(selectedAttribute);
-                                    const isBlockApplicable = (blockItem: any) => {
-                                      if (!targetParsed.subPath) return true;
-                                      const scopedPath = `${dzKey}[${blockItem?.__component}].${targetParsed.subPath}`;
-                                      const componentSupports = (col?.attributes || attributes || []).includes(scopedPath);
-                                      return componentSupports || getNestedValue(blockItem, targetParsed.subPath) !== undefined;
-                                    };
-                                    const allApplicableIndexes = blocks
-                                      .map((_: any, i: number) => i)
-                                      .filter((i: number) => isBlockApplicable(blocks[i]));
+                                  {/* Dynamic Zone / Repeatable Component Expandable Drawer Sub-Table */}
+                                  {isDzExpanded && expandableArrayFields.map((dzKey) => {
+                                    const drawerOccurrences =
+                                      gridEditMode && selectedAttribute
+                                        ? rowOccs
+                                        : enumerateClientOccurrences(entry, selectedAttribute, col?.attributes, activeAttrMeta);
 
                                     return (
                                       <Tr key={`${key}-dz-${dzKey}`}>
-                                        <Td colSpan={activeColumns.length} style={{ padding: '12px 16px', backgroundColor: 'rgba(73, 69, 255, 0.02)', borderBottom: '2px solid rgba(73, 69, 255, 0.15)' }}>
-                                          <Box
-                                            padding={3}
-                                            background="neutral0"
-                                            hasRadius
-                                            style={{ border: '1px solid rgba(73, 69, 255, 0.25)', boxShadow: '0 2px 8px rgba(0,0,0,0.05)' }}
-                                          >
-                                            <Flex justifyContent="space-between" alignItems="center" marginBottom={2}>
-                                              <Flex gap={2} alignItems="center">
-                                                <Typography variant="sigma" textColor="primary700">
-                                                  DYNAMIC ZONE: &quot;{dzKey}&quot; ({blocks.length} blocks)
-                                                </Typography>
-                                                <Badge backgroundColor="primary100" textColor="primary700">
-                                                  Selective Block Targeting
-                                                </Badge>
-                                              </Flex>
-                                              <Typography variant="pi" textColor="neutral500">
-                                                Selectively choose which blocks to update for this entry
-                                              </Typography>
-                                            </Flex>
-
-                                            <Table colCount={5} rowCount={blocks.length + 1} style={{ width: '100%', background: '#fff' }}>
-                                              <Thead>
-                                                <Tr>
-                                                  <Th style={{ width: 64 }}><Typography variant="sigma">Update?</Typography></Th>
-                                                  <Th style={{ width: 60 }}><Typography variant="sigma">Pos</Typography></Th>
-                                                  <Th style={{ width: 220 }}><Typography variant="sigma">Component</Typography></Th>
-                                                  <Th><Typography variant="sigma">Target Field Value ({selectedAttribute || 'selected'})</Typography></Th>
-                                                  <Th><Typography variant="sigma">Block Summary</Typography></Th>
-                                                </Tr>
-                                              </Thead>
-                                              <Tbody>
-                                                {blocks.map((block: any, bIdx: number) => {
-                                                  const compUid = block.__component;
-                                                  const compLabel = formatComponentName(compUid);
-                                                  const scopedPath = `${dzKey}[${compUid}].${targetParsed.subPath}`;
-                                                  const componentSupports = (col?.attributes || attributes || []).includes(scopedPath);
-                                                  const blockVal = targetParsed.subPath ? getNestedValue(block, targetParsed.subPath) : undefined;
-                                                  const hasTargetAttr = componentSupports || blockVal !== undefined;
-
-                                                  const isBlockChecked = hasTargetAttr && isSelected && (selectedDzBlocks[key] !== undefined ? selectedDzBlocks[key].includes(bIdx) : true);
-
-                                                  return (
-                                                    <Tr
-                                                      key={bIdx}
-                                                      style={{
-                                                        backgroundColor: isBlockChecked ? 'rgba(73, 69, 255, 0.08)' : undefined,
-                                                      }}
-                                                    >
-                                                      <Td>
-                                                        <Checkbox
-                                                          checked={isBlockChecked}
-                                                          disabled={!hasTargetAttr}
-                                                          onCheckedChange={() => {
-                                                            toggleDzBlock(col.uid, entry.documentId, bIdx, allApplicableIndexes);
-                                                          }}
-                                                        />
-                                                      </Td>
-                                                      <Td>
-                                                        <Typography variant="pi" fontWeight="bold">#{bIdx}</Typography>
-                                                      </Td>
-                                                      <Td>
-                                                        <Badge backgroundColor="neutral150" textColor="neutral800">
-                                                          {compLabel}
-                                                        </Badge>
-                                                        <Typography variant="pi" textColor="neutral500" display="block" style={{ fontSize: '0.68rem', marginTop: 2 }}>
-                                                          {compUid}
-                                                        </Typography>
-                                                      </Td>
-                                                      <Td>
-                                                        {hasTargetAttr ? (
-                                                          <Typography variant="omega" fontWeight="semiBold" textColor="primary700">
-                                                            {formatDisplayValue(blockVal)}
-                                                          </Typography>
-                                                        ) : (
-                                                          <Badge backgroundColor="neutral100" textColor="neutral500">
-                                                            Does not contain attribute
-                                                          </Badge>
-                                                        )}
-                                                      </Td>
-                                                      <Td>
-                                                        <Typography variant="pi" textColor="neutral600" style={{ maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                                          {block.title || block.name || block.heading || block.body || Object.keys(block).filter((k: string) => !k.startsWith('_') && k !== 'id').slice(0, 3).map((k: string) => `${k}: ${formatDisplayValue(block[k])}`).join(', ') || '-'}
-                                                        </Typography>
-                                                      </Td>
-                                                    </Tr>
-                                                  );
-                                                })}
-                                              </Tbody>
-                                            </Table>
-                                          </Box>
+                                        <Td
+                                          colSpan={activeColumns.length}
+                                          style={{
+                                            padding: '12px 16px',
+                                            backgroundColor: 'rgba(73, 69, 255, 0.02)',
+                                            borderBottom: '2px solid rgba(73, 69, 255, 0.15)',
+                                          }}
+                                        >
+                                          <ComponentOccurrencesDrawer
+                                            colUid={col.uid}
+                                            rootKey={dzKey}
+                                            entry={entry}
+                                            selectedAttribute={selectedAttribute}
+                                            attrMeta={activeAttrMeta}
+                                            colAttributes={col?.attributes || attributes || []}
+                                            gridEditMode={gridEditMode}
+                                            isSelected={isSelected}
+                                            selectedDzBlocks={selectedDzBlocks[key]}
+                                            occurrences={drawerOccurrences}
+                                            recordEdits={recordEdits}
+                                            relationOptions={relationOptions}
+                                            relationOptionsLoading={relationOptionsLoading}
+                                            relationIsMulti={Boolean(relationsMeta[selectedAttribute]?.isMulti)}
+                                            validationRules={validationRules}
+                                            onToggleDzBlock={toggleDzBlock}
+                                            onCommitEdit={handleGridCellCommit}
+                                            onResetEdit={handleGridCellReset}
+                                          />
                                         </Td>
                                       </Tr>
                                     );
@@ -4005,9 +4444,35 @@ const BulkUpdater: React.FC = () => {
                   2. Configure Attribute Update
                 </Typography>
                 <Typography variant="pi" textColor="neutral600">
-                  Select the target attribute to update and configure the replacement value for your selected entries.
+                  Select the target attribute to update and either apply a common value or enable inline Grid Editing.
                 </Typography>
               </Box>
+              <Flex gap={3} alignItems="center" wrap="wrap">
+                <Box
+                  padding={2}
+                  paddingLeft={3}
+                  paddingRight={3}
+                  background={gridEditMode ? 'primary100' : 'neutral100'}
+                  hasRadius
+                  style={{ border: gridEditMode ? '1px solid #4945ff' : '1px solid #eaeaef' }}
+                >
+                  <Flex gap={2} alignItems="center">
+                    <Checkbox
+                      checked={gridEditMode}
+                      onCheckedChange={(checked: boolean) => handleToggleGridEditMode(Boolean(checked))}
+                    >
+                      <Typography fontWeight="bold" textColor={gridEditMode ? 'primary700' : 'neutral800'}>
+                        Edit Values in Grid
+                      </Typography>
+                    </Checkbox>
+                    {gridEditMode && (
+                      <Badge backgroundColor="primary600" textColor="neutral0" size="S">
+                        ON ({gridSerialized.totalEditCount} edits)
+                      </Badge>
+                    )}
+                  </Flex>
+                </Box>
+              </Flex>
             </Flex>
 
             <Flex gap={3} alignItems="flex-end" wrap="wrap">
@@ -4038,9 +4503,43 @@ const BulkUpdater: React.FC = () => {
                 </Field.Root>
               </Box>
 
-              {/* New Value Input or Relation Target Selector */}
+              {/* New Value Input / Relation Target Selector OR Grid Edit Status Summary */}
               <Box style={{ flex: 1, minWidth: 340 }}>
-                {relationsMeta[selectedAttribute] ? (
+                {gridEditMode ? (
+                  <Box
+                    padding={3}
+                    background="primary100"
+                    hasRadius
+                    style={{ border: '1px solid #d9d8ff' }}
+                  >
+                    <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={2}>
+                      <Box>
+                        <Typography variant="pi" fontWeight="bold" textColor="primary700" display="block">
+                          Common value input hidden — Grid Editing Mode active
+                        </Typography>
+                        <Typography variant="pi" textColor="neutral700">
+                          {gridSerialized.targets.length > 0
+                            ? `Ready: ${gridSerialized.totalEditCount} edited field/block value(s) across ${gridSerialized.targets.length} selected record(s).`
+                            : 'Edit cell values directly in the table above (or expand component blocks) to queue heterogeneous updates.'}
+                        </Typography>
+                        {gridSerialized.hasValidationErrors && (
+                          <Typography variant="pi" textColor="danger700" fontWeight="bold" display="block">
+                            ⚠️ Resolve inline red validation errors before previewing or updating.
+                          </Typography>
+                        )}
+                      </Box>
+                      {totalDirtyCellsCount > 0 && (
+                        <Button
+                          variant="danger-light"
+                          size="S"
+                          onClick={() => setGridEdits({})}
+                        >
+                          Discard Edits ({totalDirtyCellsCount})
+                        </Button>
+                      )}
+                    </Flex>
+                  </Box>
+                ) : relationsMeta[selectedAttribute] ? (
                   <Flex direction="column" gap={1} style={{ width: '100%' }}>
                     <Flex gap={2} alignItems="center" wrap="wrap">
                       <Typography variant="pi" fontWeight="bold" textColor="neutral700">
@@ -4133,9 +4632,16 @@ const BulkUpdater: React.FC = () => {
                   size="L"
                   onClick={handleOpenPreviewModal}
                   loading={previewLoading}
-                  disabled={loading || totalSelectedCount === 0 || !selectedAttribute || !selectedAttribute.trim()}
+                  disabled={
+                    loading ||
+                    !selectedAttribute ||
+                    !selectedAttribute.trim() ||
+                    (gridEditMode
+                      ? gridSerialized.targets.length === 0 || gridSerialized.hasValidationErrors
+                      : totalSelectedCount === 0)
+                  }
                 >
-                  Preview Changes ({totalSelectedCount})
+                  Preview Changes ({gridEditMode ? gridSerialized.targets.length : totalSelectedCount})
                 </Button>
                 <Button
                   startIcon={<Play />}
@@ -4143,9 +4649,16 @@ const BulkUpdater: React.FC = () => {
                   size="L"
                   onClick={handleOpenConfirmModal}
                   loading={updating}
-                  disabled={loading || totalSelectedCount === 0 || !selectedAttribute || !selectedAttribute.trim()}
+                  disabled={
+                    loading ||
+                    !selectedAttribute ||
+                    !selectedAttribute.trim() ||
+                    (gridEditMode
+                      ? gridSerialized.targets.length === 0 || gridSerialized.hasValidationErrors
+                      : totalSelectedCount === 0)
+                  }
                 >
-                  Update Selected ({totalSelectedCount})
+                  Update Selected ({gridEditMode ? gridSerialized.targets.length : totalSelectedCount})
                 </Button>
                 <Button
                   startIcon={<Check />}
@@ -4224,11 +4737,11 @@ const BulkUpdater: React.FC = () => {
                       Collection: {selectedCol.displayName}
                     </Badge>
                     <Badge backgroundColor="secondary100" textColor="secondary700">
-                      Attribute: {selectedAttribute} {attributesMeta[selectedAttribute]?.type ? `(${attributesMeta[selectedAttribute].type})` : ''}
+                      Attribute: {selectedAttribute} {activeAttrMeta?.type ? `(${activeAttrMeta.type})` : ''}
                     </Badge>
-                    {attributesMeta[selectedAttribute]?.depth ? (
+                    {activeAttrMeta?.depth ? (
                       <Badge backgroundColor="neutral200" textColor="neutral700">
-                        Nesting Level: L{attributesMeta[selectedAttribute].depth}
+                        Nesting Level: L{activeAttrMeta.depth}
                       </Badge>
                     ) : null}
                     {selectedCol.draftAndPublish ? (
@@ -4818,19 +5331,31 @@ const BulkUpdater: React.FC = () => {
                                     </Tr>
                                   </Thead>
                                   <Tbody>
-                                    {rec.diffs.map((d, dIdx) => (
-                                      <Tr key={dIdx}>
-                                        <Td><Typography fontWeight="semiBold">{d.collectionName}</Typography></Td>
-                                        <Td><Typography>{d.label}</Typography></Td>
-                                        <Td>
-                                          <Badge backgroundColor="secondary100" textColor="secondary700">
-                                            {d.attribute || 'field'}
-                                          </Badge>
-                                        </Td>
-                                        <Td><Typography textColor="danger600">{formatDisplayValue(d.oldValue)}</Typography></Td>
-                                        <Td><Typography textColor="success600" fontWeight="semiBold">{formatDisplayValue(d.newValue)}</Typography></Td>
-                                      </Tr>
-                                    ))}
+                                    {rec.diffs
+                                      .flatMap((d: any) =>
+                                        Array.isArray(d.dynamicZoneDiffs) && d.dynamicZoneDiffs.length > 0
+                                          ? d.dynamicZoneDiffs.map((dz: any) => ({
+                                              collectionName: d.collectionName,
+                                              label: `${d.label}${dz.componentName ? ` [${dz.componentName}]` : ''}`,
+                                              attribute: dz.attribute || d.attribute,
+                                              oldValue: dz.oldValue,
+                                              newValue: dz.newValue,
+                                            }))
+                                          : [d]
+                                      )
+                                      .map((d: any, dIdx: number) => (
+                                        <Tr key={dIdx}>
+                                          <Td><Typography fontWeight="semiBold">{d.collectionName}</Typography></Td>
+                                          <Td><Typography>{d.label}</Typography></Td>
+                                          <Td>
+                                            <Badge backgroundColor="secondary100" textColor="secondary700">
+                                              {d.attribute || 'field'}
+                                            </Badge>
+                                          </Td>
+                                          <Td><Typography textColor="danger600">{formatDisplayValue(d.oldValue)}</Typography></Td>
+                                          <Td><Typography textColor="success600" fontWeight="semiBold">{formatDisplayValue(d.newValue)}</Typography></Td>
+                                        </Tr>
+                                      ))}
                                   </Tbody>
                                 </Table>
                               </Box>
@@ -4937,7 +5462,11 @@ const BulkUpdater: React.FC = () => {
                   <Flex justifyContent="space-between" alignItems="center">
                     <Typography fontWeight="semiBold">Target Value:</Typography>
                     <Typography variant="omega" style={{ wordBreak: 'break-all', maxWidth: 360 }}>
-                      {relationsMeta[selectedAttribute] ? (
+                      {gridEditMode ? (
+                        <Badge backgroundColor="secondary100" textColor="secondary700">
+                          Grid Editing ({gridSerialized.totalEditCount} heterogeneous edits across {gridSerialized.targets.length} records)
+                        </Badge>
+                      ) : relationsMeta[selectedAttribute] ? (
                         <span>
                           {selectedRelationDocId === '__clear__' ? (
                             <Badge backgroundColor="danger100" textColor="danger700">Clear / Unlink Relation</Badge>
@@ -4960,7 +5489,7 @@ const BulkUpdater: React.FC = () => {
                   <Flex justifyContent="space-between">
                     <Typography fontWeight="semiBold">Total Selected Records:</Typography>
                     <Typography fontWeight="bold" textColor="primary600">
-                      {totalSelectedCount} records
+                      {gridEditMode ? gridSerialized.targets.length : totalSelectedCount} records
                     </Typography>
                   </Flex>
                   <Flex justifyContent="space-between" alignItems="center">
@@ -4994,25 +5523,25 @@ const BulkUpdater: React.FC = () => {
               {/* Lifecycle Status Breakdown */}
               <Box marginBottom={4} padding={3} background="neutral100" hasRadius style={{ border: '1px solid rgba(120, 120, 150, 0.15)' }}>
                 <Typography variant="sigma" textColor="neutral600" marginBottom={2} display="block">
-                  LIFECYCLE STATUS BREAKDOWN ({totalSelectedCount} Selected)
+                  LIFECYCLE STATUS BREAKDOWN ({gridEditMode ? gridSerialized.targets.length : totalSelectedCount} Selected)
                 </Typography>
                 <Flex gap={2} wrap="wrap">
                   <Badge backgroundColor="success100" textColor="success700">
-                    ✓ Published / Approved: {selectedLifecycleStats.published}
+                    ✓ Published / Approved: {updateModalLifecycleStats.published}
                   </Badge>
-                  {selectedLifecycleStats.modified > 0 && (
+                  {updateModalLifecycleStats.modified > 0 && (
                     <Badge backgroundColor="primary100" textColor="primary700">
-                      📝 Modified (Unreviewed Revisions): {selectedLifecycleStats.modified}
+                      📝 Modified (Unreviewed Revisions): {updateModalLifecycleStats.modified}
                     </Badge>
                   )}
-                  {selectedLifecycleStats.draft > 0 && (
+                  {updateModalLifecycleStats.draft > 0 && (
                     <Badge backgroundColor="neutral200" textColor="neutral800">
-                      📄 Draft (Never Published): {selectedLifecycleStats.draft}
+                      📄 Draft (Never Published): {updateModalLifecycleStats.draft}
                     </Badge>
                   )}
-                  {selectedLifecycleStats.pendingReview > 0 && (
+                  {updateModalLifecycleStats.pendingReview > 0 && (
                     <Badge backgroundColor="warning100" textColor="warning700">
-                      ⏳ Pending Review: {selectedLifecycleStats.pendingReview}
+                      ⏳ Pending Review: {updateModalLifecycleStats.pendingReview}
                     </Badge>
                   )}
                 </Flex>
@@ -5024,7 +5553,7 @@ const BulkUpdater: React.FC = () => {
                   COLLECTION BREAKDOWN
                 </Typography>
                 <Flex direction="column" gap={1}>
-                  {Object.entries(getSelectedBreakdown()).map(([name, count]) => (
+                  {Object.entries(getSelectedBreakdown(gridEditMode ? gridTargetKeys : undefined)).map(([name, count]) => (
                     <Flex
                       key={name}
                       justifyContent="space-between"
@@ -5084,7 +5613,7 @@ const BulkUpdater: React.FC = () => {
               </Box>
 
               {/* Publishing Strategy Selection when Unreviewed Records are Selected */}
-              {publishOnApproval && selectedLifecycleStats.unreviewedCount > 0 && (
+              {publishOnApproval && updateModalLifecycleStats.unreviewedCount > 0 && (
                 <Box
                   padding={4}
                   background="neutral100"
@@ -5127,7 +5656,7 @@ const BulkUpdater: React.FC = () => {
                             🛡️ Safe Publishing (Recommended)
                           </Typography>
                           <Typography variant="pi" textColor="neutral600">
-                            Only publish records that are already approved &amp; live ({selectedLifecycleStats.published} record{selectedLifecycleStats.published === 1 ? '' : 's'}). The {selectedLifecycleStats.unreviewedCount} unreviewed or draft record(s) will receive the bulk update in Draft mode without publishing unreviewed draft revisions to visitors.
+                            Only publish records that are already approved &amp; live ({updateModalLifecycleStats.published} record{updateModalLifecycleStats.published === 1 ? '' : 's'}). The {updateModalLifecycleStats.unreviewedCount} unreviewed or draft record(s) will receive the bulk update in Draft mode without publishing unreviewed draft revisions to visitors.
                           </Typography>
                         </Box>
                       </Flex>
@@ -5158,7 +5687,7 @@ const BulkUpdater: React.FC = () => {
                             ⚠️ Publish All Selected Records (Includes Unreviewed Drafts)
                           </Typography>
                           <Typography variant="pi" textColor="neutral600">
-                            Publish all {totalSelectedCount} records live to production immediately, pushing all pending unreviewed draft edits in the {selectedLifecycleStats.unreviewedCount} draft/modified record(s) live.
+                            Publish all {gridEditMode ? gridSerialized.targets.length : totalSelectedCount} records live to production immediately, pushing all pending unreviewed draft edits in the {updateModalLifecycleStats.unreviewedCount} draft/modified record(s) live.
                           </Typography>
                         </Box>
                       </Flex>
@@ -5183,7 +5712,7 @@ const BulkUpdater: React.FC = () => {
                               Mandatory Risk Consent Required
                             </Typography>
                             <Typography variant="pi" textColor="danger700">
-                              I understand and explicitly consent that {selectedLifecycleStats.unreviewedCount} record(s) with unreviewed draft revisions or saved draft states will be published live to production visitors.
+                              I understand and explicitly consent that {updateModalLifecycleStats.unreviewedCount} record(s) with unreviewed draft revisions or saved draft states will be published live to production visitors.
                             </Typography>
                           </Box>
                         </Flex>
@@ -5219,7 +5748,7 @@ const BulkUpdater: React.FC = () => {
               }}
             >
               <Flex direction="column" gap={2} style={{ width: '100%' }}>
-                {publishOnApproval && selectedLifecycleStats.unreviewedCount > 0 && publishStrategy === 'all' && !unreviewedConsent && (
+                {publishOnApproval && updateModalLifecycleStats.unreviewedCount > 0 && publishStrategy === 'all' && !unreviewedConsent && (
                   <Typography variant="pi" textColor="danger700" fontWeight="bold">
                     ⚠️ Explicit consent is required before publishing records with unreviewed draft revisions.
                   </Typography>
@@ -5235,7 +5764,7 @@ const BulkUpdater: React.FC = () => {
                       size="M"
                       onClick={() => executeBatchWithMode('maker_checker')}
                       loading={updating}
-                      disabled={updating || (publishOnApproval && selectedLifecycleStats.unreviewedCount > 0 && publishStrategy === 'all' && !unreviewedConsent)}
+                      disabled={updating || (publishOnApproval && updateModalLifecycleStats.unreviewedCount > 0 && publishStrategy === 'all' && !unreviewedConsent)}
                     >
                       Submit for Checker Approval
                     </Button>
@@ -5248,7 +5777,7 @@ const BulkUpdater: React.FC = () => {
                           size="M"
                           onClick={() => executeBatchWithMode('queue_offpeak')}
                           loading={updating}
-                          disabled={updating || (publishOnApproval && selectedLifecycleStats.unreviewedCount > 0 && publishStrategy === 'all' && !unreviewedConsent)}
+                          disabled={updating || (publishOnApproval && updateModalLifecycleStats.unreviewedCount > 0 && publishStrategy === 'all' && !unreviewedConsent)}
                         >
                           Queue for Off-Peak ({executionWindow?.offPeakStartTime || '18:00'})
                         </Button>
@@ -5257,7 +5786,7 @@ const BulkUpdater: React.FC = () => {
                           size="S"
                           onClick={() => executeBatchWithMode('immediate', true)}
                           loading={updating}
-                          disabled={updating || (publishOnApproval && selectedLifecycleStats.unreviewedCount > 0 && publishStrategy === 'all' && !unreviewedConsent)}
+                          disabled={updating || (publishOnApproval && updateModalLifecycleStats.unreviewedCount > 0 && publishStrategy === 'all' && !unreviewedConsent)}
                         >
                           Force Run Now
                         </Button>
@@ -5268,7 +5797,7 @@ const BulkUpdater: React.FC = () => {
                         size="M"
                         onClick={() => executeBatchWithMode('immediate')}
                         loading={updating}
-                        disabled={updating || (publishOnApproval && selectedLifecycleStats.unreviewedCount > 0 && publishStrategy === 'all' && !unreviewedConsent)}
+                        disabled={updating || (publishOnApproval && updateModalLifecycleStats.unreviewedCount > 0 && publishStrategy === 'all' && !unreviewedConsent)}
                       >
                         Confirm &amp; Execute Now
                       </Button>
@@ -5559,10 +6088,13 @@ const BulkUpdater: React.FC = () => {
         loading={previewLoading}
         previewData={previewData}
         attribute={selectedAttribute}
+        editMode={gridEditMode ? 'grid' : 'common'}
         publishOnApproval={publishOnApproval}
         lifecycleStats={selectedLifecycleStats}
         targetValueDisplay={
-          relationsMeta[selectedAttribute]
+          gridEditMode
+            ? `Grid Editing (${gridSerialized.totalEditCount} edits across ${gridSerialized.targets.length} records)`
+            : relationsMeta[selectedAttribute]
             ? (selectedRelationDocId === '__clear__'
                 ? 'Clear / Unlink Relation'
                 : relationOptions.find((o) => o.documentId === selectedRelationDocId)?.label || selectedRelationDocId || '(none)')

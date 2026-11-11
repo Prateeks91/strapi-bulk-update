@@ -2,6 +2,19 @@ import type { Core } from '@strapi/strapi';
 import crypto from 'crypto';
 import { recordContentHistoryVersion } from './content-history';
 import { validateEntityQuotas, deepMergeEntities } from './validation-rules';
+import {
+  buildRichAttributeMeta,
+  applyOccurrenceUpdatesToDocument,
+  enumerateOccurrences,
+  coerceAndValidateFieldValue,
+  resolveBatchTargets,
+  type AttributeMeta,
+  type EditMode,
+  type BulkTargetEntry,
+  type OccurrenceUpdateInput,
+} from './bulk-updater/grid-occurrences';
+
+export type { AttributeMeta, EditMode, BulkTargetEntry, OccurrenceUpdateInput };
 
 // In-process memory caches (scoped to pod)
 interface CacheEntry {
@@ -21,13 +34,6 @@ export interface RelationMeta {
   targetUid: string;
   targetDisplayName: string;
   isMulti: boolean;
-}
-
-export interface AttributeMeta {
-  depth: number;
-  type: string;
-  component?: string;
-  isRelation?: boolean;
 }
 
 let staticSchemaCache: {
@@ -550,11 +556,20 @@ export function discoverComponentAttributes(
         };
         relationsByAttr[fullPath] = relMeta;
         allRelationsMeta[fullPath] = relMeta;
-        attributesMeta[fullPath] = { depth: currentDepth, type: 'relation', component: compUid, isRelation: true };
+        attributesMeta[fullPath] = buildRichAttributeMeta(subAttr, {
+          depth: currentDepth,
+          type: 'relation',
+          component: compUid,
+          isRelation: true,
+        });
         discoveredAttrs.push(fullPath);
       }
     } else {
-      attributesMeta[fullPath] = { depth: currentDepth, type: subAttr.type, component: compUid };
+      attributesMeta[fullPath] = buildRichAttributeMeta(subAttr, {
+        depth: currentDepth,
+        type: subAttr.type,
+        component: compUid,
+      });
       discoveredAttrs.push(fullPath);
     }
   }
@@ -761,6 +776,8 @@ export function setDeepProperty(
   options?: {
     targetIndexes?: number[];
     targetComponentUid?: string;
+    strapi?: any;
+    components?: Record<string, any>;
   }
 ): any {
   if (pathParts.length === 0) return value;
@@ -789,7 +806,8 @@ export function setDeepProperty(
         if (item.__component !== options.targetComponentUid) return item;
       }
 
-      const compSchema = (global as any).strapi?.components?.[item.__component];
+      const componentsMap = options?.components || options?.strapi?.components || (global as any).strapi?.components;
+      const compSchema = item.__component ? componentsMap?.[item.__component] : undefined;
       const fieldExistsInSchema = compSchema?.attributes ? head in compSchema.attributes : true;
 
       if (head in item || fieldExistsInSchema || tail.length === 0) {
@@ -1149,7 +1167,8 @@ export interface PendingBatch {
     action?: string;
     attribute: string;
     value: string;
-    selectedEntries?: Array<{ uid: string; documentId: string; dynamicZoneIndexes?: number[]; targetComponentUid?: string }>;
+    editMode?: EditMode;
+    selectedEntries?: BulkTargetEntry[];
     selectedCollections?: string[];
     isRegex?: boolean;
     regexPattern?: string;
@@ -1271,38 +1290,325 @@ async function getCollectionSignature(strapi: Core.Strapi, uid: string): Promise
   }
 }
 
-async function computeTargetsSummary(strapi: Core.Strapi, { selectedCollections = [], selectedEntries = [] }: any) {
-  const targetsMap = new Map<string, { uid: string; documentId: string }>();
-  const breakdown: Record<string, number> = {};
-
-  for (const colUid of selectedCollections) {
-    const contentType = strapi.contentTypes[colUid];
-    const displayName = contentType?.info?.displayName || colUid;
-    try {
-      const entries = await strapi.documents(colUid as any).findMany();
-      const count = entries ? entries.length : 0;
-      breakdown[displayName] = (breakdown[displayName] || 0) + count;
-      for (const entry of (entries || []) as any[]) {
-        targetsMap.set(`${colUid}@@@${entry.documentId}`, { uid: colUid, documentId: entry.documentId });
-      }
-    } catch {
-      // Ignore count failures
+function summarizeGridPayloadValue(selectedEntries: BulkTargetEntry[] = []): string {
+  const uniqueRecs = new Set<string>();
+  let editCount = 0;
+  for (const item of selectedEntries) {
+    if (!item?.uid || !item?.documentId) continue;
+    uniqueRecs.add(`${item.uid}@@@${item.documentId}@@@${item.locale || ''}`);
+    if (Array.isArray(item.occurrenceUpdates) && item.occurrenceUpdates.length > 0) {
+      editCount += item.occurrenceUpdates.length;
+    } else if (item.overrideValue !== undefined) {
+      editCount += 1;
     }
   }
+  return `Grid Editing (${editCount} edit${editCount === 1 ? '' : 's'} across ${uniqueRecs.size} record${uniqueRecs.size === 1 ? '' : 's'})`;
+}
 
-  for (const item of selectedEntries) {
-    if (!item.uid || !item.documentId) continue;
-    const key = `${item.uid}@@@${item.documentId}`;
-    if (!targetsMap.has(key)) {
-      targetsMap.set(key, { uid: item.uid, documentId: item.documentId });
-      const contentType = strapi.contentTypes[item.uid];
-      const displayName = contentType?.info?.displayName || item.uid;
-      breakdown[displayName] = (breakdown[displayName] || 0) + 1;
-    }
+async function resolveAndMaybePublishTarget({
+  strapi,
+  target,
+  contentType,
+  currentEntry,
+  publishedCounterparts,
+  publishOnApproval,
+  publishStrategy,
+  unreviewedConsent,
+  userId,
+}: {
+  strapi: Core.Strapi;
+  target: BulkTargetEntry;
+  contentType: any;
+  currentEntry: any;
+  publishedCounterparts: Map<string, any>;
+  publishOnApproval: boolean;
+  publishStrategy: 'safe' | 'all';
+  unreviewedConsent: boolean;
+  userId?: any;
+}) {
+  const isDraftAndPublish = Boolean(contentType?.options?.draftAndPublish);
+  const candLocale = (target as any).locale || currentEntry?.locale;
+  const isLocalized = Boolean(contentType?.pluginOptions?.i18n?.localized) && candLocale && candLocale !== 'null' && candLocale !== 'undefined';
+
+  let pubRecord =
+    (candLocale && publishedCounterparts.get(`${target.uid}@@@${target.documentId}@@@${candLocale}`)) ||
+    publishedCounterparts.get(`${target.uid}@@@${target.documentId}`);
+
+  if (!pubRecord && isDraftAndPublish && target.documentId) {
+    try {
+      const singlePub = await (strapi.documents(target.uid as any) as any).findMany({
+        status: 'published',
+        filters: { documentId: target.documentId },
+        ...(isLocalized ? { locale: candLocale } : {}),
+        fields: ['documentId', 'updatedAt', 'publishedAt', 'locale'],
+        limit: 1,
+      });
+      if (singlePub && singlePub.length > 0) {
+        pubRecord = singlePub[0];
+        publishedCounterparts.set(`${target.uid}@@@${target.documentId}`, pubRecord);
+      }
+    } catch {}
+  }
+
+  const inspectionTarget =
+    (target as any).status || (target as any).publishedAt
+      ? { ...currentEntry, status: (target as any).status, publishedAt: (target as any).publishedAt }
+      : currentEntry;
+
+  const { hadPublishedVersion } = resolveRecordPublicationStatus(inspectionTarget, pubRecord, isDraftAndPublish);
+  const isEditing = isRowInEditingStage(inspectionTarget) || isRowInEditingStage(target as any);
+  const shouldPublish = evaluateShouldPublish({
+    isDraftAndPublish,
+    hadPublishedVersion,
+    isEditing,
+    publishOnApproval: Boolean(publishOnApproval),
+    publishStrategy,
+    unreviewedConsent,
+  });
+
+  return {
+    candLocale: isLocalized ? candLocale : undefined,
+    isDraftAndPublish,
+    hadPublishedVersion,
+    shouldPublish,
+    async postUpdate(relatedTargetUid?: string) {
+      if (shouldPublish) {
+        try {
+          const pubArgs: any = { documentId: target.documentId };
+          if (isLocalized) pubArgs.locale = candLocale;
+          await (strapi.documents(target.uid as any) as any).publish(pubArgs);
+        } catch (publishErr) {
+          strapi.log.warn(`[bulk-updater] Failed to auto-publish ${target.uid}/${target.documentId}:`, publishErr);
+        }
+      }
+      invalidateCollectionCache(target.uid);
+      if (relatedTargetUid) invalidateCollectionCache(relatedTargetUid);
+      await recordContentHistoryVersion(strapi, {
+        uid: target.uid,
+        documentId: target.documentId,
+        userId,
+        statusOverride: shouldPublish
+          ? 'published'
+          : isDraftAndPublish
+          ? hadPublishedVersion
+            ? 'modified'
+            : 'draft'
+          : undefined,
+      });
+    },
+  };
+}
+
+async function executeGridTargetUpdate({
+  strapi,
+  target,
+  attribute,
+  contentType,
+  displayName,
+  publishedCounterparts,
+  publishOnApproval,
+  publishStrategy,
+  unreviewedConsent,
+  currentUser,
+}: {
+  strapi: Core.Strapi;
+  target: BulkTargetEntry;
+  attribute: string;
+  contentType: any;
+  displayName: string;
+  publishedCounterparts: Map<string, any>;
+  publishOnApproval: boolean;
+  publishStrategy: 'safe' | 'all';
+  unreviewedConsent: boolean;
+  currentUser?: any;
+}) {
+  const isNested = attribute.includes('.') || attribute.includes('[');
+  const isComponentNested = isNested && isDeepComponentField(contentType, strapi.components, attribute);
+  const attrDef = contentType?.attributes?.[attribute];
+  const hasAttribute = Boolean(attrDef) || isComponentNested;
+
+  if (!hasAttribute) {
+    return {
+      uid: target.uid,
+      collectionName: displayName,
+      documentId: target.documentId,
+      label: `Entry #${target.documentId}`,
+      attribute,
+      status: 'skipped' as const,
+      message: `Skipped: Attribute "${attribute}" does not exist in schema for ${displayName}`,
+    };
+  }
+
+  const updates: OccurrenceUpdateInput[] =
+    Array.isArray(target.occurrenceUpdates) && target.occurrenceUpdates.length > 0
+      ? target.occurrenceUpdates
+      : target.overrideValue !== undefined
+      ? [{ occurrenceKey: '__scalar__', value: target.overrideValue }]
+      : [];
+
+  if (updates.length === 0) {
+    return {
+      uid: target.uid,
+      collectionName: displayName,
+      documentId: target.documentId,
+      label: `Entry #${target.documentId}`,
+      attribute,
+      status: 'skipped' as const,
+      message: 'Skipped: No edited grid values provided for this entry',
+    };
+  }
+
+  const isLocalized =
+    Boolean(contentType?.pluginOptions?.i18n?.localized) &&
+    target.locale &&
+    target.locale !== 'null' &&
+    target.locale !== 'undefined';
+
+  const populateOption = buildDeepPopulate(contentType.attributes, strapi.components);
+  const findOneArgs: any = { documentId: target.documentId };
+  if (populateOption) findOneArgs.populate = populateOption;
+  if (isLocalized) findOneArgs.locale = target.locale;
+
+  const currentEntry: any = await strapi.documents(target.uid as any).findOne(findOneArgs);
+  if (!currentEntry) {
+    return {
+      uid: target.uid,
+      collectionName: displayName,
+      documentId: target.documentId,
+      label: `Entry #${target.documentId}`,
+      attribute,
+      status: 'error' as const,
+      message: `Entry "${target.documentId}" was not found in ${displayName}.`,
+    };
+  }
+
+  const entryLabel =
+    currentEntry?.name ||
+    currentEntry?.title ||
+    currentEntry?.email ||
+    `Entry #${target.documentId}`;
+
+  const applied = await applyOccurrenceUpdatesToDocument({
+    strapi,
+    contentType,
+    allComponents: strapi.components,
+    currentDoc: currentEntry,
+    attribute,
+    updates,
+  });
+
+  if (applied.errors.length > 0) {
+    return {
+      uid: target.uid,
+      collectionName: displayName,
+      documentId: target.documentId,
+      label: entryLabel,
+      attribute,
+      status: 'error' as const,
+      message: applied.errors.join('; '),
+    };
+  }
+
+  const changedDiffs = applied.diffs.filter((d) => d.hasChange);
+  if (changedDiffs.length === 0) {
+    return {
+      uid: target.uid,
+      collectionName: displayName,
+      documentId: target.documentId,
+      label: entryLabel,
+      attribute,
+      oldValue: applied.diffs[0]?.oldValue ?? null,
+      newValue: applied.diffs[0]?.newValue ?? null,
+      status: 'skipped' as const,
+      message: 'Skipped: Edited grid values already match current database values',
+    };
+  }
+
+  const proposedEntity = deepMergeEntities(currentEntry, applied.updateData);
+  const valResult = await validateEntityQuotas(strapi, target.uid, proposedEntity);
+  if (!valResult.isValid) {
+    return {
+      uid: target.uid,
+      collectionName: displayName,
+      documentId: target.documentId,
+      label: entryLabel,
+      attribute,
+      oldValue: changedDiffs.length === 1 ? changedDiffs[0].oldValue : changedDiffs.map((d) => `${d.attribute}: ${d.oldDisplay}`).join(' | '),
+      newValue: changedDiffs.length === 1 ? changedDiffs[0].newValue : changedDiffs.map((d) => `${d.attribute}: ${d.newDisplay}`).join(' | '),
+      status: 'error' as const,
+      message: valResult.errorMessage,
+    };
+  }
+
+  const lifecycle = await resolveAndMaybePublishTarget({
+    strapi,
+    target,
+    contentType,
+    currentEntry,
+    publishedCounterparts,
+    publishOnApproval,
+    publishStrategy,
+    unreviewedConsent,
+    userId: currentUser?.id,
+  });
+
+  const updateArgs: any = {
+    documentId: target.documentId,
+    data: applied.updateData,
+  };
+  if (lifecycle.candLocale) {
+    updateArgs.locale = lifecycle.candLocale;
+  }
+
+  await strapi.documents(target.uid as any).update(updateArgs);
+
+  const leafSchema = getLeafAttributeSchema(contentType, strapi.components, attribute);
+  await lifecycle.postUpdate(leafSchema?.target);
+
+  const isMultiOcc = changedDiffs.length > 1 || isComponentNested;
+  const oldSummaryVal =
+    changedDiffs.length === 1
+      ? changedDiffs[0].oldValue
+      : changedDiffs.map((d) => `#${d.index}${d.componentName ? ` ${d.componentName}` : ''}: ${d.oldDisplay}`).join(' | ');
+  const newSummaryVal =
+    changedDiffs.length === 1
+      ? changedDiffs[0].newValue
+      : changedDiffs.map((d) => `#${d.index}${d.componentName ? ` ${d.componentName}` : ''}: ${d.newDisplay}`).join(' | ');
+
+  return {
+    uid: target.uid,
+    collectionName: displayName,
+    documentId: target.documentId,
+    locale: lifecycle.candLocale,
+    label: entryLabel,
+    attribute: changedDiffs.length === 1 ? changedDiffs[0].attribute : attribute,
+    oldValue: oldSummaryVal,
+    newValue: newSummaryVal,
+    status: 'updated' as const,
+    message: isMultiOcc
+      ? `Successfully updated ${changedDiffs.length} grid occurrence(s) in ${attribute}`
+      : `Successfully updated ${attribute}`,
+    dynamicZoneDiffs: isComponentNested ? changedDiffs : undefined,
+    gridGroupDiffs: changedDiffs.length > 1 || isComponentNested ? changedDiffs : undefined,
+  };
+}
+
+async function computeTargetsSummary(strapi: Core.Strapi, { selectedCollections = [], selectedEntries = [], editMode = 'common' }: any) {
+  const targets = await resolveBatchTargets(strapi, {
+    selectedCollections: editMode === 'grid' ? [] : selectedCollections,
+    selectedEntries,
+    editMode,
+  });
+  const breakdown: Record<string, number> = {};
+
+  for (const item of targets) {
+    const contentType = strapi.contentTypes[item.uid];
+    const displayName = contentType?.info?.displayName || item.uid;
+    breakdown[displayName] = (breakdown[displayName] || 0) + 1;
   }
 
   return {
-    totalTargets: targetsMap.size,
+    totalTargets: targets.length,
     collectionBreakdown: breakdown,
   };
 }
@@ -1312,6 +1618,7 @@ async function executeBatchInternal(
   {
     attribute,
     value,
+    editMode = 'common',
     selectedEntries = [],
     selectedCollections = [],
     isRegex = false,
@@ -1322,7 +1629,8 @@ async function executeBatchInternal(
   }: {
     attribute: string;
     value: string;
-    selectedEntries?: Array<{ uid: string; documentId: string; dynamicZoneIndexes?: number[]; targetComponentUid?: string }>;
+    editMode?: EditMode;
+    selectedEntries?: BulkTargetEntry[];
     selectedCollections?: string[];
     isRegex?: boolean;
     regexPattern?: string;
@@ -1337,33 +1645,19 @@ async function executeBatchInternal(
     throw new Error('Attribute name is required.');
   }
 
-  const targetsMap = new Map<string, { uid: string; documentId: string; dynamicZoneIndexes?: number[]; targetComponentUid?: string }>();
+  const effectiveEditMode: EditMode = editMode === 'grid' ? 'grid' : 'common';
+  const targets = await resolveBatchTargets(strapi, {
+    selectedCollections: effectiveEditMode === 'grid' ? [] : selectedCollections,
+    selectedEntries,
+    editMode: effectiveEditMode,
+  });
 
-  // 1. Add entire collections if selected
-  for (const colUid of selectedCollections) {
-    if (!strapi.contentTypes[colUid]) continue;
-    const entries = await strapi.documents(colUid as any).findMany();
-    for (const entry of (entries || []) as any[]) {
-      const key = `${colUid}@@@${entry.documentId}`;
-      targetsMap.set(key, { uid: colUid, documentId: entry.documentId });
-    }
-  }
-
-  // 2. Add individually selected entries
-  for (const item of selectedEntries) {
-    if (!item.uid || !item.documentId) continue;
-    const key = `${item.uid}@@@${item.documentId}`;
-    targetsMap.set(key, {
-      uid: item.uid,
-      documentId: item.documentId,
-      dynamicZoneIndexes: item.dynamicZoneIndexes,
-      targetComponentUid: item.targetComponentUid,
-    });
-  }
-
-  if (targetsMap.size === 0) {
+  if (targets.length === 0) {
     throw new Error('No collections or entries were selected for update.');
   }
+
+  const effectiveSummaryVal =
+    effectiveEditMode === 'grid' ? summarizeGridPayloadValue(selectedEntries) : value;
 
   const batchId = existingBatchId || `batch_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
   const results: any[] = [];
@@ -1386,8 +1680,8 @@ async function executeBatchInternal(
     status: 'processing',
     executionMode: 'immediate',
     attribute,
-    value,
-    totalTargets: targetsMap.size,
+    value: effectiveSummaryVal,
+    totalTargets: targets.length,
     processedCount: 0,
     updatedCount: 0,
     skippedCount: 0,
@@ -1401,11 +1695,9 @@ async function executeBatchInternal(
   batchJobsMap.set(batchId, jobState);
 
   let regexObj: RegExp | null = null;
-  if (isRegex && regexPattern) {
+  if (effectiveEditMode !== 'grid' && isRegex && regexPattern) {
     regexObj = new RegExp(regexPattern, 'g');
   }
-
-  const targets = Array.from(targetsMap.values());
   const CHUNK_SIZE = 25; // 25 concurrent updates per batch window
 
   // Pre-fetch published counterparts for all draftAndPublish targets in a single batched query per collection
@@ -1472,6 +1764,21 @@ async function executeBatchInternal(
       const displayName = contentType?.info?.displayName || target.uid;
 
       try {
+        if (effectiveEditMode === 'grid') {
+          return await executeGridTargetUpdate({
+            strapi,
+            target,
+            attribute,
+            contentType,
+            displayName,
+            publishedCounterparts,
+            publishOnApproval: Boolean(publishOnApproval),
+            publishStrategy,
+            unreviewedConsent: Boolean(unreviewedConsent),
+            currentUser,
+          });
+        }
+
         const currentEntry: any = await getDocumentDeduplicated(target.uid, target.documentId);
 
         const entryLabel =
@@ -1983,7 +2290,9 @@ async function executeBatchInternal(
 
   const flattenedDiffs: any[] = [];
   for (const r of results) {
-    if (r.dynamicZoneDiffs && r.dynamicZoneDiffs.length > 0) {
+    if (effectiveEditMode === 'grid') {
+      flattenedDiffs.push(r);
+    } else if (r.dynamicZoneDiffs && r.dynamicZoneDiffs.length > 0) {
       for (const dz of r.dynamicZoneDiffs) {
         flattenedDiffs.push({
           uid: r.uid,
@@ -2005,10 +2314,11 @@ async function executeBatchInternal(
   const batchSummary = {
     batchId,
     attribute,
-    value,
+    value: effectiveSummaryVal,
+    editMode: effectiveEditMode,
     updatedCount,
     skippedCount,
-    totalTargets: targetsMap.size,
+    totalTargets: targets.length,
     publishOnApproval,
     publishStrategy,
     unreviewedConsent,
@@ -2025,11 +2335,12 @@ async function executeBatchInternal(
     success: true,
     batchId,
     attribute,
-    value,
+    value: effectiveSummaryVal,
+    editMode: effectiveEditMode,
     updatedCount,
     skippedCount,
     failedCount,
-    totalTargets: targetsMap.size,
+    totalTargets: targets.length,
     isLive: jobState.isLive,
     status: jobState.status,
     results,
@@ -2448,11 +2759,18 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
               };
               relationsByAttr[attrKey] = relMeta;
               allRelationsMeta[attrKey] = relMeta;
-              colAttributesMeta[attrKey] = { depth: 0, type: 'relation', isRelation: true };
+              colAttributesMeta[attrKey] = buildRichAttributeMeta(rel, {
+                depth: 0,
+                type: 'relation',
+                isRelation: true,
+              });
               return true;
             }
 
-            colAttributesMeta[attrKey] = { depth: 0, type: rawAttrs[attrKey].type };
+            colAttributesMeta[attrKey] = buildRichAttributeMeta(rawAttrs[attrKey], {
+              depth: 0,
+              type: rawAttrs[attrKey].type,
+            });
             return true;
           });
 
@@ -2460,6 +2778,14 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           allColAttrs.forEach((attr) => {
             allAttributesSet.add(attr);
             if (colAttributesMeta[attr]) {
+              const rootName = attr.split('[')[0].split('.')[0];
+              const rootDef = rawAttrs[rootName];
+              if (rootDef && (attr.includes('.') || attr.includes('['))) {
+                colAttributesMeta[attr].rootType = rootDef.type;
+                if (rootDef.type === 'component') {
+                  colAttributesMeta[attr].rootRepeatable = Boolean(rootDef.repeatable);
+                }
+              }
               allAttributesMeta[attr] = colAttributesMeta[attr];
             }
           });
@@ -2914,12 +3240,51 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
     },
 
     /**
+     * Get uploaded media assets for inline media field picker (bounded lightweight listing).
+     */
+    async getMediaOptions(search?: string) {
+      const fileQuery = strapi.db?.query?.('plugin::upload.file');
+      if (!fileQuery) {
+        return { options: [] };
+      }
+
+      const trimmed = (search || '').trim();
+      const where = trimmed
+        ? {
+            $or: [
+              { name: { $containsi: trimmed } },
+              { alternativeText: { $containsi: trimmed } },
+              { mime: { $containsi: trimmed } },
+            ],
+          }
+        : {};
+
+      const files = await fileQuery.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        limit: 100,
+        select: ['id', 'documentId', 'name', 'url', 'mime', 'ext', 'size'],
+      });
+
+      return {
+        options: (files || []).map((f: any) => ({
+          id: f.id,
+          documentId: f.documentId,
+          name: f.name || `File #${f.id}`,
+          url: f.url,
+          mime: f.mime,
+        })),
+      };
+    },
+
+    /**
      * Preview bulk update changes before execution:
      * Reads current values and computes proposed new values without mutating data.
      */
     async previewBatch({
       attribute,
       value,
+      editMode = 'common',
       selectedEntries = [],
       selectedCollections = [],
       isRegex = false,
@@ -2927,13 +3292,229 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
     }: {
       attribute: string;
       value: string;
-      selectedEntries?: Array<{ uid: string; documentId: string; dynamicZoneIndexes?: number[]; targetComponentUid?: string }>;
+      editMode?: EditMode;
+      selectedEntries?: BulkTargetEntry[];
       selectedCollections?: string[];
       isRegex?: boolean;
       regexPattern?: string;
     }) {
       if (!attribute) {
         throw new Error('Attribute name is required.');
+      }
+
+      if (editMode === 'grid') {
+        const gridTargets = await resolveBatchTargets(strapi, {
+          selectedEntries,
+          editMode: 'grid',
+        });
+
+        if (gridTargets.length === 0) {
+          throw new Error('No edited entries were selected for preview.');
+        }
+
+        const diffs: any[] = [];
+        let willUpdateCount = 0;
+        let unchangedCount = 0;
+        let skippedCount = 0;
+        let willErrorCount = 0;
+
+        for (const target of gridTargets) {
+          const contentType = strapi.contentTypes[target.uid];
+          const displayName = contentType?.info?.displayName || target.uid;
+
+          try {
+            const isNested = attribute.includes('.') || attribute.includes('[');
+            const isComponentNested = isNested && isDeepComponentField(contentType, strapi.components, attribute);
+            const attrDef = contentType?.attributes?.[attribute];
+            const hasAttribute = Boolean(attrDef) || isComponentNested;
+
+            if (!hasAttribute) {
+              skippedCount++;
+              diffs.push({
+                uid: target.uid,
+                collectionName: displayName,
+                documentId: target.documentId,
+                label: `Entry #${target.documentId}`,
+                attribute,
+                oldValue: null,
+                newValue: null,
+                oldDisplay: '—',
+                newDisplay: '—',
+                hasChange: false,
+                status: 'will_skip',
+                message: `Attribute "${attribute}" does not exist in schema for ${displayName}`,
+              });
+              continue;
+            }
+
+            const updates: OccurrenceUpdateInput[] =
+              Array.isArray(target.occurrenceUpdates) && target.occurrenceUpdates.length > 0
+                ? target.occurrenceUpdates
+                : target.overrideValue !== undefined
+                ? [{ occurrenceKey: '__scalar__', value: target.overrideValue }]
+                : [];
+
+            if (updates.length === 0) {
+              skippedCount++;
+              diffs.push({
+                uid: target.uid,
+                collectionName: displayName,
+                documentId: target.documentId,
+                label: `Entry #${target.documentId}`,
+                attribute,
+                oldValue: null,
+                newValue: null,
+                oldDisplay: '—',
+                newDisplay: '—',
+                hasChange: false,
+                status: 'will_skip',
+                message: 'No edited grid values supplied for this entry',
+              });
+              continue;
+            }
+
+            const isLocalized =
+              Boolean(contentType?.pluginOptions?.i18n?.localized) &&
+              target.locale &&
+              target.locale !== 'null' &&
+              target.locale !== 'undefined';
+
+            const populateOption = buildDeepPopulate(contentType.attributes, strapi.components);
+            const findOneArgs: any = { documentId: target.documentId };
+            if (populateOption) findOneArgs.populate = populateOption;
+            if (isLocalized) findOneArgs.locale = target.locale;
+
+            const currentEntry: any = await strapi.documents(target.uid as any).findOne(findOneArgs);
+            if (!currentEntry) {
+              skippedCount++;
+              diffs.push({
+                uid: target.uid,
+                collectionName: displayName,
+                documentId: target.documentId,
+                label: `Entry #${target.documentId}`,
+                attribute,
+                oldValue: null,
+                newValue: null,
+                oldDisplay: '—',
+                newDisplay: '—',
+                hasChange: false,
+                status: 'will_skip',
+                message: `Entry "${target.documentId}" was not found`,
+              });
+              continue;
+            }
+
+            const entryLabel =
+              currentEntry?.name ||
+              currentEntry?.title ||
+              currentEntry?.email ||
+              `Entry #${target.documentId}`;
+
+            const applied = await applyOccurrenceUpdatesToDocument({
+              strapi,
+              contentType,
+              allComponents: strapi.components,
+              currentDoc: currentEntry,
+              attribute,
+              updates,
+            });
+
+            if (applied.errors.length > 0) {
+              willErrorCount++;
+              diffs.push({
+                uid: target.uid,
+                collectionName: displayName,
+                documentId: target.documentId,
+                label: entryLabel,
+                attribute,
+                oldValue: null,
+                newValue: null,
+                oldDisplay: '—',
+                newDisplay: '—',
+                hasChange: false,
+                status: 'will_error',
+                validationError: applied.errors.join('; '),
+                message: applied.errors.join('; '),
+              });
+              continue;
+            }
+
+            const proposedEntity = deepMergeEntities(currentEntry, applied.updateData);
+            const valResult = await validateEntityQuotas(strapi, target.uid, proposedEntity);
+            const quotaError = !valResult.isValid ? valResult.errorMessage : undefined;
+
+            for (const d of applied.diffs) {
+              if (quotaError && d.hasChange) {
+                willErrorCount++;
+              } else if (d.hasChange) {
+                willUpdateCount++;
+              } else {
+                unchangedCount++;
+              }
+
+              const blockSuffix = isComponentNested
+                ? d.componentName && d.segments?.some((s) => s.index !== undefined)
+                  ? ` [Block #${d.index} (${d.componentName})]`
+                  : d.segments?.some((s) => s.index !== undefined)
+                  ? ` [#${d.index}]`
+                  : ''
+                : '';
+
+              diffs.push({
+                uid: target.uid,
+                collectionName: displayName,
+                documentId: target.documentId,
+                label: `${entryLabel}${blockSuffix}`,
+                attribute: d.attribute,
+                occurrenceKey: d.occurrenceKey,
+                componentId: d.componentId,
+                oldValue: d.oldValue,
+                newValue: d.newValue,
+                oldDisplay: d.oldDisplay,
+                newDisplay: d.newDisplay,
+                hasChange: d.hasChange,
+                status: quotaError && d.hasChange ? 'will_error' : d.hasChange ? 'will_update' : 'unchanged',
+                validationError: quotaError && d.hasChange ? quotaError : undefined,
+                message:
+                  quotaError && d.hasChange
+                    ? quotaError
+                    : d.hasChange
+                    ? 'Grid edit will update this value'
+                    : 'Value already matches database',
+              });
+            }
+          } catch (err: any) {
+            willErrorCount++;
+            diffs.push({
+              uid: target.uid,
+              collectionName: displayName,
+              documentId: target.documentId,
+              label: `Entry #${target.documentId}`,
+              attribute,
+              oldValue: null,
+              newValue: null,
+              oldDisplay: '—',
+              newDisplay: '—',
+              hasChange: false,
+              status: 'will_error',
+              validationError: err.message,
+              message: `Error inspecting entry: ${err.message}`,
+            });
+          }
+        }
+
+        return {
+          success: true,
+          editMode: 'grid',
+          summary: {
+            total: gridTargets.length,
+            willUpdate: willUpdateCount,
+            unchanged: unchangedCount,
+            skipped: skippedCount,
+            willError: willErrorCount,
+          },
+          diffs,
+        };
       }
 
       const targetsMap = new Map<string, { uid: string; documentId: string; dynamicZoneIndexes?: number[]; targetComponentUid?: string }>();
@@ -3247,6 +3828,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       {
         attribute,
         value,
+        editMode = 'common',
         selectedEntries = [],
         selectedCollections = [],
         isRegex = false,
@@ -3261,7 +3843,8 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       }: {
         attribute: string;
         value: string;
-        selectedEntries?: Array<{ uid: string; documentId: string; dynamicZoneIndexes?: number[]; targetComponentUid?: string }>;
+        editMode?: EditMode;
+        selectedEntries?: BulkTargetEntry[];
         selectedCollections?: string[];
         isRegex?: boolean;
         regexPattern?: string;
@@ -3279,33 +3862,62 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         throw new Error('Attribute name is required.');
       }
 
+      const effectiveEditMode: EditMode = editMode === 'grid' ? 'grid' : 'common';
+      const effectiveSummaryValue =
+        effectiveEditMode === 'grid' ? summarizeGridPayloadValue(selectedEntries) : value;
+      const effectiveIsRegex = effectiveEditMode === 'grid' ? false : isRegex;
+      const effectiveRegexPattern = effectiveEditMode === 'grid' ? '' : regexPattern;
+
       const executionConfig = getExecutionWindowConfig(strapi);
       const { isBusinessHours, policyMessage } = checkBusinessHours(executionConfig);
 
-      // 1. Enterprise Maker-Checker Flow:
-      if (executionMode === 'maker_checker') {
-        const summary = await computeTargetsSummary(strapi, { selectedCollections, selectedEntries });
+      const enqueuePendingBatch = async (
+        status: 'pending_approval' | 'queued_offpeak',
+        mode: 'maker_checker' | 'queue_offpeak',
+        notes: string,
+        scheduledFor?: string,
+        extraPolicyMessage?: string
+      ) => {
+        const summary = await computeTargetsSummary(strapi, {
+          selectedCollections: effectiveEditMode === 'grid' ? [] : selectedCollections,
+          selectedEntries,
+          editMode: effectiveEditMode,
+        });
         if (summary.totalTargets === 0) {
           throw new Error('No collections or entries were selected for update.');
         }
 
         const batchId = `batch_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+        const createdBy = currentUser
+          ? {
+              id: currentUser.id,
+              email: currentUser.email,
+              firstname: currentUser.firstname,
+              lastname: currentUser.lastname,
+              username: currentUser.username,
+            }
+          : { email: 'admin@system.local' };
+
         const batch: PendingBatch = {
           id: batchId,
           createdAt: new Date().toISOString(),
-          createdBy: currentUser
-            ? {
-                id: currentUser.id,
-                email: currentUser.email,
-                firstname: currentUser.firstname,
-                lastname: currentUser.lastname,
-                username: currentUser.username,
-              }
-            : { email: 'admin@system.local' },
-          payload: { attribute, value, selectedEntries, selectedCollections, isRegex, regexPattern, publishOnApproval, publishStrategy, unreviewedConsent, unreviewedCount },
+          createdBy,
+          payload: {
+            attribute,
+            value: effectiveSummaryValue,
+            editMode: effectiveEditMode,
+            selectedEntries,
+            selectedCollections: effectiveEditMode === 'grid' ? [] : selectedCollections,
+            isRegex: effectiveIsRegex,
+            regexPattern: effectiveRegexPattern,
+            publishOnApproval,
+            publishStrategy,
+            unreviewedConsent,
+            unreviewedCount,
+          },
           summary: {
             attribute,
-            value,
+            value: effectiveSummaryValue,
             totalTargets: summary.totalTargets,
             collectionBreakdown: summary.collectionBreakdown,
             publishOnApproval,
@@ -3313,20 +3925,22 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
             unreviewedConsent,
             unreviewedCount,
           },
-          status: 'pending_approval',
-          executionMode: 'maker_checker',
-          makerNotes,
+          status,
+          executionMode: mode,
+          ...(scheduledFor ? { scheduledFor } : {}),
+          makerNotes: notes,
         };
 
         pendingBatches.set(batchId, batch);
         batchJobsMap.set(batchId, {
           id: batchId,
           createdAt: batch.createdAt,
-          createdBy: batch.createdBy,
-          status: 'pending_approval',
-          executionMode: 'maker_checker',
+          createdBy,
+          status,
+          executionMode: mode,
+          ...(scheduledFor ? { scheduledFor } : {}),
           attribute,
-          value,
+          value: effectiveSummaryValue,
           totalTargets: summary.totalTargets,
           processedCount: 0,
           updatedCount: 0,
@@ -3337,10 +3951,17 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           publishStrategy,
           unreviewedConsent,
           unreviewedCount,
-          makerNotes,
+          ...(extraPolicyMessage ? { policyMessage: extraPolicyMessage } : {}),
+          makerNotes: notes,
           results: [],
         });
 
+        return { batchId, batch };
+      };
+
+      // 1. Enterprise Maker-Checker Flow:
+      if (executionMode === 'maker_checker') {
+        const { batchId, batch } = await enqueuePendingBatch('pending_approval', 'maker_checker', makerNotes);
         return {
           success: true,
           pending: true,
@@ -3353,65 +3974,12 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
       // 2. Off-Peak Queued Batch:
       if (executionMode === 'queue_offpeak') {
-        const summary = await computeTargetsSummary(strapi, { selectedCollections, selectedEntries });
-        if (summary.totalTargets === 0) {
-          throw new Error('No collections or entries were selected for update.');
-        }
-
-        const batchId = `batch_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-        const batch: PendingBatch = {
-          id: batchId,
-          createdAt: new Date().toISOString(),
-          createdBy: currentUser
-            ? {
-                id: currentUser.id,
-                email: currentUser.email,
-                firstname: currentUser.firstname,
-                lastname: currentUser.lastname,
-                username: currentUser.username,
-              }
-            : { email: 'admin@system.local' },
-          payload: { attribute, value, selectedEntries, selectedCollections, isRegex, regexPattern, publishOnApproval, publishStrategy, unreviewedConsent, unreviewedCount },
-          summary: {
-            attribute,
-            value,
-            totalTargets: summary.totalTargets,
-            collectionBreakdown: summary.collectionBreakdown,
-            publishOnApproval,
-            publishStrategy,
-            unreviewedConsent,
-            unreviewedCount,
-          },
-          status: 'queued_offpeak',
-          executionMode: 'queue_offpeak',
-          scheduledFor: executionConfig.offPeakStartTime,
+        const { batchId, batch } = await enqueuePendingBatch(
+          'queued_offpeak',
+          'queue_offpeak',
           makerNotes,
-        };
-
-        pendingBatches.set(batchId, batch);
-        batchJobsMap.set(batchId, {
-          id: batchId,
-          createdAt: batch.createdAt,
-          createdBy: batch.createdBy,
-          status: 'queued_offpeak',
-          executionMode: 'queue_offpeak',
-          scheduledFor: executionConfig.offPeakStartTime,
-          attribute,
-          value,
-          totalTargets: summary.totalTargets,
-          processedCount: 0,
-          updatedCount: 0,
-          skippedCount: 0,
-          failedCount: 0,
-          isLive: false,
-          publishOnApproval: Boolean(publishOnApproval),
-          publishStrategy,
-          unreviewedConsent,
-          unreviewedCount,
-          makerNotes,
-          results: [],
-        });
-
+          executionConfig.offPeakStartTime
+        );
         return {
           success: true,
           pending: true,
@@ -3425,66 +3993,13 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
       // 3. Immediate execution request with Server Business Hours enforcement:
       if (executionConfig.enabled && executionConfig.autoQueueDuringBusinessHours && isBusinessHours && !forceImmediate) {
-        const summary = await computeTargetsSummary(strapi, { selectedCollections, selectedEntries });
-        if (summary.totalTargets === 0) {
-          throw new Error('No collections or entries were selected for update.');
-        }
-
-        const batchId = `batch_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-        const batch: PendingBatch = {
-          id: batchId,
-          createdAt: new Date().toISOString(),
-          createdBy: currentUser
-            ? {
-                id: currentUser.id,
-                email: currentUser.email,
-                firstname: currentUser.firstname,
-                lastname: currentUser.lastname,
-                username: currentUser.username,
-              }
-            : { email: 'admin@system.local' },
-          payload: { attribute, value, selectedEntries, selectedCollections, isRegex, regexPattern, publishOnApproval, publishStrategy, unreviewedConsent, unreviewedCount },
-          summary: {
-            attribute,
-            value,
-            totalTargets: summary.totalTargets,
-            collectionBreakdown: summary.collectionBreakdown,
-            publishOnApproval,
-            publishStrategy,
-            unreviewedConsent,
-            unreviewedCount,
-          },
-          status: 'queued_offpeak',
-          executionMode: 'queue_offpeak',
-          scheduledFor: executionConfig.offPeakStartTime,
-          makerNotes: 'Automatically queued due to peak business hours restriction.',
-        };
-
-        pendingBatches.set(batchId, batch);
-        batchJobsMap.set(batchId, {
-          id: batchId,
-          createdAt: batch.createdAt,
-          createdBy: batch.createdBy,
-          status: 'queued_offpeak',
-          executionMode: 'queue_offpeak',
-          scheduledFor: executionConfig.offPeakStartTime,
-          attribute,
-          value,
-          totalTargets: summary.totalTargets,
-          processedCount: 0,
-          updatedCount: 0,
-          skippedCount: 0,
-          failedCount: 0,
-          isLive: false,
-          publishOnApproval: Boolean(publishOnApproval),
-          publishStrategy,
-          unreviewedConsent,
-          unreviewedCount,
-          policyMessage,
-          makerNotes: 'Automatically queued due to peak business hours restriction.',
-          results: [],
-        });
-
+        const { batchId, batch } = await enqueuePendingBatch(
+          'queued_offpeak',
+          'queue_offpeak',
+          'Automatically queued due to peak business hours restriction.',
+          executionConfig.offPeakStartTime,
+          policyMessage
+        );
         return {
           success: true,
           pending: true,
@@ -3499,7 +4014,18 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       // 4. Immediate execution
       return await executeBatchInternal(
         strapi,
-        { attribute, value, selectedEntries, selectedCollections, isRegex, regexPattern, publishOnApproval, publishStrategy, unreviewedConsent },
+        {
+          attribute,
+          value: effectiveSummaryValue,
+          editMode: effectiveEditMode,
+          selectedEntries,
+          selectedCollections: effectiveEditMode === 'grid' ? [] : selectedCollections,
+          isRegex: effectiveIsRegex,
+          regexPattern: effectiveRegexPattern,
+          publishOnApproval,
+          publishStrategy,
+          unreviewedConsent,
+        },
         currentUser
       );
     },
@@ -4144,10 +4670,11 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           diffs,
         };
       } else {
-        // Standard Bulk Update
+        // Standard or Grid-Mode Bulk Update
         const preview = await this.previewBatch({
           attribute: batch.payload.attribute,
           value: batch.payload.value,
+          editMode: batch.payload.editMode,
           selectedEntries: batch.payload.selectedEntries,
           selectedCollections: batch.payload.selectedCollections,
           isRegex: batch.payload.isRegex,
@@ -4161,7 +4688,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
             willUpdate: preview.summary?.willUpdate ?? 0,
             willCreate: 0,
             unchanged: preview.summary?.unchanged ?? 0,
-            skipped: preview.summary?.skipped ?? 0,
+            skipped: (preview.summary?.skipped ?? 0) + (preview.summary?.willError ?? 0),
           },
           diffs: (preview.diffs || []).map((d: any) => ({
             ...d,
@@ -4179,6 +4706,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         batchSummary: batch.summary,
         payload: {
           action: batch.payload?.action || 'bulk_update',
+          editMode: batch.payload?.editMode || 'common',
           attribute: batch.payload?.attribute,
           value: batch.payload?.value,
           publishOnApproval: batch.summary?.publishOnApproval,
