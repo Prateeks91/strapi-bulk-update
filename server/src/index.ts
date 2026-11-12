@@ -14,6 +14,13 @@ export * from './services/csv/index';
 export { extractHeadingsFromRichText, validateEntityQuotas, deepMergeEntities } from './services/validation-rules';
 export { sortAuditRecordsDesc, withRollbackLock } from './services/audit';
 export { buildCollectionQueryFilters, getAllNestedValues } from './services/bulk-updater';
+export {
+  enumerateOccurrences,
+  applyOccurrenceUpdatesToDocument,
+  coerceAndValidateFieldValue,
+  buildRichAttributeMeta,
+  resolveBatchTargets,
+} from './services/bulk-updater/grid-occurrences';
 
 import { errors } from '@strapi/utils';
 

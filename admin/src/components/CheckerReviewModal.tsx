@@ -28,7 +28,7 @@ export interface DiffItem {
   oldDisplay: string;
   newDisplay: string;
   hasChange: boolean;
-  status: 'will_update' | 'will_create' | 'unchanged' | 'will_skip';
+  status: 'will_update' | 'will_create' | 'unchanged' | 'will_skip' | 'will_error';
   action?: 'update' | 'create' | 'publish' | 'skip';
   message: string;
 }
@@ -536,6 +536,10 @@ const CheckerReviewModal: React.FC<CheckerReviewModalProps> = ({
                               <Typography variant="omega" fontWeight="bold" textColor="success700" style={{ wordBreak: 'break-all' }}>
                                 {diff.newDisplay || '(new value)'}
                               </Typography>
+                            ) : diff.status === 'will_error' ? (
+                              <Typography variant="pi" textColor="danger700" fontWeight="bold">
+                                {(diff as any).validationError || diff.message || 'Validation error'}
+                              </Typography>
                             ) : diff.status === 'will_skip' ? (
                               <Typography variant="pi" textColor="warning700">
                                 — Skipped —
@@ -567,8 +571,13 @@ const CheckerReviewModal: React.FC<CheckerReviewModalProps> = ({
                               </Badge>
                             )}
                             {diff.status === 'will_skip' && (
-                              <Badge backgroundColor="danger100" textColor="danger700">
+                              <Badge backgroundColor="warning100" textColor="warning700">
                                 ⚠ Will Skip
+                              </Badge>
+                            )}
+                            {diff.status === 'will_error' && (
+                              <Badge backgroundColor="danger100" textColor="danger700">
+                                ✕ Validation Error
                               </Badge>
                             )}
                           </Td>

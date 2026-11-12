@@ -6,6 +6,7 @@ import {
   parseDynamicZonePath,
   isDeepComponentField,
 } from './bulk-updater';
+import { applyOccurrenceUpdatesToDocument } from './bulk-updater/grid-occurrences';
 
 export interface AuditConfig {
   enabled: boolean;
@@ -500,6 +501,12 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             isDynamicZone ||
             isDeepComponentField(ct, strapi.components, item.attribute);
 
+          const isLocalized =
+            Boolean(ct?.pluginOptions?.i18n?.localized) &&
+            item.locale &&
+            item.locale !== 'null' &&
+            item.locale !== 'undefined';
+
           let wasPublished = false;
 
           if (isNested && (isComponent || isDynamicZone || rootAttrDef)) {
@@ -508,6 +515,9 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             const findOneArgs: any = { documentId: item.documentId };
             if (populateOption) {
               findOneArgs.populate = populateOption;
+            }
+            if (isLocalized) {
+              findOneArgs.locale = item.locale;
             }
             const currentDoc: any = await strapi.documents(item.uid as any).findOne(findOneArgs);
             if (!currentDoc) {
@@ -521,24 +531,56 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             let restoredRoot: any;
 
             if (Array.isArray(item.dynamicZoneDiffs) && item.dynamicZoneDiffs.length > 0) {
-              // If item recorded individual dynamic zone block diffs, revert each one
-              let workingRoot = existingRoot;
-              for (const dzDiff of item.dynamicZoneDiffs) {
-                const parsedDz = parseDynamicZonePath(dzDiff.attribute || item.attribute);
-                const dzParts = parsedDz.cleanPath.split('.').slice(1);
-                const targetIndexes =
-                  dzDiff.index !== undefined
-                    ? [dzDiff.index]
-                    : parsedDz.targetIndex !== undefined
-                    ? [parsedDz.targetIndex]
-                    : undefined;
-                workingRoot = setDeepProperty(workingRoot, dzParts, dzDiff.oldValue ?? null, {
-                  targetIndexes,
-                  targetComponentUid: dzDiff.componentUid || parsedDz.targetComponentUid,
-                  strapi,
+              const hasStructuredSegments = item.dynamicZoneDiffs.some(
+                (dz: any) => Array.isArray(dz?.segments) && dz.segments.length > 0
+              );
+              if (hasStructuredSegments) {
+                const occUpdates = item.dynamicZoneDiffs.map((dzDiff: any) => {
+                  const isRelDiff = dzDiff.oldValue && typeof dzDiff.oldValue === 'object' && dzDiff.oldValue.isRelation;
+                  const val = isRelDiff
+                    ? { mode: 'set', documentIds: Array.isArray(dzDiff.oldValue.documentIds) ? dzDiff.oldValue.documentIds : [] }
+                    : dzDiff.oldValue ?? null;
+                  return {
+                    occurrenceKey: dzDiff.occurrenceKey,
+                    segments: dzDiff.segments,
+                    dynamicZoneIndex: dzDiff.index,
+                    componentId: dzDiff.componentId,
+                    componentUid: dzDiff.componentUid,
+                    value: val,
+                  };
                 });
+                const reverted = await applyOccurrenceUpdatesToDocument({
+                  strapi,
+                  contentType: ct,
+                  allComponents: strapi.components,
+                  currentDoc,
+                  attribute: item.attribute,
+                  updates: occUpdates,
+                });
+                if (reverted.errors.length > 0) {
+                  throw new Error(reverted.errors.join('; '));
+                }
+                restoredRoot = reverted.updateData[rootKey];
+              } else {
+                // Legacy dynamic zone block diffs: revert each one onto workingRoot
+                let workingRoot = existingRoot;
+                for (const dzDiff of item.dynamicZoneDiffs) {
+                  const parsedDz = parseDynamicZonePath(dzDiff.attribute || item.attribute);
+                  const dzParts = parsedDz.cleanPath.split('.').slice(1);
+                  const targetIndexes =
+                    dzDiff.index !== undefined
+                      ? [dzDiff.index]
+                      : parsedDz.targetIndex !== undefined
+                      ? [parsedDz.targetIndex]
+                      : undefined;
+                  workingRoot = setDeepProperty(workingRoot, dzParts, dzDiff.oldValue ?? null, {
+                    targetIndexes,
+                    targetComponentUid: dzDiff.componentUid || parsedDz.targetComponentUid,
+                    strapi,
+                  });
+                }
+                restoredRoot = workingRoot;
               }
-              restoredRoot = workingRoot;
             } else {
               const parts = parsed.cleanPath.split('.');
               const pathParts = parts.slice(1);
@@ -554,6 +596,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
             await strapi.documents(item.uid as any).update({
               documentId: item.documentId,
+              ...(isLocalized ? { locale: item.locale } : {}),
               data: {
                 [rootKey]: restoredRoot,
               },
@@ -562,11 +605,13 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             // Top-level scalar or relation
             const currentDoc: any = await strapi.documents(item.uid as any).findOne({
               documentId: item.documentId,
+              ...(isLocalized ? { locale: item.locale } : {}),
             });
             wasPublished = Boolean(currentDoc?.publishedAt);
 
             await strapi.documents(item.uid as any).update({
               documentId: item.documentId,
+              ...(isLocalized ? { locale: item.locale } : {}),
               data: {
                 [item.attribute]: rollbackPayload,
               },
@@ -577,6 +622,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             try {
               await (strapi.documents(item.uid as any) as any).publish({
                 documentId: item.documentId,
+                ...(isLocalized ? { locale: item.locale } : {}),
               });
             } catch (publishErr: any) {
               strapi.log.warn(`[bulk-updater] Failed to auto-publish rollback for ${item.uid}/${item.documentId}:`, publishErr?.message);

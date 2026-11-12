@@ -27,6 +27,14 @@ export default {
         },
       },
       {
+        method: 'GET',
+        path: '/media-options',
+        handler: 'bulkUpdater.getMediaOptions',
+        config: {
+          policies: [],
+        },
+      },
+      {
         method: 'POST',
         path: '/batch-update',
         handler: 'bulkUpdater.batchUpdate',
