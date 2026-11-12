@@ -23,6 +23,7 @@ import {
   extractMetadataFromRow,
   buildDocumentUpdatePayload,
   verifyDocumentIntegrity,
+  validateRecordSchemaConstraints,
   buildErrorCsv,
   formatErrorCsvFilename,
   sanitizeUserErrorMessage,
@@ -1252,7 +1253,50 @@ async function executeUpdateMutation(
     unreviewedConsent: options.unreviewedConsent,
   });
 
-  // Pre-validate entire proposed entity against active Validation & Quota Rules before mutating or publishing
+  // Pre-validate record applicability/required constraints + active Validation & Quota Rules before mutating or publishing
+  const rowMeta = extractMetadataFromRow(row);
+  const schemaValidation = validateRecordSchemaConstraints(
+    strapi,
+    uid,
+    existing,
+    updatePayload,
+    row,
+    {
+      isCreate: false,
+      rowMeta: rowMeta
+        ? {
+            applicableFields: rowMeta.applicableFields,
+            flatTypes: rowMeta.flatTypes,
+          }
+        : null,
+    }
+  );
+  if (schemaValidation.errors.length > 0) {
+    const errMsg = schemaValidation.errors[0];
+    stats.skipped++;
+    if (stats.failed !== undefined) stats.failed++;
+    recordFailedCsvRow(
+      stats,
+      rowNumber,
+      row,
+      errMsg,
+      resolvedDocId,
+      options.originalHeaders
+    );
+    stats.diffs.push({
+      uid,
+      collectionName: ct.info?.displayName || uid,
+      documentId: resolvedDocId,
+      label: existing.title || existing.name || `Entry #${resolvedDocId}`,
+      attribute: '',
+      oldValue: null,
+      newValue: null,
+      status: 'error',
+      message: errMsg,
+    });
+    return;
+  }
+
   const proposedEntity = deepMergeEntities(existing, updatePayload);
   const valResult = await validateEntityQuotas(strapi, uid, proposedEntity);
   if (!valResult.isValid) {
@@ -1366,6 +1410,49 @@ async function executeCreateMutation(
     row,
     { isPartialUpdate: false }
   );
+
+  const rowMeta = extractMetadataFromRow(row);
+  const schemaValidation = validateRecordSchemaConstraints(
+    strapi,
+    uid,
+    null,
+    createPayload,
+    row,
+    {
+      isCreate: true,
+      rowMeta: rowMeta
+        ? {
+            applicableFields: rowMeta.applicableFields,
+            flatTypes: rowMeta.flatTypes,
+          }
+        : null,
+    }
+  );
+  if (schemaValidation.errors.length > 0) {
+    const errMsg = schemaValidation.errors[0];
+    stats.skipped++;
+    if (stats.failed !== undefined) stats.failed++;
+    recordFailedCsvRow(
+      stats,
+      rowNumber,
+      row,
+      errMsg,
+      docId || 'new',
+      options.originalHeaders
+    );
+    stats.diffs.push({
+      uid,
+      collectionName: ct.info?.displayName || uid,
+      documentId: docId || 'new',
+      label: `Row ${rowNumber}`,
+      attribute: '',
+      oldValue: null,
+      newValue: null,
+      status: 'error',
+      message: errMsg,
+    });
+    return;
+  }
 
   const valResultNew = await validateEntityQuotas(strapi, uid, createPayload);
   if (!valResultNew.isValid) {
@@ -1864,10 +1951,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     const schema = discoverSchema(strapi, uid);
     const deepPopulate = buildLosslessPopulate(strapi, uid);
 
-    const headers = [METADATA_COLUMN_KEY, ...schema.allExportKeys];
-    const lines: string[] = [];
-    lines.push(headers.map(escapeCsvCell).join(','));
-
     // Build database query filters using shared filter engine (100% parity with Workspace)
     const filterMeta = buildCollectionQueryFilters(strapi, ct, {
       attribute: options.attribute,
@@ -1880,11 +1963,12 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
     if (!filterMeta.colHasAttribute && filterMeta.normOp && filterMeta.normOp !== 'none') {
       // Attribute does not exist on collection: return empty CSV (headers only)
+      const emptySerialized = serializeDocumentsToCsv(strapi, uid, [], { schema });
       return {
         filename: `${ct.info?.singularName || uid}_export_${new Date().toISOString().slice(0, 10)}.csv`,
-        csvContent: '\uFEFF' + lines.join('\r\n') + '\r\n',
+        csvContent: emptySerialized.csvContent,
         count: 0,
-        fields: headers,
+        fields: emptySerialized.headers,
       };
     }
 
@@ -1945,7 +2029,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       return matches.some((m) => testSingleValue(m.value));
     };
 
-    let totalExported = 0;
+    const exportedDocs: any[] = [];
     const maxLimit = options.limit && options.limit > 0 ? options.limit : Infinity;
     const BATCH_SIZE = 200;
     const exportedAt = new Date().toISOString();
@@ -1959,29 +2043,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       }
       const doc = await (strapi.documents(uid as any) as any).findFirst(findFirstArgs);
       if (doc && passesDzFilter(doc)) {
-        const rowValues: string[] = [];
-        const metadata: BulkUpdaterMetadata = {
-          schemaVersion: CURRENT_SCHEMA_VERSION,
-          contentType: uid,
-          documentId: String(doc.documentId || doc.id || ''),
-          locale: doc.locale || undefined,
-          exportedAt,
-        };
-        rowValues.push(escapeCsvCell(metadata));
-
-        for (const key of schema.allExportKeys) {
-          if (key === 'documentId') {
-            rowValues.push(escapeCsvCell(doc.documentId || doc.id || ''));
-          } else if (key === 'locale') {
-            rowValues.push(escapeCsvCell(doc.locale || ''));
-          } else {
-            const field = schema.fields[key];
-            const rawVal = doc[key];
-            rowValues.push(escapeCsvCell(field ? serializeFieldValue(rawVal, field) : rawVal));
-          }
-        }
-        lines.push(rowValues.join(','));
-        totalExported = 1;
+        exportedDocs.push(doc);
       }
     } else {
       let currentPage = 1;
@@ -1993,8 +2055,8 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         ? { id: 'desc' }
         : undefined;
 
-      while (hasMore && totalExported < maxLimit) {
-        const remaining = maxLimit - totalExported;
+      while (hasMore && exportedDocs.length < maxLimit) {
+        const remaining = maxLimit - exportedDocs.length;
         const currentBatchLimit = Math.min(BATCH_SIZE, remaining);
 
         const findPageArgs: any = {
@@ -2020,30 +2082,8 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           if (!passesDzFilter(entry)) {
             continue;
           }
-          const rowValues: string[] = [];
-          const metadata: BulkUpdaterMetadata = {
-            schemaVersion: CURRENT_SCHEMA_VERSION,
-            contentType: uid,
-            documentId: String(entry.documentId || entry.id || ''),
-            locale: entry.locale || undefined,
-            exportedAt,
-          };
-          rowValues.push(escapeCsvCell(metadata));
-
-          for (const key of schema.allExportKeys) {
-            if (key === 'documentId') {
-              rowValues.push(escapeCsvCell(entry.documentId || entry.id || ''));
-            } else if (key === 'locale') {
-              rowValues.push(escapeCsvCell(entry.locale || ''));
-            } else {
-              const field = schema.fields[key];
-              const rawVal = entry[key];
-              rowValues.push(escapeCsvCell(field ? serializeFieldValue(rawVal, field) : rawVal));
-            }
-          }
-          lines.push(rowValues.join(','));
-          totalExported++;
-          if (totalExported >= maxLimit) {
+          exportedDocs.push(entry);
+          if (exportedDocs.length >= maxLimit) {
             hasMore = false;
             break;
           }
@@ -2059,14 +2099,14 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       }
     }
 
-    const csvContent = '\uFEFF' + lines.join('\r\n') + '\r\n';
+    const serialized = serializeDocumentsToCsv(strapi, uid, exportedDocs, { exportedAt, schema });
     const filename = `${ct.info?.singularName || uid}_export_${new Date().toISOString().slice(0, 10)}.csv`;
 
     return {
       filename,
-      csvContent,
-      count: totalExported,
-      fields: headers,
+      csvContent: serialized.csvContent,
+      count: serialized.count,
+      fields: serialized.headers,
     };
   },
 
@@ -2711,18 +2751,55 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         }
       }
 
-      // 4. Complete Validation & Quota Rules Check across entire proposed entity
+      // 4. Shared Schema Applicability, Mandatory Fields, & Quota Rules Validation
+      let proposedPayload: any = {};
+      try {
+        proposedPayload = await buildDocumentUpdatePayload(
+          strapi,
+          uid,
+          existing,
+          row,
+          { isPartialUpdate: mode === 'update' }
+        );
+      } catch {}
+
+      const rowMeta = extractMetadataFromRow(row);
+      const isRowCreate = mode === 'create_or_override' ? !existing : !existing && mode !== 'update';
+      if (!(mode === 'update' && (!docId || !existing))) {
+        const schemaValidation = validateRecordSchemaConstraints(
+          strapi,
+          uid,
+          existing,
+          proposedPayload,
+          row,
+          {
+            isCreate: isRowCreate,
+            rowMeta: rowMeta
+              ? {
+                  applicableFields: rowMeta.applicableFields,
+                  flatTypes: rowMeta.flatTypes,
+                }
+              : null,
+          }
+        );
+        for (const errStr of schemaValidation.errors) {
+          errors.push({
+            row: rowNumber,
+            documentId: docId || undefined,
+            error: errStr,
+          });
+          rowHasError = true;
+        }
+        for (const warnStr of schemaValidation.warnings) {
+          warnings.push({
+            row: rowNumber,
+            documentId: docId || undefined,
+            warning: warnStr,
+          });
+        }
+      }
+
       if (activeRules.length > 0) {
-        let proposedPayload: any = {};
-        try {
-          proposedPayload = await buildDocumentUpdatePayload(
-            strapi,
-            uid,
-            existing,
-            row,
-            { isPartialUpdate: mode === 'update' }
-          );
-        } catch {}
         const proposedEntity = existing ? deepMergeEntities(existing, proposedPayload) : proposedPayload;
         const valResult = await validateEntityQuotas(strapi, uid, proposedEntity, activeRules);
         if (!valResult.isValid) {
@@ -2870,7 +2947,10 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
             const oldDisplay = formatValueDisplay(oldVal);
             const newDisplay = formatValueDisplay(newVal);
-            const hasChange = String(oldVal ?? '') !== String(newVal ?? '');
+            const hasChange =
+              (typeof oldVal === 'object' && oldVal !== null) || (typeof newVal === 'object' && newVal !== null)
+                ? oldDisplay !== newDisplay
+                : String(oldVal ?? '') !== String(newVal ?? '');
 
             if (hasChange) {
               rowHasChanges = true;

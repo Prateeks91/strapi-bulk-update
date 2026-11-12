@@ -20,7 +20,7 @@ import {
   Combobox,
   ComboboxOption,
 } from '@strapi/design-system';
-import { Download, Upload, ArrowClockwise, Check, ChevronLeft, ChevronRight, Eye } from '@strapi/icons';
+import { Download, Upload, ArrowClockwise, Check, ChevronLeft, ChevronRight, Eye, Search } from '@strapi/icons';
 import {
   parseCsvWithHeaders,
   extractDocId,
@@ -31,6 +31,14 @@ import {
 } from '../utils/csvParser';
 import { isAbortError } from '../utils/isAbortError';
 import { getEntryLifecycleStatus, Entry, PendingBatch } from '../utils/lifecycleStatus';
+import {
+  type FilterOperator,
+  type SearchFilterSnapshot,
+  EMPTY_SEARCH_FILTER,
+  areSearchFiltersEqual,
+  buildEntriesQueryParams,
+  buildCsvExportQueryParams,
+} from '../utils/deferredFilter';
 
 interface CollectionModel {
   uid: string;
@@ -71,14 +79,23 @@ export default function CsvManagerTab() {
   const [relationsMeta, setRelationsMeta] = useState<Record<string, RelationMeta>>({});
   const [attributesMeta, setAttributesMeta] = useState<Record<string, AttributeMeta>>({});
 
-  // Search and Filter states for CSV Export (100% parity with Bulk Updater Workspace)
-  type FilterOperator = 'none' | 'empty' | 'not_empty' | 'equals' | 'contains' | 'starts_with';
+  // Search and Filter states for CSV Export (deferred execution until Search click)
   const [searchAttribute, setSearchAttribute] = useState<string>('');
   const [filterOperator, setFilterOperator] = useState<FilterOperator>('none');
   const [filterQuery, setFilterQuery] = useState<string>('');
   const [entrySearch, setEntrySearch] = useState<string>('');
+  const [appliedFilter, setAppliedFilter] = useState<SearchFilterSnapshot>(EMPTY_SEARCH_FILTER);
+  const appliedFilterRef = useRef<SearchFilterSnapshot>(EMPTY_SEARCH_FILTER);
   const [matchingCount, setMatchingCount] = useState<number | null>(null);
   const [countLoading, setCountLoading] = useState<boolean>(false);
+
+  const draftFilter: SearchFilterSnapshot = {
+    searchAttribute,
+    filterOperator,
+    filterQuery,
+    entrySearch,
+  };
+  const hasPendingFilterChanges = !areSearchFiltersEqual(draftFilter, appliedFilter);
 
   // Relation filter search options
   const [searchRelationOptions, setSearchRelationOptions] = useState<Array<{ documentId: string; label: string }>>([]);
@@ -263,66 +280,95 @@ export default function CsvManagerTab() {
       fileInputRef.current.value = '';
     }
 
-    // Reset search & filter criteria
+    // Reset search & filter criteria (both draft and applied)
     setSearchAttribute('');
     setFilterOperator('none');
     setFilterQuery('');
     setEntrySearch('');
+    appliedFilterRef.current = EMPTY_SEARCH_FILTER;
+    setAppliedFilter(EMPTY_SEARCH_FILTER);
     setMatchingCount(null);
     setCountLoading(Boolean(newUid));
   };
 
+  const executeMatchingCountSearch = async (targetUid: string, filterToApply: SearchFilterSnapshot) => {
+    if (!targetUid) {
+      setMatchingCount(null);
+      setCountLoading(false);
+      return;
+    }
+
+    if (countAbortControllerRef.current) {
+      countAbortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    countAbortControllerRef.current = controller;
+    setCountLoading(true);
+
+    try {
+      const params = buildEntriesQueryParams({
+        page: 1,
+        pageSize: 1,
+        filter: filterToApply,
+        includeAttributeEvenIfSame: true,
+      });
+
+      const res = await get(`/bulk-updater/collections/${targetUid}/entries?${params.toString()}`, {
+        signal: controller.signal,
+      });
+
+      if (countAbortControllerRef.current !== controller) return;
+
+      if (res.data) {
+        const total = res.data.pagination?.total ?? (Array.isArray(res.data.entries) ? res.data.entries.length : 0);
+        setMatchingCount(total);
+      }
+    } catch (err: any) {
+      if (!isAbortError(err)) {
+        // Keep prior count or null
+      }
+    } finally {
+      if (countAbortControllerRef.current === controller) {
+        setCountLoading(false);
+      }
+    }
+  };
+
+  // Load baseline record count only when target collection changes (filter edits wait for Search button click)
   useEffect(() => {
     if (!selectedUid) {
       setMatchingCount(null);
       setCountLoading(false);
       return;
     }
+    executeMatchingCountSearch(selectedUid, appliedFilterRef.current);
+  }, [selectedUid]);
 
-    setCountLoading(true);
-    const timer = setTimeout(async () => {
-      if (countAbortControllerRef.current) {
-        countAbortControllerRef.current.abort();
-      }
-      const controller = new AbortController();
-      countAbortControllerRef.current = controller;
+  const handleApplySearch = () => {
+    const nextApplied: SearchFilterSnapshot = {
+      searchAttribute,
+      filterOperator,
+      filterQuery,
+      entrySearch,
+    };
+    appliedFilterRef.current = nextApplied;
+    setAppliedFilter(nextApplied);
+    if (selectedUid) {
+      executeMatchingCountSearch(selectedUid, nextApplied);
+    }
+  };
 
-      try {
-        const params = new URLSearchParams({
-          page: '1',
-          pageSize: '1',
-        });
-        if (searchAttribute) {
-          params.set('attribute', searchAttribute);
-          params.set('searchAttribute', searchAttribute);
-        }
-        if (filterOperator && filterOperator !== 'none') {
-          params.set('filterOperator', filterOperator);
-          if (filterQuery) params.set('filterQuery', filterQuery);
-        }
-        if (entrySearch && entrySearch.trim()) {
-          params.set('search', entrySearch.trim());
-        }
-
-        const res = await get(`/bulk-updater/collections/${selectedUid}/entries?${params.toString()}`, {
-          signal: controller.signal,
-        });
-
-        if (res.data) {
-          const total = res.data.pagination?.total ?? (Array.isArray(res.data.entries) ? res.data.entries.length : 0);
-          setMatchingCount(total);
-        }
-      } catch (err: any) {
-        if (!isAbortError(err)) {
-          // Keep prior count or null
-        }
-      } finally {
-        setCountLoading(false);
-      }
-    }, 300);
-
-    return () => clearTimeout(timer);
-  }, [selectedUid, searchAttribute, filterOperator, filterQuery, entrySearch]);
+  const handleClearFilters = () => {
+    setSearchAttribute('');
+    setFilterOperator('none');
+    setFilterQuery('');
+    setEntrySearch('');
+    appliedFilterRef.current = EMPTY_SEARCH_FILTER;
+    setAppliedFilter(EMPTY_SEARCH_FILTER);
+    if (selectedUid) {
+      executeMatchingCountSearch(selectedUid, EMPTY_SEARCH_FILTER);
+    }
+  };
 
   const fetchAndEnrichEntries = async (
     colUid: string,
@@ -425,16 +471,10 @@ export default function CsvManagerTab() {
     if (!selectedUid || exportingCollection) return;
     try {
       setExportingCollection(true);
-      const queryParams = new URLSearchParams();
-      if (exportLimit > 0) queryParams.set('limit', String(exportLimit));
-      if (searchAttribute) queryParams.set('searchAttribute', searchAttribute);
-      if (filterOperator && filterOperator !== 'none') {
-        queryParams.set('filterOperator', filterOperator);
-        if (filterQuery) queryParams.set('filterQuery', filterQuery);
-      }
-      if (entrySearch && entrySearch.trim()) {
-        queryParams.set('search', entrySearch.trim());
-      }
+      const queryParams = buildCsvExportQueryParams({
+        limit: exportLimit,
+        filter: appliedFilterRef.current,
+      });
 
       const res = await get(`/bulk-updater/csv/export/${selectedUid}?${queryParams.toString()}`);
       const csvStr = res.data?.csvContent || (typeof res.data === 'string' ? res.data : '');
@@ -996,17 +1036,16 @@ export default function CsvManagerTab() {
                       {matchingCount.toLocaleString()} matching records found
                     </Badge>
                   ) : null}
-                  {(searchAttribute || filterOperator !== 'none' || entrySearch.trim()) && (
-                    <Button
-                      variant="ghost"
-                      size="S"
-                      onClick={() => {
-                        setSearchAttribute('');
-                        setFilterOperator('none');
-                        setFilterQuery('');
-                        setEntrySearch('');
-                      }}
-                    >
+                  {hasPendingFilterChanges && (
+                    <Badge backgroundColor="warning100" textColor="warning700" size="S">
+                      Filters modified &mdash; click Search to apply
+                    </Badge>
+                  )}
+                  {(searchAttribute ||
+                    filterOperator !== 'none' ||
+                    entrySearch.trim() ||
+                    hasPendingFilterChanges) && (
+                    <Button variant="ghost" size="S" onClick={handleClearFilters}>
                       Clear Filters
                     </Button>
                   )}
@@ -1117,6 +1156,12 @@ export default function CsvManagerTab() {
                         placeholder="Type value to match..."
                         value={filterQuery}
                         onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFilterQuery(e.target.value)}
+                        onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            handleApplySearch();
+                          }
+                        }}
                       />
                     )}
                   </Box>
@@ -1131,7 +1176,26 @@ export default function CsvManagerTab() {
                     placeholder="Search title, name, or text across records..."
                     value={entrySearch}
                     onChange={(e: React.ChangeEvent<HTMLInputElement>) => setEntrySearch(e.target.value)}
+                    onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        handleApplySearch();
+                      }
+                    }}
                   />
+                </Box>
+
+                {/* Explicit Search Button */}
+                <Box>
+                  <Button
+                    variant={hasPendingFilterChanges ? 'default' : 'secondary'}
+                    startIcon={<Search />}
+                    onClick={handleApplySearch}
+                    loading={countLoading}
+                    disabled={!selectedUid || countLoading}
+                  >
+                    Search
+                  </Button>
                 </Box>
               </Flex>
             </Box>

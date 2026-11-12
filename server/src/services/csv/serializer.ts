@@ -1,5 +1,11 @@
 import type { Core } from '@strapi/strapi';
 import { DiscoveredSchema, DiscoveredField, discoverSchema } from './schema-discovery';
+import {
+  FlattenedLeafType,
+  buildExportColumnPlan,
+  extractRowFlattenedMetadata,
+  serializePlannedCell,
+} from './object-flattening';
 
 export const METADATA_COLUMN_KEY = '__bulk_updater_metadata';
 export const CURRENT_SCHEMA_VERSION = 1;
@@ -10,6 +16,8 @@ export interface BulkUpdaterMetadata {
   documentId: string;
   locale?: string;
   exportedAt: string;
+  applicableFields?: string[];
+  flatTypes?: Record<string, FlattenedLeafType>;
 }
 
 /**
@@ -264,24 +272,27 @@ export function serializeFieldValue(value: any, field: DiscoveredField): any {
 export function serializeDocumentsToCsv(
   strapi: Core.Strapi,
   uid: string,
-  documents: any[]
+  documents: any[],
+  options: { exportedAt?: string; schema?: DiscoveredSchema } = {}
 ): {
   csvContent: string;
   headers: string[];
   count: number;
 } {
-  const schema = discoverSchema(strapi, uid);
+  const schema = options.schema || discoverSchema(strapi, uid);
+  const plan = buildExportColumnPlan(strapi, uid, documents || [], schema);
 
-  // Headers start with metadata column, followed by documentId, locale (if localized), and discovered fields
-  const headers = [METADATA_COLUMN_KEY, ...schema.allExportKeys];
+  // Headers start with metadata column, followed by planned export columns (with object fields flattened)
+  const headers = [METADATA_COLUMN_KEY, ...plan.headers];
 
   const lines: string[] = [];
   lines.push(headers.map(escapeCsvCell).join(','));
 
-  const exportedAt = new Date().toISOString();
+  const exportedAt = options.exportedAt || new Date().toISOString();
 
   for (const doc of documents) {
     const rowValues: string[] = [];
+    const flattenedMeta = extractRowFlattenedMetadata(plan, doc);
 
     // 1. Metadata column
     const metadata: BulkUpdaterMetadata = {
@@ -290,25 +301,15 @@ export function serializeDocumentsToCsv(
       documentId: String(doc.documentId || doc.id || ''),
       locale: doc.locale || undefined,
       exportedAt,
+      ...(flattenedMeta.applicableFields ? { applicableFields: flattenedMeta.applicableFields } : {}),
+      ...(flattenedMeta.flatTypes ? { flatTypes: flattenedMeta.flatTypes } : {}),
     };
     rowValues.push(escapeCsvCell(metadata));
 
-    // 2. Discovered fields
-    for (const key of schema.allExportKeys) {
-      if (key === 'documentId') {
-        rowValues.push(escapeCsvCell(doc.documentId || doc.id || ''));
-      } else if (key === 'locale') {
-        rowValues.push(escapeCsvCell(doc.locale || ''));
-      } else {
-        const field = schema.fields[key];
-        const rawValue = doc[key];
-        if (field) {
-          const serialized = serializeFieldValue(rawValue, field);
-          rowValues.push(escapeCsvCell(serialized));
-        } else {
-          rowValues.push(escapeCsvCell(rawValue));
-        }
-      }
+    // 2. Planned columns (scalars, flattened dotted objects/single components, repeatables, DZ, relations, media)
+    for (const col of plan.columns) {
+      const cellValue = serializePlannedCell(col, doc, serializeFieldValue);
+      rowValues.push(escapeCsvCell(cellValue));
     }
 
     lines.push(rowValues.join(','));
