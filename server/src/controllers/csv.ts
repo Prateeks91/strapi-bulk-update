@@ -21,10 +21,10 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
   async exportCollection(ctx: any) {
     try {
       const { uid } = ctx.params;
-      const { search, attribute, searchAttribute, filterOperator, filterQuery, limit, documentIds } = {
-        ...ctx.query,
+      const { search, attribute, searchAttribute, filterOperator, filterQuery, limit, documentIds, exportMode } = ({
+        ...(ctx.query || {}),
         ...(ctx.request?.body || {}),
-      };
+      }) as Record<string, any>;
       const csvService = strapi.plugin('bulk-updater').service('csv');
 
       let parsedDocIds: string[] | undefined;
@@ -45,6 +45,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         filterQuery: filterQuery !== undefined ? String(filterQuery) : undefined,
         limit: limit ? Number(limit) : undefined,
         documentIds: parsedDocIds,
+        exportMode: exportMode ? String(exportMode) : undefined,
       });
 
       ctx.body = {

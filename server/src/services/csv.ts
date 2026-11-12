@@ -21,9 +21,12 @@ import {
   CURRENT_SCHEMA_VERSION,
   type BulkUpdaterMetadata,
   extractMetadataFromRow,
-  buildDocumentUpdatePayload,
+  prepareCsvRowMutation,
+  detectCsvBatchExportMode,
+  normalizeExportMode,
+  type CsvExportMode,
+  type DetectedCsvExportMode,
   verifyDocumentIntegrity,
-  validateRecordSchemaConstraints,
   buildErrorCsv,
   formatErrorCsvFilename,
   sanitizeUserErrorMessage,
@@ -1179,13 +1182,45 @@ async function executeUpdateMutation(
   actionLabel = 'Updated'
 ) {
   const resolvedDocId = existing.documentId;
-  const updatePayload = await buildDocumentUpdatePayload(
+  const mutationPlan = await prepareCsvRowMutation(
     strapi,
     uid,
     existing,
     row,
-    { isPartialUpdate: options.mode === 'update' }
+    {
+      isPartialUpdate: options.mode === 'update',
+      isCreate: false,
+      expectedExportMode: options.expectedExportMode,
+      docIdForError: resolvedDocId,
+    }
   );
+  const updatePayload = mutationPlan.payload;
+
+  if (mutationPlan.errors.length > 0) {
+    const errMsg = mutationPlan.errors[0];
+    stats.skipped++;
+    if (stats.failed !== undefined) stats.failed++;
+    recordFailedCsvRow(
+      stats,
+      rowNumber,
+      row,
+      errMsg,
+      resolvedDocId,
+      options.originalHeaders
+    );
+    stats.diffs.push({
+      uid,
+      collectionName: ct.info?.displayName || uid,
+      documentId: resolvedDocId,
+      label: existing.title || existing.name || `Entry #${resolvedDocId}`,
+      attribute: mutationPlan.targetObjectField || '',
+      oldValue: null,
+      newValue: null,
+      status: 'error',
+      message: errMsg,
+    });
+    return;
+  }
 
   if (Object.keys(updatePayload).length === 0) {
     stats.skipped++;
@@ -1252,50 +1287,6 @@ async function executeUpdateMutation(
     publishStrategy: options.publishStrategy || 'safe',
     unreviewedConsent: options.unreviewedConsent,
   });
-
-  // Pre-validate record applicability/required constraints + active Validation & Quota Rules before mutating or publishing
-  const rowMeta = extractMetadataFromRow(row);
-  const schemaValidation = validateRecordSchemaConstraints(
-    strapi,
-    uid,
-    existing,
-    updatePayload,
-    row,
-    {
-      isCreate: false,
-      rowMeta: rowMeta
-        ? {
-            applicableFields: rowMeta.applicableFields,
-            flatTypes: rowMeta.flatTypes,
-          }
-        : null,
-    }
-  );
-  if (schemaValidation.errors.length > 0) {
-    const errMsg = schemaValidation.errors[0];
-    stats.skipped++;
-    if (stats.failed !== undefined) stats.failed++;
-    recordFailedCsvRow(
-      stats,
-      rowNumber,
-      row,
-      errMsg,
-      resolvedDocId,
-      options.originalHeaders
-    );
-    stats.diffs.push({
-      uid,
-      collectionName: ct.info?.displayName || uid,
-      documentId: resolvedDocId,
-      label: existing.title || existing.name || `Entry #${resolvedDocId}`,
-      attribute: '',
-      oldValue: null,
-      newValue: null,
-      status: 'error',
-      message: errMsg,
-    });
-    return;
-  }
 
   const proposedEntity = deepMergeEntities(existing, updatePayload);
   const valResult = await validateEntityQuotas(strapi, uid, proposedEntity);
@@ -1403,33 +1394,22 @@ async function executeCreateMutation(
   isDraftAndPublish: boolean,
   stats: ProcessRowsStats
 ) {
-  const createPayload = await buildDocumentUpdatePayload(
+  const mutationPlan = await prepareCsvRowMutation(
     strapi,
     uid,
     null,
-    row,
-    { isPartialUpdate: false }
-  );
-
-  const rowMeta = extractMetadataFromRow(row);
-  const schemaValidation = validateRecordSchemaConstraints(
-    strapi,
-    uid,
-    null,
-    createPayload,
     row,
     {
+      isPartialUpdate: false,
       isCreate: true,
-      rowMeta: rowMeta
-        ? {
-            applicableFields: rowMeta.applicableFields,
-            flatTypes: rowMeta.flatTypes,
-          }
-        : null,
+      expectedExportMode: options.expectedExportMode,
+      docIdForError: docId || `row-${rowNumber}`,
     }
   );
-  if (schemaValidation.errors.length > 0) {
-    const errMsg = schemaValidation.errors[0];
+  const createPayload = mutationPlan.payload;
+
+  if (mutationPlan.errors.length > 0) {
+    const errMsg = mutationPlan.errors[0];
     stats.skipped++;
     if (stats.failed !== undefined) stats.failed++;
     recordFailedCsvRow(
@@ -1584,6 +1564,42 @@ export async function processCsvRows(
     diffs: [],
   };
 
+  const batchModeInfo = detectCsvBatchExportMode(rows);
+  if (batchModeInfo.error) {
+    for (let i = 0; i < rows.length; i++) {
+      const rowNumber = startRowNumber + i;
+      const row = rows[i];
+      const docId = extractDocId(row);
+      stats.skipped++;
+      if (stats.failed !== undefined) stats.failed++;
+      recordFailedCsvRow(
+        stats,
+        rowNumber,
+        row,
+        batchModeInfo.error,
+        docId || undefined,
+        originalHeaders
+      );
+      stats.diffs.push({
+        uid,
+        collectionName: ct.info?.displayName || uid,
+        documentId: docId || `(Row #${rowNumber})`,
+        label: `Row #${rowNumber}`,
+        attribute: '__bulk_updater_metadata',
+        oldValue: null,
+        newValue: null,
+        status: 'error',
+        message: batchModeInfo.error,
+      });
+    }
+    return stats;
+  }
+
+  const rowOptions = {
+    ...options,
+    expectedExportMode: batchModeInfo.mode,
+  };
+
   for (let i = 0; i < rows.length; i++) {
     const rowNumber = startRowNumber + i;
     const row = rows[i];
@@ -1641,7 +1657,7 @@ export async function processCsvRows(
           existing,
           row,
           rowNumber,
-          options,
+          rowOptions,
           effectiveLocale,
           isEditing,
           isDraftAndPublish,
@@ -1663,7 +1679,7 @@ export async function processCsvRows(
             existing,
             row,
             rowNumber,
-            options,
+            rowOptions,
             effectiveLocale,
             isEditing,
             isDraftAndPublish,
@@ -1679,7 +1695,7 @@ export async function processCsvRows(
             docId,
             row,
             rowNumber,
-            options,
+            rowOptions,
             effectiveLocale,
             isEditing,
             isDraftAndPublish,
@@ -1701,7 +1717,7 @@ export async function processCsvRows(
             existing,
             row,
             rowNumber,
-            options,
+            rowOptions,
             effectiveLocale,
             isEditing,
             isDraftAndPublish,
@@ -1717,7 +1733,7 @@ export async function processCsvRows(
             docId,
             row,
             rowNumber,
-            options,
+            rowOptions,
             effectiveLocale,
             isEditing,
             isDraftAndPublish,
@@ -1941,6 +1957,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       filterQuery?: string;
       limit?: number;
       documentIds?: string[];
+      exportMode?: CsvExportMode | string;
     } = {}
   ) {
     const ct = strapi.contentTypes[uid];
@@ -1950,6 +1967,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
     const schema = discoverSchema(strapi, uid);
     const deepPopulate = buildLosslessPopulate(strapi, uid);
+    const exportMode = normalizeExportMode(options.exportMode);
 
     // Build database query filters using shared filter engine (100% parity with Workspace)
     const filterMeta = buildCollectionQueryFilters(strapi, ct, {
@@ -1963,12 +1981,13 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
     if (!filterMeta.colHasAttribute && filterMeta.normOp && filterMeta.normOp !== 'none') {
       // Attribute does not exist on collection: return empty CSV (headers only)
-      const emptySerialized = serializeDocumentsToCsv(strapi, uid, [], { schema });
+      const emptySerialized = serializeDocumentsToCsv(strapi, uid, [], { schema, exportMode });
       return {
         filename: `${ct.info?.singularName || uid}_export_${new Date().toISOString().slice(0, 10)}.csv`,
         csvContent: emptySerialized.csvContent,
         count: 0,
         fields: emptySerialized.headers,
+        exportMode,
       };
     }
 
@@ -2099,7 +2118,11 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       }
     }
 
-    const serialized = serializeDocumentsToCsv(strapi, uid, exportedDocs, { exportedAt, schema });
+    const serialized = serializeDocumentsToCsv(strapi, uid, exportedDocs, {
+      exportedAt,
+      schema,
+      exportMode,
+    });
     const filename = `${ct.info?.singularName || uid}_export_${new Date().toISOString().slice(0, 10)}.csv`;
 
     return {
@@ -2107,6 +2130,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       csvContent: serialized.csvContent,
       count: serialized.count,
       fields: serialized.headers,
+      exportMode,
     };
   },
 
@@ -2573,6 +2597,29 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     const errors: Array<{ row: number; documentId?: string; error: string }> = [];
     const warnings: Array<{ row: number; documentId?: string; warning: string }> = [];
 
+    const batchModeInfo = detectCsvBatchExportMode(rows);
+    if (batchModeInfo.error) {
+      errors.push({
+        row: 1,
+        error: batchModeInfo.error,
+      });
+      return {
+        success: true,
+        detectedExportMode: 'invalid' as DetectedCsvExportMode | 'invalid',
+        totalRows: rows.length,
+        validRows: 0,
+        estimatedUpdates: 0,
+        estimatedCreates: 0,
+        lifecycleStats,
+        hasErrors: true,
+        hasWarnings: false,
+        errors,
+        warnings: [],
+        totalErrorCount: errors.length,
+        totalWarningCount: 0,
+      };
+    }
+
     // Pre-fetch published counterparts for preflight
     const docIdsInPreflight = rows.map((r) => extractDocId(r)).filter(Boolean);
     const publishedCounterparts = new Map<string, any>();
@@ -2752,50 +2799,45 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       }
 
       // 4. Shared Schema Applicability, Mandatory Fields, & Quota Rules Validation
-      let proposedPayload: any = {};
-      try {
-        proposedPayload = await buildDocumentUpdatePayload(
-          strapi,
-          uid,
-          existing,
-          row,
-          { isPartialUpdate: mode === 'update' }
-        );
-      } catch {}
-
-      const rowMeta = extractMetadataFromRow(row);
       const isRowCreate = mode === 'create_or_override' ? !existing : !existing && mode !== 'update';
+      let proposedPayload: any = {};
       if (!(mode === 'update' && (!docId || !existing))) {
-        const schemaValidation = validateRecordSchemaConstraints(
-          strapi,
-          uid,
-          existing,
-          proposedPayload,
-          row,
-          {
-            isCreate: isRowCreate,
-            rowMeta: rowMeta
-              ? {
-                  applicableFields: rowMeta.applicableFields,
-                  flatTypes: rowMeta.flatTypes,
-                }
-              : null,
+        try {
+          const mutationPlan = await prepareCsvRowMutation(
+            strapi,
+            uid,
+            existing,
+            row,
+            {
+              isPartialUpdate: mode === 'update',
+              isCreate: isRowCreate,
+              expectedExportMode: batchModeInfo.mode,
+              docIdForError: docId || `row-${rowNumber}`,
+            }
+          );
+          proposedPayload = mutationPlan.payload;
+          for (const errStr of mutationPlan.errors) {
+            errors.push({
+              row: rowNumber,
+              documentId: docId || undefined,
+              error: errStr,
+            });
+            rowHasError = true;
           }
-        );
-        for (const errStr of schemaValidation.errors) {
+          for (const warnStr of mutationPlan.warnings) {
+            warnings.push({
+              row: rowNumber,
+              documentId: docId || undefined,
+              warning: warnStr,
+            });
+          }
+        } catch (prepErr: any) {
           errors.push({
             row: rowNumber,
             documentId: docId || undefined,
-            error: errStr,
+            error: prepErr?.message || 'Failed to reconstruct CSV payload.',
           });
           rowHasError = true;
-        }
-        for (const warnStr of schemaValidation.warnings) {
-          warnings.push({
-            row: rowNumber,
-            documentId: docId || undefined,
-            warning: warnStr,
-          });
         }
       }
 
@@ -2819,6 +2861,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
     return {
       success: true,
+      detectedExportMode: batchModeInfo.mode,
       totalRows: rows.length,
       validRows,
       estimatedUpdates,
@@ -2854,6 +2897,38 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
     const attrs = ct.attributes || {};
     const { mode = 'auto' } = options;
+
+    const batchModeInfo = detectCsvBatchExportMode(rows);
+    if (batchModeInfo.error) {
+      return {
+        success: true,
+        detectedExportMode: 'invalid' as DetectedCsvExportMode | 'invalid',
+        summary: {
+          total: rows.length,
+          willUpdate: 0,
+          willCreate: 0,
+          unchanged: 0,
+          skipped: rows.length,
+        },
+        diffs: [
+          {
+            uid,
+            collectionName: ct.info?.displayName || uid,
+            documentId: '(batch)',
+            label: 'CSV Export Mode Check',
+            attribute: '__bulk_updater_metadata',
+            oldValue: null,
+            newValue: null,
+            oldDisplay: '—',
+            newDisplay: '—',
+            hasChange: false,
+            status: 'error',
+            action: 'skip',
+            message: batchModeInfo.error,
+          },
+        ],
+      };
+    }
 
     const diffs: any[] = [];
     let willUpdateCount = 0;
@@ -2906,13 +2981,41 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         continue;
       }
 
-      const payload = await buildDocumentUpdatePayload(
+      const isRowCreate = !existing;
+      const mutationPlan = await prepareCsvRowMutation(
         strapi,
         uid,
         existing,
         row,
-        { isPartialUpdate: mode === 'update' }
+        {
+          isPartialUpdate: mode === 'update',
+          isCreate: isRowCreate,
+          expectedExportMode: batchModeInfo.mode,
+          docIdForError: docId || `row-${rowNumber}`,
+        }
       );
+
+      if (mutationPlan.errors.length > 0) {
+        skippedCount++;
+        diffs.push({
+          uid,
+          collectionName: ct.info?.displayName || uid,
+          documentId: existing?.documentId || docId || `(Row #${rowNumber})`,
+          label: existing?.title || existing?.name || existing?.slug || `Row #${rowNumber}`,
+          attribute: mutationPlan.targetObjectField || '(validation)',
+          oldValue: null,
+          newValue: null,
+          oldDisplay: '—',
+          newDisplay: '—',
+          hasChange: false,
+          status: 'error',
+          action: 'skip',
+          message: mutationPlan.errors.join(' | '),
+        });
+        continue;
+      }
+
+      const payload = mutationPlan.payload;
 
       if (existing) {
         const resolvedDocId = existing.documentId || docId;
@@ -3027,6 +3130,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
     return {
       success: true,
+      detectedExportMode: batchModeInfo.mode,
       summary: {
         total: rows.length,
         willUpdate: willUpdateCount,

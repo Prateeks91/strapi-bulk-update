@@ -126,18 +126,24 @@ export function buildEntriesQueryParams(options: {
   return params;
 }
 
+export type CsvExportMode = 'all' | 'metafields' | 'topbarconfig';
+
 /**
  * Builds `/csv/export/:uid` query parameters strictly from an applied filter snapshot.
  */
 export function buildCsvExportQueryParams(options: {
   limit?: number;
   filter: SearchFilterSnapshot;
+  exportMode?: CsvExportMode;
 }): URLSearchParams {
-  const { limit, filter } = options;
+  const { limit, filter, exportMode } = options;
   const queryParams = new URLSearchParams();
 
   if (limit && limit > 0) {
     queryParams.set('limit', String(limit));
+  }
+  if (exportMode) {
+    queryParams.set('exportMode', exportMode);
   }
   if (filter.searchAttribute) {
     queryParams.set('searchAttribute', filter.searchAttribute);

@@ -7,16 +7,33 @@ import {
 } from './schema-discovery';
 import { METADATA_COLUMN_KEY, extractMetadataFromRow } from './serializer';
 import {
+  DetectedCsvExportMode,
   EXPLICIT_CLEAR_TOKENS,
-  buildNestedComponentPatchFromDots,
+  EXPLICIT_DELETE_KEY_TOKEN,
+  EXPLICIT_EMPTY_STRING_TOKEN,
   deepCloneValue,
+  inspectRowMetadataMode,
   isPlainObject,
-  parseFlattenedLeafValue,
-  reconstructFlattenedJsonAttribute,
+  parseFirstLevelCellValue,
+  reconstructTargetedFirstLevelObject,
+  resolveTargetObjectField,
+  validateRecordSchemaConstraints,
 } from './object-flattening';
 
 export interface PayloadBuilderOptions {
   isPartialUpdate?: boolean;
+  isCreate?: boolean;
+  expectedExportMode?: DetectedCsvExportMode;
+  docIdForError?: string;
+}
+
+export interface CsvRowMutationPlan {
+  payload: Record<string, any>;
+  errors: string[];
+  warnings: string[];
+  detectedMode: DetectedCsvExportMode;
+  targetObjectField?: string;
+  rowMeta: ReturnType<typeof inspectRowMetadataMode>;
 }
 
 /**
@@ -295,7 +312,7 @@ export async function resolveComponentPayload(
             if (isPlainObject(v) && isPlainObject(next[k])) {
               next[k] = deepMergePlain(next[k], v);
             } else {
-              next[k] = parseFlattenedLeafValue(v, undefined, next[k]);
+              next[k] = parseFirstLevelCellValue(v, undefined, next[k]).value;
             }
           }
           return next;
@@ -304,7 +321,9 @@ export async function resolveComponentPayload(
       } else if (isPlainObject(fieldVal)) {
         const parsedObj: Record<string, any> = {};
         for (const [k, v] of Object.entries(fieldVal)) {
-          parsedObj[k] = isPlainObject(v) ? deepCloneValue(v) : parseFlattenedLeafValue(v);
+          parsedObj[k] = isPlainObject(v)
+            ? deepCloneValue(v)
+            : parseFirstLevelCellValue(v).value;
         }
         result[attrName] = parsedObj;
       } else if (typeof fieldVal === 'string') {
@@ -380,23 +399,73 @@ export async function resolveDynamicZonePayload(
   return resolvedBlocks;
 }
 
+const UNSAFE_PROP_NAMES = new Set(['__proto__', 'constructor', 'prototype']);
+
 /**
- * Builds a 100% schema-aware update payload for Strapi 5 Document Service
+ * Legacy helper: builds a recursive patch from arbitrary dot-notation entries for backward
+ * compatibility with older exported CSVs that contain component/json dot columns without a target mode.
  */
-export async function buildDocumentUpdatePayload(
+function buildLegacyNestedPatchFromDots(
+  attrName: string,
+  dotEntries: Array<[string, any]>
+): { hasEffectiveEdits: boolean; patch: Record<string, any> } {
+  const patch: Record<string, any> = {};
+  let hasEffectiveEdits = false;
+  const prefix = `${attrName}.`;
+
+  for (const [fullKey, rawVal] of dotEntries) {
+    if (!fullKey.startsWith(prefix)) continue;
+    if (rawVal === undefined || rawVal === null || rawVal === '') continue;
+
+    const segments = fullKey.slice(prefix.length).split('.').filter(Boolean);
+    if (segments.length === 0 || segments.some((s) => UNSAFE_PROP_NAMES.has(s))) continue;
+
+    const strVal = String(rawVal);
+    const trimmed = strVal.trim();
+    if (trimmed === EXPLICIT_DELETE_KEY_TOKEN) continue;
+
+    const parsedValue = EXPLICIT_CLEAR_TOKENS.has(trimmed)
+      ? null
+      : trimmed === EXPLICIT_EMPTY_STRING_TOKEN
+        ? ''
+        : parseFirstLevelCellValue(strVal).value;
+
+    let cursor = patch;
+    for (let i = 0; i < segments.length - 1; i++) {
+      const seg = segments[i];
+      if (!isPlainObject(cursor[seg])) {
+        cursor[seg] = {};
+      }
+      cursor = cursor[seg];
+    }
+    cursor[segments[segments.length - 1]] = parsedValue;
+    hasEffectiveEdits = true;
+  }
+
+  return { hasEffectiveEdits, patch };
+}
+
+/**
+ * Single shared source of truth for CSV row reconstruction, applicability validation,
+ * and schema constraint checking used across preflight validation, preview, and import execution.
+ */
+export async function prepareCsvRowMutation(
   strapi: Core.Strapi,
   uid: string,
   existingDoc: any,
   rawRow: Record<string, string>,
   options: PayloadBuilderOptions = {}
-): Promise<Record<string, any>> {
+): Promise<CsvRowMutationPlan> {
   const schema = discoverSchema(strapi, uid);
   const payload: Record<string, any> = {};
+  const errors: string[] = [];
+  const warnings: string[] = [];
   const isPartialUpdate = options.isPartialUpdate !== false;
+  const isCreate = options.isCreate !== undefined ? options.isCreate : !existingDoc;
 
   // Strip formula prefix if present
   const unescapedRow: Record<string, string> = {};
-  for (const [k, v] of Object.entries(rawRow)) {
+  for (const [k, v] of Object.entries(rawRow || {})) {
     let cleanVal = v;
     if (typeof cleanVal === 'string' && /^'[=+@-]/.test(cleanVal)) {
       cleanVal = cleanVal.substring(1);
@@ -404,9 +473,100 @@ export async function buildDocumentUpdatePayload(
     unescapedRow[k] = cleanVal;
   }
 
-  const rowMeta = extractMetadataFromRow(unescapedRow);
+  const rowInfo = inspectRowMetadataMode(unescapedRow);
+  if (rowInfo.error) {
+    errors.push(rowInfo.error);
+  }
 
-  // Collect arbitrary-depth dot-notation columns grouped by top-level attribute name
+  const detectedMode = rowInfo.mode;
+  if (options.expectedExportMode && detectedMode !== options.expectedExportMode) {
+    errors.push(
+      `Row exportMode "${detectedMode}" conflicts with batch exportMode "${options.expectedExportMode}".`
+    );
+  }
+
+  const isTargetedMode = detectedMode === 'metafields' || detectedMode === 'topbarconfig';
+  const targetAttr = isTargetedMode
+    ? rowInfo.targetObjectField || resolveTargetObjectField(schema, detectedMode) || detectedMode
+    : undefined;
+
+  // Targeted 1-level update mode: update ONLY the chosen object (metafields or topbarconfig),
+  // leaving all unrelated fields, objects, relations, media, components, and dynamic zones untouched.
+  if (isTargetedMode && targetAttr && !isCreate) {
+    const targetField = schema.fields[targetAttr];
+    if (!targetField || (targetField.category !== 'json' && targetField.category !== 'component_single')) {
+      errors.push(
+        `Target object field "${targetAttr}" for exportMode "${detectedMode}" was not found as an object/component attribute on "${uid}".`
+      );
+      return {
+        payload,
+        errors,
+        warnings,
+        detectedMode,
+        targetObjectField: targetAttr,
+        rowMeta: rowInfo,
+      };
+    }
+
+    const ctAttr = strapi.contentTypes?.[uid]?.attributes?.[targetAttr];
+    const reconstructed = reconstructTargetedFirstLevelObject({
+      targetAttr,
+      exportMode: detectedMode,
+      existingDoc,
+      docIdForError: options.docIdForError,
+      rawRow: unescapedRow,
+      rowMeta: rowInfo,
+      isAttrRequired: Boolean(ctAttr?.required),
+    });
+
+    if (reconstructed.errors.length > 0) {
+      errors.push(...reconstructed.errors);
+    }
+
+    if (reconstructed.shouldSet) {
+      if (
+        targetField.category === 'component_single' &&
+        targetField.componentUid &&
+        isPlainObject(reconstructed.value)
+      ) {
+        payload[targetAttr] = await resolveComponentPayload(
+          strapi,
+          targetField.componentUid,
+          reconstructed.value,
+          existingDoc?.[targetAttr] || {}
+        );
+      } else {
+        payload[targetAttr] = reconstructed.value;
+      }
+    }
+
+    const schemaCheck = validateRecordSchemaConstraints(
+      strapi,
+      uid,
+      existingDoc,
+      payload,
+      unescapedRow,
+      {
+        isCreate: false,
+        detectedMode,
+        targetObjectField: targetAttr,
+        rowMeta: rowInfo,
+      }
+    );
+    errors.push(...schemaCheck.errors);
+    warnings.push(...schemaCheck.warnings);
+
+    return {
+      payload,
+      errors,
+      warnings,
+      detectedMode,
+      targetObjectField: targetAttr,
+      rowMeta: rowInfo,
+    };
+  }
+
+  // Legacy / All mode (or Create): collect dot-notation columns for backward compatibility
   const dotEntriesByAttr: Record<string, Array<[string, any]>> = {};
   for (const [k, v] of Object.entries(unescapedRow)) {
     const firstDot = k.indexOf('.');
@@ -421,6 +581,40 @@ export async function buildDocumentUpdatePayload(
     const hasDirectKey = attrName in unescapedRow;
     const dotEntries = dotEntriesByAttr[attrName] || [];
     const hasDotKeys = dotEntries.length > 0;
+
+    // Targeted create for the target object uses 1-level targeted reconstruction
+    if (isTargetedMode && isCreate && targetAttr === attrName) {
+      const ctAttr = strapi.contentTypes?.[uid]?.attributes?.[targetAttr];
+      const reconstructed = reconstructTargetedFirstLevelObject({
+        targetAttr,
+        exportMode: detectedMode,
+        existingDoc: null,
+        docIdForError: options.docIdForError,
+        rawRow: unescapedRow,
+        rowMeta: rowInfo,
+        isAttrRequired: Boolean(ctAttr?.required),
+      });
+      if (reconstructed.errors.length > 0) {
+        errors.push(...reconstructed.errors);
+      }
+      if (reconstructed.shouldSet) {
+        if (
+          field.category === 'component_single' &&
+          field.componentUid &&
+          isPlainObject(reconstructed.value)
+        ) {
+          payload[attrName] = await resolveComponentPayload(
+            strapi,
+            field.componentUid,
+            reconstructed.value,
+            {}
+          );
+        } else {
+          payload[attrName] = reconstructed.value;
+        }
+      }
+      continue;
+    }
 
     // If column was completely omitted from the CSV row, leave field unchanged (Partial Update guard)
     if (!hasDirectKey && !hasDotKeys) {
@@ -477,22 +671,48 @@ export async function buildDocumentUpdatePayload(
       }
 
       case 'json': {
-        const reconstructed = reconstructFlattenedJsonAttribute({
-          attrName,
-          existingVal: existingDoc?.[attrName],
-          hasDirectKey,
-          directRawVal: rawVal,
-          dotEntries,
-          rowMeta: rowMeta
-            ? {
-                applicableFields: rowMeta.applicableFields,
-                flatTypes: rowMeta.flatTypes,
+        if (hasDotKeys) {
+          const { hasEffectiveEdits, patch } = buildLegacyNestedPatchFromDots(
+            attrName,
+            dotEntries
+          );
+          if (hasEffectiveEdits) {
+            const mergeDeep = (base: any, p: any): any => {
+              if (!isPlainObject(base) || !isPlainObject(p)) return p;
+              const next = deepCloneValue(base);
+              for (const [k, v] of Object.entries(p)) {
+                if (isPlainObject(v) && isPlainObject(next[k])) {
+                  next[k] = mergeDeep(next[k], v);
+                } else {
+                  next[k] = deepCloneValue(v);
+                }
               }
-            : null,
-          isPartialUpdate,
-        });
-        if (reconstructed.shouldSet) {
-          payload[attrName] = reconstructed.value;
+              return next;
+            };
+            payload[attrName] = isPlainObject(existingDoc?.[attrName])
+              ? mergeDeep(existingDoc[attrName], patch)
+              : patch;
+            break;
+          }
+        }
+
+        if (hasDirectKey) {
+          const trimmed = typeof rawVal === 'string' ? rawVal.trim() : '';
+          if (rawVal === undefined || rawVal === null || rawVal === '') {
+            if (!isPartialUpdate) {
+              payload[attrName] = null;
+            }
+          } else if (EXPLICIT_CLEAR_TOKENS.has(trimmed) || trimmed === 'null') {
+            payload[attrName] = null;
+          } else if (typeof rawVal === 'string') {
+            try {
+              payload[attrName] = JSON.parse(rawVal);
+            } catch {
+              payload[attrName] = rawVal;
+            }
+          } else {
+            payload[attrName] = rawVal;
+          }
         }
         break;
       }
@@ -501,7 +721,7 @@ export async function buildDocumentUpdatePayload(
         if (field.componentUid) {
           const directTrimmed = typeof rawVal === 'string' ? rawVal.trim() : '';
           if (hasDotKeys) {
-            const { hasEffectiveEdits, patch } = buildNestedComponentPatchFromDots(
+            const { hasEffectiveEdits, patch } = buildLegacyNestedPatchFromDots(
               attrName,
               dotEntries
             );
@@ -609,5 +829,42 @@ export async function buildDocumentUpdatePayload(
     }
   }
 
-  return payload;
+  const schemaCheck = validateRecordSchemaConstraints(
+    strapi,
+    uid,
+    existingDoc,
+    payload,
+    unescapedRow,
+    {
+      isCreate,
+      detectedMode,
+      targetObjectField: targetAttr,
+      rowMeta: rowInfo,
+    }
+  );
+  errors.push(...schemaCheck.errors);
+  warnings.push(...schemaCheck.warnings);
+
+  return {
+    payload,
+    errors,
+    warnings,
+    detectedMode,
+    targetObjectField: targetAttr,
+    rowMeta: rowInfo,
+  };
+}
+
+/**
+ * Builds a 100% schema-aware update payload for Strapi 5 Document Service
+ */
+export async function buildDocumentUpdatePayload(
+  strapi: Core.Strapi,
+  uid: string,
+  existingDoc: any,
+  rawRow: Record<string, string>,
+  options: PayloadBuilderOptions = {}
+): Promise<Record<string, any>> {
+  const plan = await prepareCsvRowMutation(strapi, uid, existingDoc, rawRow, options);
+  return plan.payload;
 }
