@@ -1,9 +1,12 @@
 import type { Core } from '@strapi/strapi';
 import { DiscoveredSchema, DiscoveredField, discoverSchema } from './schema-discovery';
 import {
+  CsvExportMode,
   FlattenedLeafType,
+  TargetObjectState,
   buildExportColumnPlan,
   extractRowFlattenedMetadata,
+  normalizeExportMode,
   serializePlannedCell,
 } from './object-flattening';
 
@@ -16,6 +19,9 @@ export interface BulkUpdaterMetadata {
   documentId: string;
   locale?: string;
   exportedAt: string;
+  exportMode?: CsvExportMode;
+  targetObjectField?: string;
+  targetObjectState?: TargetObjectState;
   applicableFields?: string[];
   flatTypes?: Record<string, FlattenedLeafType>;
 }
@@ -273,16 +279,17 @@ export function serializeDocumentsToCsv(
   strapi: Core.Strapi,
   uid: string,
   documents: any[],
-  options: { exportedAt?: string; schema?: DiscoveredSchema } = {}
+  options: { exportedAt?: string; schema?: DiscoveredSchema; exportMode?: CsvExportMode } = {}
 ): {
   csvContent: string;
   headers: string[];
   count: number;
 } {
   const schema = options.schema || discoverSchema(strapi, uid);
-  const plan = buildExportColumnPlan(strapi, uid, documents || [], schema);
+  const exportMode = normalizeExportMode(options.exportMode);
+  const plan = buildExportColumnPlan(strapi, uid, documents || [], { schema, exportMode });
 
-  // Headers start with metadata column, followed by planned export columns (with object fields flattened)
+  // Headers start with metadata column, followed by planned export columns (with selected object split at 1 level in targeted mode)
   const headers = [METADATA_COLUMN_KEY, ...plan.headers];
 
   const lines: string[] = [];
@@ -301,6 +308,9 @@ export function serializeDocumentsToCsv(
       documentId: String(doc.documentId || doc.id || ''),
       locale: doc.locale || undefined,
       exportedAt,
+      ...(flattenedMeta.exportMode ? { exportMode: flattenedMeta.exportMode } : {}),
+      ...(flattenedMeta.targetObjectField ? { targetObjectField: flattenedMeta.targetObjectField } : {}),
+      ...(flattenedMeta.targetObjectState ? { targetObjectState: flattenedMeta.targetObjectState } : {}),
       ...(flattenedMeta.applicableFields ? { applicableFields: flattenedMeta.applicableFields } : {}),
       ...(flattenedMeta.flatTypes ? { flatTypes: flattenedMeta.flatTypes } : {}),
     };

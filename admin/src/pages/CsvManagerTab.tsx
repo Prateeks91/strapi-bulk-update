@@ -32,6 +32,7 @@ import {
 import { isAbortError } from '../utils/isAbortError';
 import { getEntryLifecycleStatus, Entry, PendingBatch } from '../utils/lifecycleStatus';
 import {
+  type CsvExportMode,
   type FilterOperator,
   type SearchFilterSnapshot,
   EMPTY_SEARCH_FILTER,
@@ -102,6 +103,7 @@ export default function CsvManagerTab() {
   const [searchRelationOptionsLoading, setSearchRelationOptionsLoading] = useState<boolean>(false);
 
   // Export filters and loading states (0 = Unlimited / All records)
+  const [exportMode, setExportMode] = useState<CsvExportMode>('all');
   const [exportLimit, setExportLimit] = useState<number>(0);
   const [exportLimitInput, setExportLimitInput] = useState<string>('');
   const [exportingCollection, setExportingCollection] = useState<boolean>(false);
@@ -474,6 +476,7 @@ export default function CsvManagerTab() {
       const queryParams = buildCsvExportQueryParams({
         limit: exportLimit,
         filter: appliedFilterRef.current,
+        exportMode,
       });
 
       const res = await get(`/bulk-updater/csv/export/${selectedUid}?${queryParams.toString()}`);
@@ -1267,6 +1270,24 @@ export default function CsvManagerTab() {
               </Flex>
             </Box>
 
+            {/* Export Object Mode Selection */}
+            <Box style={{ width: 220 }}>
+              <Typography variant="pi" fontWeight="bold" textColor="neutral800" marginBottom={1} display="block">
+                Object Export Mode
+              </Typography>
+              <SingleSelect
+                value={exportMode}
+                onChange={(val: string) =>
+                  setExportMode(val === 'metafields' || val === 'topbarconfig' ? val : 'all')
+                }
+                disabled={exportingCollection}
+              >
+                <SingleSelectOption value="all">All</SingleSelectOption>
+                <SingleSelectOption value="metafields">Metafields</SingleSelectOption>
+                <SingleSelectOption value="topbarconfig">Topbarconfig</SingleSelectOption>
+              </SingleSelect>
+            </Box>
+
             {/* Standard Collection Export */}
             <Button
               variant="default"
@@ -1313,6 +1334,22 @@ export default function CsvManagerTab() {
               </Flex>
             )}
           </Flex>
+
+          <Box marginTop={3}>
+            {exportMode === 'all' ? (
+              <Alert closeLabel="Close" variant="warning" title="Data Migration Export Mode">
+                All exports the complete collection data and is intended for data migration. Do not use this mode for routine updates. For targeted updates, select Metafields or Topbarconfig.
+              </Alert>
+            ) : (
+              <Box padding={3} background="primary100" hasRadius>
+                <Typography variant="pi" textColor="primary700">
+                  {exportMode === 'metafields'
+                    ? 'Exports metafields as individual first-level columns for targeted updates. Other fields retain their existing structure.'
+                    : 'Exports topbarconfig as individual first-level columns for targeted updates. Other fields retain their existing structure.'}
+                </Typography>
+              </Box>
+            )}
+          </Box>
         </Box>
 
         {/* Section 2: Import & Override Hub */}
@@ -1394,7 +1431,31 @@ export default function CsvManagerTab() {
             const totalRows = allParsedRecords.length;
             const missingDocIdCount = allParsedRecords.filter((row) => !extractDocId(row)).length;
             const updateCount = totalRows - missingDocIdCount;
-            const headers = Object.keys(allParsedRecords[0]);
+            const headers = Object.keys(allParsedRecords[0]).filter(
+              (h) => h !== '__bulk_updater_metadata' && h !== '_bulk_updater_metadata'
+            );
+
+            let detectedPreviewMode: string = 'legacy';
+            try {
+              const rawMetaCell =
+                allParsedRecords[0]['__bulk_updater_metadata'] ||
+                allParsedRecords[0]['_bulk_updater_metadata'];
+              if (rawMetaCell) {
+                const parsedMeta =
+                  typeof rawMetaCell === 'string' ? JSON.parse(rawMetaCell) : rawMetaCell;
+                if (parsedMeta?.exportMode) {
+                  detectedPreviewMode = String(parsedMeta.exportMode);
+                }
+              }
+            } catch {}
+            const modeDisplayLabel =
+              detectedPreviewMode === 'metafields'
+                ? 'Metafields (1-Level Targeted)'
+                : detectedPreviewMode === 'topbarconfig'
+                ? 'Topbarconfig (1-Level Targeted)'
+                : detectedPreviewMode === 'all'
+                ? 'All (Full Migration Export)'
+                : 'Legacy';
 
             const totalPages = Math.ceil(totalRows / previewPageSize) || 1;
             const safePage = Math.min(Math.max(1, previewPage), totalPages);
@@ -1418,7 +1479,10 @@ export default function CsvManagerTab() {
                         : ''}
                     </Typography>
                   </Box>
-                  <Flex gap={2}>
+                  <Flex gap={2} wrap="wrap">
+                    <Badge backgroundColor="neutral150" textColor="neutral700">
+                      Mode: {modeDisplayLabel}
+                    </Badge>
                     <Badge backgroundColor="primary100" textColor="primary700">
                       🔄 {updateCount.toLocaleString()} Updates
                     </Badge>
