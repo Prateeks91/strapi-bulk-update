@@ -6,6 +6,14 @@ import {
   SYSTEM_ATTRIBUTES,
 } from './schema-discovery';
 import { METADATA_COLUMN_KEY, extractMetadataFromRow } from './serializer';
+import {
+  EXPLICIT_CLEAR_TOKENS,
+  buildNestedComponentPatchFromDots,
+  deepCloneValue,
+  isPlainObject,
+  parseFlattenedLeafValue,
+  reconstructFlattenedJsonAttribute,
+} from './object-flattening';
 
 export interface PayloadBuilderOptions {
   isPartialUpdate?: boolean;
@@ -278,7 +286,37 @@ export async function resolveComponentPayload(
       result[attrName] = parseNumeric(fieldVal, false);
     } else if (type === 'boolean') {
       result[attrName] = parseBoolean(fieldVal);
-    } else if (type === 'json' || type === 'blocks') {
+    } else if (type === 'json') {
+      if (isPlainObject(fieldVal) && isPlainObject(existingVal?.[attrName])) {
+        const deepMergePlain = (base: any, patch: any): any => {
+          if (!isPlainObject(base) || !isPlainObject(patch)) return patch;
+          const next = deepCloneValue(base);
+          for (const [k, v] of Object.entries(patch)) {
+            if (isPlainObject(v) && isPlainObject(next[k])) {
+              next[k] = deepMergePlain(next[k], v);
+            } else {
+              next[k] = parseFlattenedLeafValue(v, undefined, next[k]);
+            }
+          }
+          return next;
+        };
+        result[attrName] = deepMergePlain(existingVal[attrName], fieldVal);
+      } else if (isPlainObject(fieldVal)) {
+        const parsedObj: Record<string, any> = {};
+        for (const [k, v] of Object.entries(fieldVal)) {
+          parsedObj[k] = isPlainObject(v) ? deepCloneValue(v) : parseFlattenedLeafValue(v);
+        }
+        result[attrName] = parsedObj;
+      } else if (typeof fieldVal === 'string') {
+        try {
+          result[attrName] = JSON.parse(fieldVal);
+        } catch {
+          result[attrName] = fieldVal;
+        }
+      } else {
+        result[attrName] = fieldVal;
+      }
+    } else if (type === 'blocks') {
       if (typeof fieldVal === 'string') {
         try {
           result[attrName] = JSON.parse(fieldVal);
@@ -354,6 +392,7 @@ export async function buildDocumentUpdatePayload(
 ): Promise<Record<string, any>> {
   const schema = discoverSchema(strapi, uid);
   const payload: Record<string, any> = {};
+  const isPartialUpdate = options.isPartialUpdate !== false;
 
   // Strip formula prefix if present
   const unescapedRow: Record<string, string> = {};
@@ -365,20 +404,23 @@ export async function buildDocumentUpdatePayload(
     unescapedRow[k] = cleanVal;
   }
 
-  // Handle dot-notation keys (e.g. "seo.metaTitle")
-  const dotNotationMap: Record<string, Record<string, string>> = {};
+  const rowMeta = extractMetadataFromRow(unescapedRow);
+
+  // Collect arbitrary-depth dot-notation columns grouped by top-level attribute name
+  const dotEntriesByAttr: Record<string, Array<[string, any]>> = {};
   for (const [k, v] of Object.entries(unescapedRow)) {
-    if (k.includes('.')) {
-      const [parent, ...rest] = k.split('.');
-      const child = rest.join('.');
-      if (!dotNotationMap[parent]) dotNotationMap[parent] = {};
-      dotNotationMap[parent][child] = v;
+    const firstDot = k.indexOf('.');
+    if (firstDot > 0) {
+      const parent = k.slice(0, firstDot);
+      if (!dotEntriesByAttr[parent]) dotEntriesByAttr[parent] = [];
+      dotEntriesByAttr[parent].push([k, v]);
     }
   }
 
   for (const [attrName, field] of Object.entries(schema.fields)) {
     const hasDirectKey = attrName in unescapedRow;
-    const hasDotKeys = Boolean(dotNotationMap[attrName]);
+    const dotEntries = dotEntriesByAttr[attrName] || [];
+    const hasDotKeys = dotEntries.length > 0;
 
     // If column was completely omitted from the CSV row, leave field unchanged (Partial Update guard)
     if (!hasDirectKey && !hasDotKeys) {
@@ -435,33 +477,64 @@ export async function buildDocumentUpdatePayload(
       }
 
       case 'json': {
-        if (rawVal === undefined || rawVal === '' || rawVal === null) {
-          payload[attrName] = null;
-        } else {
-          try {
-            payload[attrName] = JSON.parse(rawVal);
-          } catch {
-            payload[attrName] = rawVal;
-          }
+        const reconstructed = reconstructFlattenedJsonAttribute({
+          attrName,
+          existingVal: existingDoc?.[attrName],
+          hasDirectKey,
+          directRawVal: rawVal,
+          dotEntries,
+          rowMeta: rowMeta
+            ? {
+                applicableFields: rowMeta.applicableFields,
+                flatTypes: rowMeta.flatTypes,
+              }
+            : null,
+          isPartialUpdate,
+        });
+        if (reconstructed.shouldSet) {
+          payload[attrName] = reconstructed.value;
         }
         break;
       }
 
       case 'component_single': {
         if (field.componentUid) {
-          let compInput: any = rawVal;
+          const directTrimmed = typeof rawVal === 'string' ? rawVal.trim() : '';
           if (hasDotKeys) {
-            compInput = { ...(existingDoc?.[attrName] || {}), ...dotNotationMap[attrName] };
-          }
-          if (compInput === '' || compInput === null) {
-            payload[attrName] = null;
-          } else {
-            payload[attrName] = await resolveComponentPayload(
-              strapi,
-              field.componentUid,
-              compInput,
-              existingDoc?.[attrName] || {}
+            const { hasEffectiveEdits, patch } = buildNestedComponentPatchFromDots(
+              attrName,
+              dotEntries
             );
+            if (hasEffectiveEdits) {
+              payload[attrName] = await resolveComponentPayload(
+                strapi,
+                field.componentUid,
+                patch,
+                existingDoc?.[attrName] || {}
+              );
+            } else if (hasDirectKey && rawVal !== '' && rawVal !== undefined && rawVal !== null) {
+              if (EXPLICIT_CLEAR_TOKENS.has(directTrimmed) || directTrimmed === 'null') {
+                payload[attrName] = null;
+              } else {
+                payload[attrName] = await resolveComponentPayload(
+                  strapi,
+                  field.componentUid,
+                  rawVal,
+                  existingDoc?.[attrName] || {}
+                );
+              }
+            }
+          } else if (hasDirectKey) {
+            if (EXPLICIT_CLEAR_TOKENS.has(directTrimmed) || directTrimmed === 'null') {
+              payload[attrName] = null;
+            } else if (rawVal !== '' && rawVal !== null && rawVal !== undefined) {
+              payload[attrName] = await resolveComponentPayload(
+                strapi,
+                field.componentUid,
+                rawVal,
+                existingDoc?.[attrName] || {}
+              );
+            }
           }
         }
         break;

@@ -22,7 +22,7 @@ import {
   Field,
   Loader,
 } from '@strapi/design-system';
-import { Play, ArrowClockwise, Check, Download, Eye, Cog } from '@strapi/icons';
+import { Play, ArrowClockwise, Check, Download, Eye, Cog, Search } from '@strapi/icons';
 import ValidationRulesTab from './ValidationRulesTab';
 import CsvManagerTab from './CsvManagerTab';
 import ProcessingDashboardModal from '../components/ProcessingDashboardModal';
@@ -40,6 +40,14 @@ import {
 } from '../utils/gridEdit';
 import { isAbortError } from '../utils/isAbortError';
 import { getEntryLifecycleStatus } from '../utils/lifecycleStatus';
+import {
+  type FilterOperator,
+  type SearchFilterSnapshot,
+  EMPTY_SEARCH_FILTER,
+  areSearchFiltersEqual,
+  isSearchFilterActive,
+  buildEntriesQueryParams,
+} from '../utils/deferredFilter';
 export { getEntryLifecycleStatus } from '../utils/lifecycleStatus';
 
 interface Entry {
@@ -1299,7 +1307,6 @@ const BulkUpdater: React.FC = () => {
   }, [effectiveSearchAttribute, relationsMeta]);
 
   // Target Value Filter state ("Find items with a certain value first")
-  type FilterOperator = 'none' | 'empty' | 'not_empty' | 'equals' | 'contains' | 'starts_with';
   const [filterOperator, setFilterOperator] = useState<FilterOperator>('none');
   const [filterQuery, setFilterQuery] = useState<string>('');
   const [entrySearch, setEntrySearch] = useState<string>('');
@@ -1307,13 +1314,32 @@ const BulkUpdater: React.FC = () => {
   type StatusFilter = 'all' | 'pending_review' | 'draft' | 'published' | 'modified' | 'unknown';
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
 
-  const isFilterActive =
-    Boolean(searchAttribute && searchAttribute !== selectedAttribute) ||
-    (filterOperator !== 'none' &&
-      (['empty', 'not_empty'].includes(filterOperator) || Boolean(filterQuery.trim()))) ||
-    Boolean(entrySearch.trim()) ||
-    Boolean(statusFilter !== 'all') ||
-    Boolean(useRegex && regexPattern.trim());
+  const [appliedSearchFilter, setAppliedSearchFilter] =
+    useState<SearchFilterSnapshot>(EMPTY_SEARCH_FILTER);
+  const appliedSearchFilterRef = useRef<SearchFilterSnapshot>(EMPTY_SEARCH_FILTER);
+
+  const draftSearchFilter: SearchFilterSnapshot = useMemo(
+    () => ({
+      searchAttribute,
+      filterOperator,
+      filterQuery,
+      entrySearch,
+      statusFilter,
+      useRegex,
+      regexPattern,
+    }),
+    [searchAttribute, filterOperator, filterQuery, entrySearch, statusFilter, useRegex, regexPattern]
+  );
+
+  const hasPendingFilterChanges = useMemo(
+    () =>
+      !areSearchFiltersEqual(draftSearchFilter, appliedSearchFilter, {
+        includeWorkspaceExtras: true,
+      }),
+    [draftSearchFilter, appliedSearchFilter]
+  );
+
+  const isFilterActive = isSearchFilterActive(appliedSearchFilter, selectedAttribute);
 
   // Result state
   const [lastResults, setLastResults] = useState<UpdateResult[] | null>(null);
@@ -1524,10 +1550,12 @@ const BulkUpdater: React.FC = () => {
     const sortField = customSortField !== undefined ? customSortField : currentSort.field;
     const sortOrder = customSortOrder !== undefined ? customSortOrder : currentSort.order;
 
-    const op = overrideFilterOp !== undefined ? overrideFilterOp : filterOperator;
-    const q = overrideFilterQuery !== undefined ? overrideFilterQuery : filterQuery;
-    const s = overrideEntrySearch !== undefined ? overrideEntrySearch : entrySearch;
-    const searchAttr = overrideSearchAttr !== undefined ? overrideSearchAttr : searchAttribute;
+    const appliedSnapshot = appliedSearchFilterRef.current;
+    const op = overrideFilterOp !== undefined ? overrideFilterOp : appliedSnapshot.filterOperator;
+    const q = overrideFilterQuery !== undefined ? overrideFilterQuery : appliedSnapshot.filterQuery;
+    const s = overrideEntrySearch !== undefined ? overrideEntrySearch : appliedSnapshot.entrySearch;
+    const searchAttr =
+      overrideSearchAttr !== undefined ? overrideSearchAttr : appliedSnapshot.searchAttribute;
 
     setCollectionPages((prev) => ({
       ...prev,
@@ -1537,36 +1565,32 @@ const BulkUpdater: React.FC = () => {
       },
     }));
 
+    let controller: AbortController | null = null;
     try {
-      const params = new URLSearchParams({
-        page: String(targetPage),
-        pageSize: String(size),
+      const params = buildEntriesQueryParams({
+        page: targetPage,
+        pageSize: size,
+        filter: {
+          searchAttribute: searchAttr,
+          filterOperator: op,
+          filterQuery: q,
+          entrySearch: s,
+        },
+        selectedAttribute,
+        sortField,
+        sortOrder,
       });
-      if (selectedAttribute) params.set('attribute', selectedAttribute);
-      if (searchAttr && searchAttr !== selectedAttribute) {
-        params.set('searchAttribute', searchAttr);
-      }
-      if (op && op !== 'none') {
-        params.set('filterOperator', op);
-        if (q) params.set('filterQuery', q);
-      }
-      if (s && s.trim()) {
-        params.set('search', s.trim());
-      }
-      if (sortField) {
-        params.set('sortField', sortField);
-        params.set('sortOrder', sortOrder);
-      }
 
       if (abortControllersRef.current[colUid]) {
         abortControllersRef.current[colUid].abort();
       }
-      const controller = new AbortController();
+      controller = new AbortController();
       abortControllersRef.current[colUid] = controller;
 
       const res = await get(`/bulk-updater/collections/${colUid}/entries?${params.toString()}`, {
         signal: controller.signal,
       });
+      if (abortControllersRef.current[colUid] !== controller) return;
       if (res.data && (res.data.success || res.data.entries !== undefined)) {
         const fetchedEntries: Entry[] = res.data.entries || [];
         const pageNum = res.data.pagination?.page ?? targetPage ?? 1;
@@ -1622,13 +1646,15 @@ const BulkUpdater: React.FC = () => {
           message: `Failed to load entries for ${colUid}: ${err?.message || 'Network error'}`,
         });
       }
-      setCollectionPages((prev) => ({
-        ...prev,
-        [colUid]: {
-          ...(prev[colUid] || {}),
-          loading: false,
-        },
-      }));
+      if (abortControllersRef.current[colUid] === controller) {
+        setCollectionPages((prev) => ({
+          ...prev,
+          [colUid]: {
+            ...(prev[colUid] || {}),
+            loading: false,
+          },
+        }));
+      }
     }
   };
 
@@ -1699,54 +1725,52 @@ const BulkUpdater: React.FC = () => {
     }
   }, [activeTab]);
 
-  const isInitialFilterMount = useRef(true);
-  useEffect(() => {
-    if (isInitialFilterMount.current) {
-      isInitialFilterMount.current = false;
-      return;
+  // Explicit Search trigger: executes API call only when user clicks Search (or presses Enter)
+  const handleApplySearch = () => {
+    const nextApplied: SearchFilterSnapshot = {
+      searchAttribute,
+      filterOperator,
+      filterQuery,
+      entrySearch,
+      statusFilter,
+      useRegex,
+      regexPattern,
+    };
+
+    appliedSearchFilterRef.current = nextApplied;
+    setAppliedSearchFilter(nextApplied);
+
+    if (!selectedCollectionUid) return;
+
+    const isFilterActiveNow = isSearchFilterActive(nextApplied, selectedAttribute);
+    if (isFilterActiveNow) {
+      if (gridEditMode) {
+        // Preserve selection for rows that already contain unsaved grid edits across filters/pages
+        setSelectedEntries((prev) => {
+          const retained: Record<string, boolean> = {};
+          Object.keys(gridEdits).forEach((k) => {
+            if (prev[k]) retained[k] = true;
+          });
+          return retained;
+        });
+      } else {
+        setSelectedEntries({});
+      }
     }
 
-    const timer = setTimeout(() => {
-      if (selectedCollectionUid) {
-        const isFilterActiveNow =
-          Boolean(searchAttribute && searchAttribute !== selectedAttribute) ||
-          (filterOperator !== 'none' &&
-            (['empty', 'not_empty'].includes(filterOperator) || Boolean(filterQuery.trim()))) ||
-          Boolean(entrySearch.trim()) ||
-          Boolean(useRegex && regexPattern.trim());
-
-        if (isFilterActiveNow) {
-          if (gridEditMode) {
-            // Preserve selection for rows that already contain unsaved grid edits across filters/pages
-            setSelectedEntries((prev) => {
-              const retained: Record<string, boolean> = {};
-              Object.keys(gridEdits).forEach((k) => {
-                if (prev[k]) retained[k] = true;
-              });
-              return retained;
-            });
-          } else {
-            setSelectedEntries({});
-          }
-        }
-
-        loadCollectionPage(
-          selectedCollectionUid,
-          1,
-          undefined,
-          undefined,
-          undefined,
-          filterOperator,
-          filterQuery,
-          entrySearch,
-          true,
-          searchAttribute
-        );
-      }
-    }, 350);
-
-    return () => clearTimeout(timer);
-  }, [selectedCollectionUid, searchAttribute, filterOperator, filterQuery, entrySearch, useRegex, regexPattern]);
+    loadCollectionPage(
+      selectedCollectionUid,
+      1,
+      undefined,
+      undefined,
+      undefined,
+      nextApplied.filterOperator,
+      nextApplied.filterQuery,
+      nextApplied.entrySearch,
+      true,
+      nextApplied.searchAttribute
+    );
+  };
 
   const KEY_SEP = '@@@';
 
@@ -1900,6 +1924,12 @@ const BulkUpdater: React.FC = () => {
 
     setSelectedEntries({});
     setSearchAttribute('');
+    const nextAppliedOnColSwitch: SearchFilterSnapshot = {
+      ...appliedSearchFilterRef.current,
+      searchAttribute: '',
+    };
+    appliedSearchFilterRef.current = nextAppliedOnColSwitch;
+    setAppliedSearchFilter(nextAppliedOnColSwitch);
 
     if (!newUid || !newUid.trim()) {
       setAttributes([]);
@@ -1922,7 +1952,18 @@ const BulkUpdater: React.FC = () => {
       setAttributeValue('');
     }
 
-    loadCollectionPage(newUid, 1, undefined, undefined, undefined, filterOperator, filterQuery, entrySearch, true, '');
+    loadCollectionPage(
+      newUid,
+      1,
+      undefined,
+      undefined,
+      undefined,
+      nextAppliedOnColSwitch.filterOperator,
+      nextAppliedOnColSwitch.filterQuery,
+      nextAppliedOnColSwitch.entrySearch,
+      true,
+      ''
+    );
   };
 
   // Handle attribute selection change: updates selectedAttribute without clearing search/filters/selected entries
@@ -2049,20 +2090,6 @@ const BulkUpdater: React.FC = () => {
   const handleSearchAttributeChange = (newAttr: string) => {
     const finalAttr = newAttr === '__default__' ? '' : newAttr;
     setSearchAttribute(finalAttr);
-    if (selectedCollectionUid) {
-      loadCollectionPage(
-        selectedCollectionUid,
-        1,
-        undefined,
-        undefined,
-        undefined,
-        filterOperator,
-        filterQuery,
-        entrySearch,
-        true,
-        finalAttr
-      );
-    }
   };
 
   const handleGlobalPageSizeChange = (newSize: number) => {
@@ -2136,27 +2163,31 @@ const BulkUpdater: React.FC = () => {
     });
   };
 
-  // Value filter evaluation across all dynamic zone / component matches
+  // Value filter evaluation across all dynamic zone / component matches (uses applied filter state)
   const entryMatchesFilter = (entry: Entry, attr: string): boolean => {
     const matches = getAllNestedValues(entry, attr);
+    const activeOp = appliedSearchFilter.filterOperator;
+    const activeQuery = appliedSearchFilter.filterQuery || '';
+    const activeUseRegex = Boolean(appliedSearchFilter.useRegex);
+    const activeRegexPattern = appliedSearchFilter.regexPattern || '';
 
     // If regex search pattern is provided, verify against the search attribute values
-    if (useRegex && regexPattern.trim()) {
+    if (activeUseRegex && activeRegexPattern.trim()) {
       try {
-        const regex = new RegExp(regexPattern, 'i');
+        const regex = new RegExp(activeRegexPattern, 'i');
         const anyRegexMatch = matches.some((m) => regex.test(formatDisplayValue(m.value)));
         if (!anyRegexMatch) {
           return false;
         }
       } catch {
-        // Keep unhindered while typing regex
+        // Keep unhindered if regex is invalid
       }
     }
 
-    if (filterOperator === 'none') return true;
+    if (activeOp === 'none') return true;
 
     if (matches.length === 0) {
-      return filterOperator === 'empty';
+      return activeOp === 'empty';
     }
 
     const checkMatch = (val: any) => {
@@ -2170,17 +2201,17 @@ const BulkUpdater: React.FC = () => {
         displayStr.trim().toLowerCase() === '(empty / not set)' ||
         displayStr.trim().toLowerCase() === '(empty / unlinked)';
 
-      if (filterOperator === 'empty') return isValEmpty;
-      if (filterOperator === 'not_empty') return !isValEmpty;
+      if (activeOp === 'empty') return isValEmpty;
+      if (activeOp === 'not_empty') return !isValEmpty;
       if (isValEmpty) return false;
 
-      const q = filterQuery.trim().toLowerCase();
+      const q = activeQuery.trim().toLowerCase();
       if (!q) return true;
 
       const testString = (str: any): boolean => {
         if (str === undefined || str === null) return false;
         const s = String(str).trim().toLowerCase();
-        switch (filterOperator) {
+        switch (activeOp) {
           case 'equals':
             return s === q;
           case 'contains':
@@ -2216,7 +2247,7 @@ const BulkUpdater: React.FC = () => {
       return testString(displayStr);
     };
 
-    if (filterOperator === 'empty') {
+    if (activeOp === 'empty') {
       return matches.every((m) => checkMatch(m.value));
     }
     return matches.some((m) => checkMatch(m.value));
@@ -2228,10 +2259,11 @@ const BulkUpdater: React.FC = () => {
     if (gridEditMode && gridFilterModifiedOnly) {
       raw = raw.filter((entry) => Boolean(gridEdits[`${col.uid}${KEY_SEP}${entry.documentId}`]));
     }
-    if (statusFilter === 'all') return raw;
+    const activeStatus = (appliedSearchFilter.statusFilter || 'all') as StatusFilter;
+    if (activeStatus === 'all') return raw;
     return raw.filter((entry) => {
       const lifecycle = getEntryLifecycleStatus(entry, col, pendingBatches);
-      return lifecycle.status === statusFilter;
+      return lifecycle.status === activeStatus;
     });
   };
 
@@ -2242,7 +2274,7 @@ const BulkUpdater: React.FC = () => {
       count += getVisibleEntries(col).length;
     });
     return count;
-  }, [filteredCollections, collectionPages, isFilterActive, statusFilter, pendingBatches, gridEditMode, gridFilterModifiedOnly, gridEdits]);
+  }, [filteredCollections, collectionPages, isFilterActive, appliedSearchFilter, pendingBatches, gridEditMode, gridFilterModifiedOnly, gridEdits]);
 
   const selectAllMatching = () => {
     const updated = { ...selectedEntries };
@@ -2273,6 +2305,8 @@ const BulkUpdater: React.FC = () => {
     setEntrySearch('');
     setStatusFilter('all');
     setRegexPattern('');
+    appliedSearchFilterRef.current = EMPTY_SEARCH_FILTER;
+    setAppliedSearchFilter(EMPTY_SEARCH_FILTER);
     if (gridEditMode) {
       setSelectedEntries((prev) => {
         const retained: Record<string, boolean> = {};
@@ -2724,17 +2758,18 @@ const BulkUpdater: React.FC = () => {
           await fetchAuditHistory();
 
           if (selectedCollectionUid) {
+            const appliedNow = appliedSearchFilterRef.current;
             loadCollectionPage(
               selectedCollectionUid,
               collectionPages[selectedCollectionUid]?.page || 1,
               undefined,
               undefined,
               undefined,
-              filterOperator,
-              filterQuery,
-              entrySearch,
+              appliedNow.filterOperator,
+              appliedNow.filterQuery,
+              appliedNow.entrySearch,
               false,
-              searchAttribute
+              appliedNow.searchAttribute
             );
           }
         }
@@ -3521,13 +3556,25 @@ const BulkUpdater: React.FC = () => {
                         {matchingEntriesCount} matching {matchingEntriesCount === 1 ? 'entry' : 'entries'} found in database
                       </Badge>
                     )}
-                    {searchAttribute && searchAttribute !== selectedAttribute && (
-                      <Badge backgroundColor="secondary100" textColor="secondary700">
-                        Searching by: {searchAttribute} &rarr; Target to update: {selectedAttribute}
+                    {appliedSearchFilter.searchAttribute &&
+                      appliedSearchFilter.searchAttribute !== selectedAttribute && (
+                        <Badge backgroundColor="secondary100" textColor="secondary700">
+                          Searching by: {appliedSearchFilter.searchAttribute} &rarr; Target to update: {selectedAttribute}
+                        </Badge>
+                      )}
+                    {hasPendingFilterChanges && (
+                      <Badge backgroundColor="warning100" textColor="warning700">
+                        Filters modified &mdash; click Search to apply
                       </Badge>
                     )}
                   </Flex>
-                  {isFilterActive && (
+                  {(isFilterActive ||
+                    hasPendingFilterChanges ||
+                    Boolean(searchAttribute) ||
+                    filterOperator !== 'none' ||
+                    Boolean(entrySearch.trim()) ||
+                    statusFilter !== 'all' ||
+                    Boolean(useRegex && regexPattern.trim())) && (
                     <Button variant="ghost" size="S" onClick={clearFilter}>
                       Clear Search &amp; Filter
                     </Button>
@@ -3614,6 +3661,12 @@ const BulkUpdater: React.FC = () => {
                           placeholder="Type value to match..."
                           value={filterQuery}
                           onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFilterQuery(e.target.value)}
+                          onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => {
+                            if (e.key === 'Enter') {
+                              e.preventDefault();
+                              handleApplySearch();
+                            }
+                          }}
                         />
                       )}
                     </Box>
@@ -3626,6 +3679,12 @@ const BulkUpdater: React.FC = () => {
                       placeholder="Search title, name, or text across records..."
                       value={entrySearch}
                       onChange={(e: React.ChangeEvent<HTMLInputElement>) => setEntrySearch(e.target.value)}
+                      onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          handleApplySearch();
+                        }
+                      }}
                     />
                   </Box>
 
@@ -3643,6 +3702,22 @@ const BulkUpdater: React.FC = () => {
                       <SingleSelectOption value="modified">Modified</SingleSelectOption>
                       <SingleSelectOption value="unknown">Unknown</SingleSelectOption>
                     </SingleSelect>
+                  </Box>
+
+                  {/* Explicit Search Button (deferred filter execution) */}
+                  <Box>
+                    <Button
+                      variant={hasPendingFilterChanges ? 'default' : 'secondary'}
+                      startIcon={<Search />}
+                      onClick={handleApplySearch}
+                      loading={Boolean(selectedCollectionUid && collectionPages[selectedCollectionUid]?.loading)}
+                      disabled={
+                        !selectedCollectionUid ||
+                        Boolean(selectedCollectionUid && collectionPages[selectedCollectionUid]?.loading)
+                      }
+                    >
+                      Search
+                    </Button>
                   </Box>
 
                   {/* Quick Action Buttons when filter is active */}
