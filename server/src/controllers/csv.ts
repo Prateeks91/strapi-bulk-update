@@ -21,7 +21,17 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
   async exportCollection(ctx: any) {
     try {
       const { uid } = ctx.params;
-      const { search, attribute, searchAttribute, filterOperator, filterQuery, limit, documentIds, exportMode } = ({
+      const {
+        search,
+        attribute,
+        searchAttribute,
+        filterOperator,
+        filterQuery,
+        limit,
+        documentIds,
+        exportMode,
+        selectedColumns,
+      } = ({
         ...(ctx.query || {}),
         ...(ctx.request?.body || {}),
       }) as Record<string, any>;
@@ -37,6 +47,16 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
               .filter(Boolean);
       }
 
+      let parsedSelectedColumns: string[] | undefined;
+      if (selectedColumns) {
+        parsedSelectedColumns = Array.isArray(selectedColumns)
+          ? selectedColumns
+          : String(selectedColumns)
+              .split(',')
+              .map((s) => s.trim())
+              .filter(Boolean);
+      }
+
       const result = await csvService.exportCollectionCsv(uid, {
         search: search ? String(search) : undefined,
         attribute: attribute ? String(attribute) : undefined,
@@ -46,6 +66,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         limit: limit ? Number(limit) : undefined,
         documentIds: parsedDocIds,
         exportMode: exportMode ? String(exportMode) : undefined,
+        selectedColumns: parsedSelectedColumns,
       });
 
       ctx.body = {
@@ -63,9 +84,20 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
   async exportBulk(ctx: any) {
     try {
-      const { selectedEntries } = ctx.request.body || {};
+      const { selectedEntries, selectedColumns } = ctx.request.body || {};
       const csvService = strapi.plugin('bulk-updater').service('csv');
-      const result = await csvService.exportBulkCsv(selectedEntries);
+      let parsedSelectedColumns: string[] | undefined;
+      if (selectedColumns) {
+        parsedSelectedColumns = Array.isArray(selectedColumns)
+          ? selectedColumns
+          : String(selectedColumns)
+              .split(',')
+              .map((s) => s.trim())
+              .filter(Boolean);
+      }
+      const result = await csvService.exportBulkCsv(selectedEntries, {
+        selectedColumns: parsedSelectedColumns,
+      });
 
       ctx.body = {
         success: true,
