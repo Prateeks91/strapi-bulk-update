@@ -608,3 +608,209 @@ export function serializeGridTargets(
 
   return { targets, totalEditCount, hasValidationErrors };
 }
+
+export interface DynamicZoneItemMatch {
+  index: number;
+  componentUid?: string;
+  componentName?: string;
+  componentId?: number | string;
+  value: any;
+  path: string;
+}
+
+/**
+ * Parses dynamic zone dot or bracket notation paths:
+ * e.g. "blocks.title", "blocks[shared.heading].title", or "blocks[0].title"
+ */
+export function parseDynamicZonePath(path: string): {
+  cleanPath: string;
+  rootKey: string;
+  subPath: string;
+  targetComponentUid?: string;
+  targetIndex?: number;
+} {
+  if (!path) return { cleanPath: '', rootKey: '', subPath: '' };
+  const bracketMatch = path.match(/^([^.[]+)\[([^\]]+)\]\.(.+)$/);
+  if (bracketMatch) {
+    const rootKey = bracketMatch[1];
+    const selector = bracketMatch[2];
+    const subPath = bracketMatch[3];
+    const cleanPath = `${rootKey}.${subPath}`;
+    if (/^\d+$/.test(selector)) {
+      return { cleanPath, rootKey, subPath, targetIndex: parseInt(selector, 10) };
+    }
+    return { cleanPath, rootKey, subPath, targetComponentUid: selector };
+  }
+
+  const parts = path.split('.');
+  return {
+    cleanPath: path,
+    rootKey: parts[0] || '',
+    subPath: parts.slice(1).join('.'),
+  };
+}
+
+/**
+ * Formats a component UID into a friendly readable label (e.g. "shared.featured-section" -> "Featured Section")
+ */
+export function formatComponentName(compUid?: string): string {
+  if (!compUid) return 'Component';
+  const name = compUid.includes('.') ? compUid.split('.')[1] : compUid;
+  return name
+    .split(/[-_]/)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+}
+
+/**
+ * Robust property value resolver matching direct key, snake_case <-> camelCase aliases,
+ * and case-insensitive fallback.
+ */
+export function getPropertyValue(target: any, key: string): any {
+  if (!target || typeof target !== 'object' || !key) return undefined;
+
+  if (target[key] !== undefined && target[key] !== null) return target[key];
+
+  const camelKey = key.replace(/_([a-z0-9])/g, (_, letter) => letter.toUpperCase());
+  if (target[camelKey] !== undefined && target[camelKey] !== null) return target[camelKey];
+
+  const snakeKey = key.replace(/([A-Z])/g, '_$1').toLowerCase();
+  if (target[snakeKey] !== undefined && target[snakeKey] !== null) return target[snakeKey];
+
+  const lowerKey = key.toLowerCase();
+  const lowerNoUnderscore = lowerKey.replace(/_/g, '');
+  const matchedKey = Object.keys(target).find((k) => {
+    const kLower = k.toLowerCase();
+    return kLower === lowerKey || kLower.replace(/_/g, '') === lowerNoUnderscore;
+  });
+  if (matchedKey && target[matchedKey] !== undefined && target[matchedKey] !== null) {
+    return target[matchedKey];
+  }
+
+  if (key in target) return target[key];
+  if (camelKey in target) return target[camelKey];
+  if (snakeKey in target) return target[snakeKey];
+
+  return undefined;
+}
+
+/**
+ * Safely resolves a nested dot-notation property across objects and dynamic zone / repeatable component arrays.
+ */
+export function getNestedValue(obj: any, path: string): any {
+  if (!obj || !path) return undefined;
+  const parsed = parseDynamicZonePath(path);
+  const parts = parsed.cleanPath.split('.');
+
+  function extract(current: any, remainingParts: string[]): any {
+    if (current === undefined || current === null) return undefined;
+    if (remainingParts.length === 0) return current;
+
+    const [head, ...tail] = remainingParts;
+
+    if (Array.isArray(current)) {
+      if (/^\d+$/.test(head)) {
+        return extract(current[parseInt(head, 10)], tail);
+      }
+      for (let idx = 0; idx < current.length; idx++) {
+        const item = current[idx];
+        if (parsed.targetIndex !== undefined && idx !== parsed.targetIndex) continue;
+        if (parsed.targetComponentUid && item?.__component !== parsed.targetComponentUid) continue;
+        const found = extract(getPropertyValue(item, head), tail);
+        if (found !== undefined && found !== null) return found;
+      }
+      return undefined;
+    }
+
+    return extract(getPropertyValue(current, head), tail);
+  }
+
+  return extract(obj, parts);
+}
+
+/**
+ * Extracts all matching instances of a nested property across dynamic zone components or repeatable arrays.
+ */
+export function getAllNestedValues(
+  obj: any,
+  path: string,
+  availableAttributes?: string[]
+): DynamicZoneItemMatch[] {
+  if (!obj || !path) return [];
+  const parsed = parseDynamicZonePath(path);
+  const parts = parsed.cleanPath.split('.');
+  const [head, ...tail] = parts;
+
+  const rootTarget = getPropertyValue(obj, head);
+  if (rootTarget === undefined || rootTarget === null) return [];
+
+  // If rootTarget is an Array (Dynamic Zone or Repeatable Component)
+  if (Array.isArray(rootTarget)) {
+    const results: DynamicZoneItemMatch[] = [];
+    rootTarget.forEach((item, idx) => {
+      if (!item || typeof item !== 'object') return;
+      if (parsed.targetIndex !== undefined && idx !== parsed.targetIndex) return;
+      if (parsed.targetComponentUid && item.__component !== parsed.targetComponentUid) return;
+
+      const subPath = tail.join('.');
+      const scopedPath = item.__component ? `${head}[${item.__component}].${subPath}` : '';
+      const isSupported = availableAttributes ? availableAttributes.includes(scopedPath) : false;
+
+      // If tail contains nested array/components, resolve all sub-matches recursively
+      if (tail.length > 0) {
+        const subMatches = getAllNestedValues(item, subPath, availableAttributes);
+        if (subMatches.length > 0) {
+          subMatches.forEach((sm) => {
+            results.push({
+              index: idx,
+              componentUid: item.__component || sm.componentUid,
+              componentName: item.__component ? formatComponentName(item.__component) : sm.componentName,
+              componentId: item.id !== undefined && item.id !== null ? item.id : sm.componentId,
+              value: sm.value,
+              path: `${head}[#${idx}${item.__component ? ` ${formatComponentName(item.__component)}` : ''}].${sm.path}`,
+            });
+          });
+          return;
+        }
+      }
+
+      const subVal = tail.length > 0 ? getNestedValue(item, subPath) : item;
+      if (subVal !== undefined || isSupported) {
+        results.push({
+          index: idx,
+          componentUid: item.__component,
+          componentName: formatComponentName(item.__component),
+          componentId: item.id !== undefined && item.id !== null ? item.id : undefined,
+          value: subVal !== undefined ? subVal : null,
+          path: `${head}[#${idx}${item.__component ? ` ${formatComponentName(item.__component)}` : ''}].${subPath}`,
+        });
+      }
+    });
+    return results;
+  }
+
+  // If rootTarget is an object and tail has remaining parts, recurse into nested objects to find array occurrences
+  if (typeof rootTarget === 'object' && tail.length > 0) {
+    const subMatches = getAllNestedValues(rootTarget, tail.join('.'), availableAttributes);
+    if (subMatches.length > 0) {
+      return subMatches.map((sm) => ({
+        ...sm,
+        path: `${head}.${sm.path}`,
+      }));
+    }
+  }
+
+  // Not an array, standard object resolution
+  const singleVal = getNestedValue(obj, parsed.cleanPath);
+  if (singleVal !== undefined) {
+    return [
+      {
+        index: 0,
+        value: singleVal,
+        path: parsed.cleanPath,
+      },
+    ];
+  }
+
+  return [];
+}

@@ -1958,6 +1958,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       limit?: number;
       documentIds?: string[];
       exportMode?: CsvExportMode | string;
+      selectedColumns?: string[];
     } = {}
   ) {
     const ct = strapi.contentTypes[uid];
@@ -1981,7 +1982,11 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
     if (!filterMeta.colHasAttribute && filterMeta.normOp && filterMeta.normOp !== 'none') {
       // Attribute does not exist on collection: return empty CSV (headers only)
-      const emptySerialized = serializeDocumentsToCsv(strapi, uid, [], { schema, exportMode });
+      const emptySerialized = serializeDocumentsToCsv(strapi, uid, [], {
+        schema,
+        exportMode,
+        selectedColumns: options.selectedColumns,
+      });
       return {
         filename: `${ct.info?.singularName || uid}_export_${new Date().toISOString().slice(0, 10)}.csv`,
         csvContent: emptySerialized.csvContent,
@@ -2122,6 +2127,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       exportedAt,
       schema,
       exportMode,
+      selectedColumns: options.selectedColumns,
     });
     const filename = `${ct.info?.singularName || uid}_export_${new Date().toISOString().slice(0, 10)}.csv`;
 
@@ -2182,7 +2188,10 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
   /**
    * Bulk Export: Exports selected entries across multiple collections or a multi-collection batch.
    */
-  async exportBulkCsv(selectedEntries: Array<{ uid: string; documentId: string }>) {
+  async exportBulkCsv(
+    selectedEntries: Array<{ uid: string; documentId: string }>,
+    options: { selectedColumns?: string[] } = {}
+  ) {
     if (!selectedEntries || selectedEntries.length === 0) {
       throw new Error('No entries selected for bulk export');
     }
@@ -2199,7 +2208,11 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     // If all entries belong to a single collection, export full collection schema with deep fields
     if (uids.length === 1) {
       const uid = uids[0];
-      return await this.exportCollectionCsv(uid, { documentIds: byUid[uid], limit: 0 });
+      return await this.exportCollectionCsv(uid, {
+        documentIds: byUid[uid],
+        limit: 0,
+        selectedColumns: options.selectedColumns,
+      });
     }
 
     // Multi-collection unified export

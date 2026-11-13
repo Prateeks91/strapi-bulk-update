@@ -190,185 +190,23 @@ export interface ColumnDef {
   defaultVisible: boolean;
 }
 
-/**
- * Parses dynamic zone dot or bracket notation paths:
- * e.g. "blocks.title", "blocks[shared.heading].title", or "blocks[0].title"
- */
-export function parseDynamicZonePath(path: string): {
-  cleanPath: string;
-  rootKey: string;
-  subPath: string;
-  targetComponentUid?: string;
-  targetIndex?: number;
-} {
-  if (!path) return { cleanPath: '', rootKey: '', subPath: '' };
-  const bracketMatch = path.match(/^([^.[]+)\[([^\]]+)\]\.(.+)$/);
-  if (bracketMatch) {
-    const rootKey = bracketMatch[1];
-    const selector = bracketMatch[2];
-    const subPath = bracketMatch[3];
-    const cleanPath = `${rootKey}.${subPath}`;
-    if (/^\d+$/.test(selector)) {
-      return { cleanPath, rootKey, subPath, targetIndex: parseInt(selector, 10) };
-    }
-    return { cleanPath, rootKey, subPath, targetComponentUid: selector };
-  }
+import {
+  parseDynamicZonePath,
+  formatComponentName,
+  type DynamicZoneItemMatch,
+  getAllNestedValues,
+  getPropertyValue,
+  getNestedValue,
+} from '../utils/gridEdit';
 
-  const parts = path.split('.');
-  return {
-    cleanPath: path,
-    rootKey: parts[0] || '',
-    subPath: parts.slice(1).join('.'),
-  };
-}
-
-/**
- * Formats a component UID into a friendly readable label (e.g. "shared.featured-section" -> "Featured Section")
- */
-export function formatComponentName(compUid?: string): string {
-  if (!compUid) return 'Component';
-  const name = compUid.includes('.') ? compUid.split('.')[1] : compUid;
-  return name
-    .split(/[-_]/)
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-    .join(' ');
-}
-
-export interface DynamicZoneItemMatch {
-  index: number;
-  componentUid?: string;
-  componentName?: string;
-  value: any;
-  path: string;
-}
-
-/**
- * Extracts all matching instances of a nested property across dynamic zone components or repeatable arrays.
- */
-export function getAllNestedValues(
-  obj: any,
-  path: string,
-  availableAttributes?: string[]
-): DynamicZoneItemMatch[] {
-  if (!obj || !path) return [];
-  const parsed = parseDynamicZonePath(path);
-  const parts = parsed.cleanPath.split('.');
-  const [head, ...tail] = parts;
-
-  const rootTarget = getPropertyValue(obj, head);
-
-  // If rootTarget is an Array (Dynamic Zone or Repeatable Component)
-  if (Array.isArray(rootTarget)) {
-    const results: DynamicZoneItemMatch[] = [];
-    rootTarget.forEach((item, idx) => {
-      if (!item || typeof item !== 'object') return;
-      if (parsed.targetIndex !== undefined && idx !== parsed.targetIndex) return;
-      if (parsed.targetComponentUid && item.__component !== parsed.targetComponentUid) return;
-
-      const subPath = tail.join('.');
-      const scopedPath = item.__component ? `${head}[${item.__component}].${subPath}` : '';
-      const isSupported = availableAttributes ? availableAttributes.includes(scopedPath) : false;
-
-      const subVal = tail.length > 0 ? getNestedValue(item, subPath) : item;
-      if (subVal !== undefined || isSupported) {
-        results.push({
-          index: idx,
-          componentUid: item.__component,
-          componentName: formatComponentName(item.__component),
-          value: subVal !== undefined ? subVal : null,
-          path: `${head}[#${idx}${item.__component ? ` ${formatComponentName(item.__component)}` : ''}].${subPath}`,
-        });
-      }
-    });
-    return results;
-  }
-
-  // Not an array, standard object resolution
-  const singleVal = getNestedValue(obj, parsed.cleanPath);
-  if (singleVal !== undefined) {
-    return [
-      {
-        index: 0,
-        value: singleVal,
-        path: parsed.cleanPath,
-      },
-    ];
-  }
-
-  return [];
-}
-
-/**
- * Robust property value resolver:
- * Matches direct key, snake_case <-> camelCase aliases (e.g. updated_at <-> updatedAt, created_at <-> createdAt),
- * and case-insensitive fallback.
- */
-export function getPropertyValue(target: any, key: string): any {
-  if (!target || typeof target !== 'object' || !key) return undefined;
-
-  // 1. Direct match
-  if (target[key] !== undefined && target[key] !== null) return target[key];
-
-  // 2. snake_case -> camelCase (e.g. updated_at -> updatedAt, created_at -> createdAt)
-  const camelKey = key.replace(/_([a-z0-9])/g, (_, letter) => letter.toUpperCase());
-  if (target[camelKey] !== undefined && target[camelKey] !== null) return target[camelKey];
-
-  // 3. camelCase -> snake_case (e.g. updatedAt -> updated_at, createdAt -> created_at)
-  const snakeKey = key.replace(/([A-Z])/g, '_$1').toLowerCase();
-  if (target[snakeKey] !== undefined && target[snakeKey] !== null) return target[snakeKey];
-
-  // 4. Case-insensitive / underscore-insensitive match
-  const lowerKey = key.toLowerCase();
-  const lowerNoUnderscore = lowerKey.replace(/_/g, '');
-  const matchedKey = Object.keys(target).find((k) => {
-    const kLower = k.toLowerCase();
-    return kLower === lowerKey || kLower.replace(/_/g, '') === lowerNoUnderscore;
-  });
-  if (matchedKey && target[matchedKey] !== undefined && target[matchedKey] !== null) {
-    return target[matchedKey];
-  }
-
-  // 5. Fallback: check key presence
-  if (key in target) return target[key];
-  if (camelKey in target) return target[camelKey];
-  if (snakeKey in target) return target[snakeKey];
-
-  return undefined;
-}
-
-/**
- * Safely resolves a nested dot-notation property across objects and dynamic zone / repeatable component arrays.
- */
-export function getNestedValue(obj: any, path: string): any {
-  if (!obj || !path) return undefined;
-  const parsed = parseDynamicZonePath(path);
-  const parts = parsed.cleanPath.split('.');
-
-  function extract(current: any, remainingParts: string[]): any {
-    if (current === undefined || current === null) return undefined;
-    if (remainingParts.length === 0) return current;
-
-    const [head, ...tail] = remainingParts;
-
-    if (Array.isArray(current)) {
-      if (/^\d+$/.test(head)) {
-        return extract(current[parseInt(head, 10)], tail);
-      }
-      for (let idx = 0; idx < current.length; idx++) {
-        const item = current[idx];
-        if (parsed.targetIndex !== undefined && idx !== parsed.targetIndex) continue;
-        if (parsed.targetComponentUid && item?.__component !== parsed.targetComponentUid) continue;
-        const found = extract(getPropertyValue(item, head), tail);
-        if (found !== undefined && found !== null) return found;
-      }
-      return undefined;
-    }
-
-    return extract(getPropertyValue(current, head), tail);
-  }
-
-  return extract(obj, parts);
-}
+export {
+  parseDynamicZonePath,
+  formatComponentName,
+  type DynamicZoneItemMatch,
+  getAllNestedValues,
+  getPropertyValue,
+  getNestedValue,
+} from '../utils/gridEdit';
 
 /**
  * Flat helper: Generates the list of available columns for a given collection model.
@@ -1130,15 +968,68 @@ function renderCellContent(
 
     default: {
       const attrName = colDef.key.replace('attr_', '');
-      const rawVal = getNestedValue(entry, attrName);
-      const displayStr = formatDisplayValue(rawVal);
+      const matches = getAllNestedValues(entry, attrName, col?.attributes);
+      if (matches.length === 0) {
+        return (
+          <Typography textColor="neutral500" style={{ fontStyle: 'italic' }}>
+            -
+          </Typography>
+        );
+      }
+
+      // If exactly 1 match and it's a standard scalar/direct property (not inside an array/component occurrence)
+      if (matches.length === 1 && !matches[0].componentUid && !matches[0].path.includes('[#')) {
+        const displayStr = formatDisplayValue(matches[0].value);
+        return (
+          <Typography
+            textColor="neutral700"
+            style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+          >
+            {displayStr === '(empty / not set)' ? '-' : displayStr}
+          </Typography>
+        );
+      }
+
+      // Multiple occurrences or component occurrence: render ALL occurrences
       return (
-        <Typography
-          textColor="neutral700"
-          style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-        >
-          {displayStr === '(empty / not set)' ? '-' : displayStr}
-        </Typography>
+        <Flex direction="column" gap={1} alignItems="flex-start" style={{ maxWidth: 320 }}>
+          {matches.map((m, mIdx) => {
+            const displayStr = formatDisplayValue(m.value);
+            return (
+              <Flex
+                key={`${m.index}_${m.componentId ?? mIdx}_${m.componentUid ?? ''}`}
+                gap={1}
+                alignItems="center"
+                style={{
+                  backgroundColor: 'rgba(0, 0, 0, 0.03)',
+                  padding: '2px 6px',
+                  borderRadius: 4,
+                }}
+              >
+                <Badge size="S" backgroundColor="neutral200" textColor="neutral800">
+                  #{m.index} {m.componentName || 'Item'}
+                </Badge>
+                {m.componentId !== undefined && (
+                  <Typography variant="pi" textColor="neutral500" style={{ fontSize: '0.68rem' }}>
+                    id:{m.componentId}
+                  </Typography>
+                )}
+                <Typography
+                  variant="pi"
+                  textColor="neutral800"
+                  style={{
+                    maxWidth: 200,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {displayStr}
+                </Typography>
+              </Flex>
+            );
+          })}
+        </Flex>
       );
     }
   }
@@ -2825,7 +2716,34 @@ const BulkUpdater: React.FC = () => {
 
     try {
       setBulkExporting(true);
-      const res = await post('/bulk-updater/csv/export-bulk', { selectedEntries: targets });
+      const targetUids = Array.from(new Set(targets.map((t) => t.uid)));
+      let bulkSelectedCols: string[] | undefined;
+      if (targetUids.length === 1 && selectedCol && selectedCol.uid === targetUids[0]) {
+        const availCols = getAvailableColumnsForCollection(selectedCol, selectedAttribute, searchAttribute);
+        const savedKeys = collectionColumnVisibility[selectedCol.uid];
+        const activeCols = savedKeys
+          ? availCols.filter((c) => c.isPermanent || savedKeys.includes(c.key))
+          : availCols.filter((c) => c.defaultVisible);
+        const selectedDataAttrs: string[] = [];
+        for (const c of activeCols) {
+          if (c.key.startsWith('attr_')) {
+            const attr = c.key.slice(5);
+            if (!selectedDataAttrs.includes(attr)) selectedDataAttrs.push(attr);
+          } else if (c.key === 'target_attr' && selectedAttribute) {
+            if (!selectedDataAttrs.includes(selectedAttribute)) selectedDataAttrs.push(selectedAttribute);
+          } else if (c.key === 'search_attr' && searchAttribute) {
+            if (!selectedDataAttrs.includes(searchAttribute)) selectedDataAttrs.push(searchAttribute);
+          }
+        }
+        if (selectedDataAttrs.length > 0) {
+          bulkSelectedCols = selectedDataAttrs;
+        }
+      }
+
+      const res = await post('/bulk-updater/csv/export-bulk', {
+        selectedEntries: targets,
+        selectedColumns: bulkSelectedCols,
+      });
       const csvStr = res.data?.csvContent || (typeof res.data === 'string' ? res.data : '');
       if (!csvStr) {
         toggleNotification({
@@ -4169,6 +4087,24 @@ const BulkUpdater: React.FC = () => {
                                 .map((e) => e.documentId);
                               if (colSelectedDocIds.length > 0) {
                                 params.set('documentIds', colSelectedDocIds.join(','));
+                              }
+
+                              // Selected-columns CSV export (Enhancement 2):
+                              // Export strictly the active data columns visible in Workspace
+                              const selectedDataAttrs: string[] = [];
+                              for (const c of activeColumns) {
+                                if (c.key.startsWith('attr_')) {
+                                  const attr = c.key.slice(5);
+                                  if (!selectedDataAttrs.includes(attr)) selectedDataAttrs.push(attr);
+                                } else if (c.key === 'target_attr' && selectedAttribute) {
+                                  if (!selectedDataAttrs.includes(selectedAttribute)) selectedDataAttrs.push(selectedAttribute);
+                                } else if (c.key === 'search_attr' && searchAttribute) {
+                                  if (!selectedDataAttrs.includes(searchAttribute)) selectedDataAttrs.push(searchAttribute);
+                                }
+                              }
+                              if (selectedDataAttrs.length > 0) {
+                                params.set('selectedColumns', selectedDataAttrs.join(','));
+                                params.set('exportMode', 'selective');
                               }
 
                               const res = await get(`/bulk-updater/csv/export/${col.uid}?${params.toString()}`);

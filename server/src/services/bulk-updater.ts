@@ -626,6 +626,7 @@ export interface DynamicZoneItemMatch {
   index: number;
   componentUid?: string;
   componentName?: string;
+  componentId?: number | string;
   value: any;
   path: string;
 }
@@ -640,6 +641,7 @@ export function getAllNestedValues(obj: any, path: string): DynamicZoneItemMatch
   const [head, ...tail] = parts;
 
   const rootTarget = obj[head];
+  if (rootTarget === undefined || rootTarget === null) return [];
 
   // If rootTarget is an Array (Dynamic Zone or Repeatable Component)
   if (Array.isArray(rootTarget)) {
@@ -654,18 +656,48 @@ export function getAllNestedValues(obj: any, path: string): DynamicZoneItemMatch
         ? tail[0] in compSchema.attributes
         : false;
 
+      // Recursive resolution if tail contains sub-arrays or nested components
+      if (tail.length > 0) {
+        const subMatches = getAllNestedValues(item, tail.join('.'));
+        if (subMatches.length > 0) {
+          subMatches.forEach((sm) => {
+            results.push({
+              index: idx,
+              componentUid: item.__component || sm.componentUid,
+              componentName: item.__component ? formatComponentName(item.__component) : sm.componentName,
+              componentId: item.id !== undefined && item.id !== null ? item.id : sm.componentId,
+              value: sm.value,
+              path: `${head}[#${idx}${item.__component ? ` ${formatComponentName(item.__component)}` : ''}].${sm.path}`,
+            });
+          });
+          return;
+        }
+      }
+
       const subVal = tail.length > 0 ? getDeepProperty(item, tail.join('.')) : item;
       if (subVal !== undefined || fieldInSchema) {
         results.push({
           index: idx,
           componentUid: item.__component,
           componentName: formatComponentName(item.__component),
+          componentId: item.id !== undefined && item.id !== null ? item.id : undefined,
           value: subVal !== undefined ? subVal : null,
           path: `${head}[#${idx}${item.__component ? ` ${formatComponentName(item.__component)}` : ''}].${tail.join('.')}`,
         });
       }
     });
     return results;
+  }
+
+  // If rootTarget is a single object and there are remaining parts in tail, recurse
+  if (typeof rootTarget === 'object' && tail.length > 0) {
+    const subMatches = getAllNestedValues(rootTarget, tail.join('.'));
+    if (subMatches.length > 0) {
+      return subMatches.map((sm) => ({
+        ...sm,
+        path: `${head}.${sm.path}`,
+      }));
+    }
   }
 
   // Not an array, standard object resolution

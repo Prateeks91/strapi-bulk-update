@@ -24,6 +24,7 @@ export interface BulkUpdaterMetadata {
   targetObjectState?: TargetObjectState;
   applicableFields?: string[];
   flatTypes?: Record<string, FlattenedLeafType>;
+  selectedColumns?: string[];
 }
 
 /**
@@ -279,7 +280,12 @@ export function serializeDocumentsToCsv(
   strapi: Core.Strapi,
   uid: string,
   documents: any[],
-  options: { exportedAt?: string; schema?: DiscoveredSchema; exportMode?: CsvExportMode } = {}
+  options: {
+    exportedAt?: string;
+    schema?: DiscoveredSchema;
+    exportMode?: CsvExportMode;
+    selectedColumns?: string[];
+  } = {}
 ): {
   csvContent: string;
   headers: string[];
@@ -287,7 +293,11 @@ export function serializeDocumentsToCsv(
 } {
   const schema = options.schema || discoverSchema(strapi, uid);
   const exportMode = normalizeExportMode(options.exportMode);
-  const plan = buildExportColumnPlan(strapi, uid, documents || [], { schema, exportMode });
+  const plan = buildExportColumnPlan(strapi, uid, documents || [], {
+    schema,
+    exportMode,
+    selectedColumns: options.selectedColumns,
+  });
 
   // Headers start with metadata column, followed by planned export columns (with selected object split at 1 level in targeted mode)
   const headers = [METADATA_COLUMN_KEY, ...plan.headers];
@@ -309,6 +319,7 @@ export function serializeDocumentsToCsv(
       locale: doc.locale || undefined,
       exportedAt,
       ...(flattenedMeta.exportMode ? { exportMode: flattenedMeta.exportMode } : {}),
+      ...(flattenedMeta.selectedColumns ? { selectedColumns: flattenedMeta.selectedColumns } : {}),
       ...(flattenedMeta.targetObjectField ? { targetObjectField: flattenedMeta.targetObjectField } : {}),
       ...(flattenedMeta.targetObjectState ? { targetObjectState: flattenedMeta.targetObjectState } : {}),
       ...(flattenedMeta.applicableFields ? { applicableFields: flattenedMeta.applicableFields } : {}),

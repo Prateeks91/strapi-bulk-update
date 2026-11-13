@@ -5,13 +5,14 @@ import {
   discoverSchema,
   SYSTEM_ATTRIBUTES,
 } from './schema-discovery';
+import { getAllNestedValues } from '../bulk-updater';
 
 export const EXPLICIT_CLEAR_TOKENS = new Set(['__CLEAR__', '__NULL__']);
 export const EXPLICIT_EMPTY_STRING_TOKEN = '__EMPTY__';
 export const EXPLICIT_DELETE_KEY_TOKEN = '__DELETE__';
 export const FORBIDDEN_OBJECT_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
-export type CsvExportMode = 'all' | 'metafields' | 'topbarconfig';
+export type CsvExportMode = 'all' | 'metafields' | 'topbarconfig' | 'selective';
 export type DetectedCsvExportMode = CsvExportMode | 'legacy';
 export type TargetObjectState = 'present' | 'empty_object' | 'null' | 'absent';
 export type FlattenedLeafType = 'string' | 'number' | 'boolean' | 'null' | 'array' | 'object';
@@ -22,12 +23,14 @@ export interface FlattenedRowMeta {
   targetObjectState?: TargetObjectState;
   applicableFields?: string[];
   flatTypes?: Record<string, FlattenedLeafType>;
+  selectedColumns?: string[];
 }
 
 export type ExportColumnKind =
   | 'system'
   | 'field'
-  | 'flattened_first_level';
+  | 'flattened_first_level'
+  | 'selective_nested';
 
 export interface ExportColumnDescriptor {
   header: string;
@@ -36,6 +39,7 @@ export interface ExportColumnDescriptor {
   propKey?: string;
   field?: DiscoveredField;
   componentSubDef?: Record<string, any>;
+  isRepeatedNested?: boolean;
 }
 
 export interface ExportColumnPlan {
@@ -43,12 +47,14 @@ export interface ExportColumnPlan {
   targetObjectField?: string;
   columns: ExportColumnDescriptor[];
   headers: string[];
+  selectedColumns?: string[];
 }
 
 export function normalizeExportMode(raw: any): CsvExportMode {
   const val = String(raw || '').trim().toLowerCase();
   if (val === 'metafields') return 'metafields';
   if (val === 'topbarconfig') return 'topbarconfig';
+  if (val === 'selective') return 'selective';
   return 'all';
 }
 
@@ -108,6 +114,36 @@ function isSafePropKey(segment: string): boolean {
   return Boolean(segment) && !FORBIDDEN_OBJECT_KEYS.has(segment) && !segment.includes('.');
 }
 
+export function getDeepProp(obj: any, path: string): any {
+  if (!obj || !path) return undefined;
+  const parts = path.split('.');
+  let cur = obj;
+  for (const key of parts) {
+    if (cur === null || cur === undefined || typeof cur !== 'object') return undefined;
+    if (FORBIDDEN_OBJECT_KEYS.has(key)) return undefined;
+    cur = cur[key];
+  }
+  return cur;
+}
+
+export function setDeepProp(obj: any, path: string, value: any): boolean {
+  if (!obj || typeof obj !== 'object' || !path) return false;
+  const parts = path.split('.');
+  let cur = obj;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const key = parts[i];
+    if (FORBIDDEN_OBJECT_KEYS.has(key)) return false;
+    if (cur[key] === undefined || cur[key] === null || typeof cur[key] !== 'object') {
+      cur[key] = {};
+    }
+    cur = cur[key];
+  }
+  const lastKey = parts[parts.length - 1];
+  if (FORBIDDEN_OBJECT_KEYS.has(lastKey)) return false;
+  cur[lastKey] = value;
+  return true;
+}
+
 /**
  * Resolves the exact schema attribute name matching the targeted export mode ('metafields' or 'topbarconfig').
  */
@@ -115,7 +151,7 @@ export function resolveTargetObjectField(
   schema: DiscoveredSchema,
   exportMode: CsvExportMode
 ): string | undefined {
-  if (exportMode === 'all') return undefined;
+  if (exportMode === 'all' || exportMode === 'selective') return undefined;
 
   const keys = Object.keys(schema.fields || {});
   const exactMatch = keys.find((k) => k === exportMode);
@@ -231,10 +267,97 @@ export function buildExportColumnPlan(
   strapi: Core.Strapi,
   uid: string,
   documents: any[],
-  options: { schema?: DiscoveredSchema; exportMode?: CsvExportMode } = {}
+  options: { schema?: DiscoveredSchema; exportMode?: CsvExportMode; selectedColumns?: string[] } = {}
 ): ExportColumnPlan {
   const schema = options.schema || discoverSchema(strapi, uid);
-  const exportMode: CsvExportMode = normalizeExportMode(options.exportMode);
+  const rawExportMode = options.exportMode;
+  const hasSelectedColumns = Array.isArray(options.selectedColumns) && options.selectedColumns.length > 0;
+  const exportMode: CsvExportMode = hasSelectedColumns ? 'selective' : normalizeExportMode(rawExportMode);
+
+  if (exportMode === 'selective' && hasSelectedColumns) {
+    const columns: ExportColumnDescriptor[] = [];
+    const headers: string[] = [];
+
+    // 1. documentId by default
+    columns.push({
+      header: 'documentId',
+      kind: 'system',
+      rootKey: 'documentId',
+    });
+    headers.push('documentId');
+
+    // 2. slug by default
+    columns.push({
+      header: 'slug',
+      kind: schema.fields['slug'] ? 'field' : 'system',
+      rootKey: 'slug',
+      field: schema.fields['slug'],
+    });
+    headers.push('slug');
+
+    // 3. User selected columns
+    for (const rawCol of options.selectedColumns!) {
+      const colName = String(rawCol).trim();
+      if (
+        !colName ||
+        colName === 'documentId' ||
+        colName === 'slug' ||
+        colName === '__bulk_updater_metadata' ||
+        colName === '_bulk_updater_metadata'
+      ) {
+        continue;
+      }
+      if (headers.includes(colName)) {
+        continue;
+      }
+
+      if (colName.includes('.')) {
+        const rootKey = colName.split('.')[0];
+        const rootField = schema.fields[rootKey];
+        const isRepeated =
+          rootField?.category === 'component_repeatable' ||
+          rootField?.category === 'dynamiczone' ||
+          rootField?.rawType === 'dynamiczone' ||
+          (Array.isArray(documents) && documents.some((d) => Array.isArray(d?.[rootKey])));
+
+        columns.push({
+          header: colName,
+          kind: 'selective_nested',
+          rootKey,
+          isRepeatedNested: Boolean(isRepeated),
+          field: rootField,
+        });
+        headers.push(colName);
+      } else {
+        const field = schema.fields[colName];
+        if (field) {
+          columns.push({
+            header: colName,
+            kind: 'field',
+            rootKey: colName,
+            field,
+          });
+          headers.push(colName);
+        } else {
+          columns.push({
+            header: colName,
+            kind: 'selective_nested',
+            rootKey: colName,
+            isRepeatedNested: false,
+          });
+          headers.push(colName);
+        }
+      }
+    }
+
+    return {
+      exportMode,
+      columns,
+      headers,
+      selectedColumns: options.selectedColumns,
+    };
+  }
+
   const targetObjectField = resolveTargetObjectField(schema, exportMode);
   const topLevelNames = new Set(schema.allExportKeys);
   const columns: ExportColumnDescriptor[] = [];
@@ -303,6 +426,12 @@ export function extractRowFlattenedMetadata(
     exportMode: plan.exportMode,
   };
 
+  if (plan.exportMode === 'selective') {
+    out.selectedColumns =
+      plan.selectedColumns || plan.headers.filter((h) => h !== 'documentId' && h !== 'slug');
+    return out;
+  }
+
   if (plan.exportMode === 'all' || !plan.targetObjectField) {
     return out;
   }
@@ -361,7 +490,39 @@ export function serializePlannedCell(
   if (col.kind === 'system') {
     if (col.header === 'documentId') return doc?.documentId || doc?.id || '';
     if (col.header === 'locale') return doc?.locale || '';
+    if (col.header === 'slug') return doc?.slug ?? '';
     return doc?.[col.header] ?? '';
+  }
+
+  if (col.kind === 'selective_nested') {
+    if (col.isRepeatedNested) {
+      const matches = getAllNestedValues(doc, col.header);
+      if (!matches || matches.length === 0) {
+        return '';
+      }
+      const occurrences = matches.map((m) => {
+        const item: Record<string, any> = { value: m.value };
+        if (m.componentId !== undefined && m.componentId !== null) {
+          item.id = m.componentId;
+        }
+        if (m.componentUid) {
+          item.__component = m.componentUid;
+        }
+        if (m.index !== undefined) {
+          item.index = m.index;
+        }
+        return item;
+      });
+      return JSON.stringify(occurrences);
+    } else {
+      const val = getDeepProp(doc, col.header);
+      if (val === undefined || val === null) return '';
+      if (val instanceof Date) return val.toISOString();
+      if (Array.isArray(val) || isPlainObject(val)) return JSON.stringify(val);
+      if (typeof val === 'boolean') return val ? 'true' : 'false';
+      if (typeof val === 'number') return Number.isFinite(val) ? String(val) : '';
+      return String(val);
+    }
   }
 
   if (col.kind === 'flattened_first_level' && col.propKey) {
@@ -422,6 +583,7 @@ export function inspectRowMetadataMode(
   targetObjectState?: TargetObjectState;
   flatTypes?: Record<string, FlattenedLeafType>;
   applicableFields?: string[];
+  selectedColumns?: string[];
   error?: string;
 } {
   if (!rawRow || typeof rawRow !== 'object') {
@@ -461,11 +623,12 @@ export function inspectRowMetadataMode(
       mode: 'legacy',
       applicableFields: Array.isArray(parsed.applicableFields) ? parsed.applicableFields : undefined,
       flatTypes: isPlainObject(parsed.flatTypes) ? parsed.flatTypes : undefined,
+      selectedColumns: Array.isArray(parsed.selectedColumns) ? parsed.selectedColumns : undefined,
     };
   }
 
   const rawMode = String(parsed.exportMode).trim().toLowerCase();
-  if (rawMode !== 'all' && rawMode !== 'metafields' && rawMode !== 'topbarconfig') {
+  if (rawMode !== 'all' && rawMode !== 'metafields' && rawMode !== 'topbarconfig' && rawMode !== 'selective') {
     return {
       mode: 'legacy',
       error: `Unsupported CSV exportMode "${parsed.exportMode}" in metadata.`,
@@ -481,6 +644,7 @@ export function inspectRowMetadataMode(
     targetObjectState: parsed.targetObjectState,
     applicableFields: Array.isArray(parsed.applicableFields) ? parsed.applicableFields : undefined,
     flatTypes: isPlainObject(parsed.flatTypes) ? parsed.flatTypes : undefined,
+    selectedColumns: Array.isArray(parsed.selectedColumns) ? parsed.selectedColumns : undefined,
   };
 }
 

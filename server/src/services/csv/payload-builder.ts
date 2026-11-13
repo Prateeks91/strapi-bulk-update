@@ -12,6 +12,9 @@ import {
   EXPLICIT_DELETE_KEY_TOKEN,
   EXPLICIT_EMPTY_STRING_TOKEN,
   deepCloneValue,
+  deepEqualValues,
+  getDeepProp,
+  setDeepProp,
   inspectRowMetadataMode,
   isPlainObject,
   parseFirstLevelCellValue,
@@ -19,6 +22,7 @@ import {
   resolveTargetObjectField,
   validateRecordSchemaConstraints,
 } from './object-flattening';
+import { getAllNestedValues } from '../bulk-updater';
 
 export interface PayloadBuilderOptions {
   isPartialUpdate?: boolean;
@@ -562,6 +566,287 @@ export async function prepareCsvRowMutation(
       warnings,
       detectedMode,
       targetObjectField: targetAttr,
+      rowMeta: rowInfo,
+    };
+  }
+
+  // Selective update mode (Enhancement 2):
+  // Headers in CSV minus metadata/identifiers form the strict allowlist of updateable fields.
+  // We compare imported values against current persisted values, update only changed fields,
+  // skip unchanged records, and preserve unselected fields, sibling properties, and component identities.
+  if (detectedMode === 'selective' && !isCreate) {
+    const allowlistedHeaders = Object.keys(unescapedRow).filter(
+      (k) =>
+        k !== METADATA_COLUMN_KEY &&
+        k !== '__bulk_updater_metadata' &&
+        k !== '_bulk_updater_metadata' &&
+        k !== 'documentId' &&
+        k !== 'slug'
+    );
+
+    if (allowlistedHeaders.length === 0) {
+      return {
+        payload: {},
+        errors: [],
+        warnings: [],
+        detectedMode,
+        rowMeta: rowInfo,
+      };
+    }
+
+    let hasRowChanges = false;
+    const modifiedContainers: Record<string, any> = {};
+    const containerChanged: Record<string, boolean> = {};
+
+    for (const colKey of allowlistedHeaders) {
+      const rawCell = unescapedRow[colKey];
+      if (rawCell === undefined || rawCell === null) {
+        continue;
+      }
+      const strCell = typeof rawCell === 'string' ? rawCell : String(rawCell);
+      const trimmed = strCell.trim();
+
+      // Blank cell NEVER deletes or overwrites existing property (Section 1 & 6.2)
+      if (strCell === '') {
+        continue;
+      }
+
+      const isExplicitClear = EXPLICIT_CLEAR_TOKENS.has(trimmed) || trimmed === 'null';
+      const isExplicitEmptyString = trimmed === EXPLICIT_EMPTY_STRING_TOKEN;
+
+      const firstDot = colKey.indexOf('.');
+      if (firstDot === -1) {
+        // Root-level attribute (e.g. title, description, price)
+        const field = schema.fields[colKey];
+        const currentVal = existingDoc ? existingDoc[colKey] : undefined;
+        let targetVal: any;
+
+        if (isExplicitClear) {
+          targetVal = null;
+        } else if (isExplicitEmptyString) {
+          targetVal = '';
+        } else if (!field) {
+          targetVal = strCell;
+        } else if (field.category === 'scalar') {
+          if (field.rawType === 'integer' || field.rawType === 'biginteger') {
+            targetVal = parseNumeric(strCell, true);
+          } else if (field.rawType === 'float' || field.rawType === 'decimal') {
+            targetVal = parseNumeric(strCell, false);
+          } else if (field.rawType === 'boolean') {
+            targetVal = parseBoolean(strCell);
+          } else if (field.rawType === 'enumeration') {
+            if (field.enumOptions && field.enumOptions.length > 0) {
+              const match = field.enumOptions.find((o) => o.toLowerCase() === trimmed.toLowerCase());
+              targetVal = match || trimmed;
+            } else {
+              targetVal = trimmed;
+            }
+          } else {
+            targetVal = strCell;
+          }
+        } else if (field.category === 'json') {
+          targetVal = parseFirstLevelCellValue(strCell, 'object', currentVal).value;
+        } else if (field.category === 'relation_to_one') {
+          targetVal = resolveRelationPayload(strCell, false);
+        } else if (field.category === 'relation_to_many') {
+          targetVal = resolveRelationPayload(strCell, true);
+        } else if (field.category === 'media_single') {
+          targetVal = await resolveMediaIds(strapi, strCell, false);
+        } else if (field.category === 'media_to_many') {
+          targetVal = await resolveMediaIds(strapi, strCell, true);
+        } else {
+          targetVal = strCell;
+        }
+
+        if (!deepEqualValues(targetVal, currentVal)) {
+          payload[colKey] = targetVal;
+          hasRowChanges = true;
+        }
+      } else {
+        // Dotted path attribute (e.g. metafields.metatitle or content.titleheadingstyle.titlestyle)
+        const rootKey = colKey.slice(0, firstDot);
+        const nestedPath = colKey.slice(firstDot + 1);
+        const rootField = schema.fields[rootKey];
+        const isRepeatableOrDz =
+          rootField?.category === 'component_repeatable' ||
+          rootField?.category === 'dynamiczone' ||
+          rootField?.rawType === 'dynamiczone' ||
+          Array.isArray(existingDoc?.[rootKey]);
+
+        if (isRepeatableOrDz) {
+          const existingList: any[] = Array.isArray(existingDoc?.[rootKey]) ? existingDoc[rootKey] : [];
+          let cellOccurrences: any[] = [];
+
+          if (trimmed.startsWith('[')) {
+            try {
+              const parsed = JSON.parse(trimmed);
+              cellOccurrences = Array.isArray(parsed) ? parsed : [parsed];
+            } catch {
+              errors.push(`Column "${colKey}" contains invalid JSON array: "${strCell}"`);
+              continue;
+            }
+          } else {
+            const existingMatches = getAllNestedValues(existingDoc, colKey);
+            if (existingMatches.length > 1) {
+              errors.push(
+                `Ambiguous update: multiple occurrences (${existingMatches.length}) of "${colKey}" exist on document "${options.docIdForError || existingDoc.documentId}", but CSV provided an ambiguous scalar without occurrence IDs.`
+              );
+              continue;
+            } else if (existingMatches.length === 1) {
+              cellOccurrences = [
+                {
+                  id: existingMatches[0].componentId,
+                  index: existingMatches[0].index,
+                  __component: existingMatches[0].componentUid,
+                  value: isExplicitClear ? null : (isExplicitEmptyString ? '' : strCell),
+                },
+              ];
+            } else {
+              errors.push(
+                `Field "${colKey}" is not applicable or has no matching components on document "${options.docIdForError || existingDoc.documentId}".`
+              );
+              continue;
+            }
+          }
+
+          if (!modifiedContainers[rootKey]) {
+            modifiedContainers[rootKey] = deepCloneValue(existingList);
+            containerChanged[rootKey] = false;
+          }
+          const workingList: any[] = modifiedContainers[rootKey];
+
+          for (const occ of cellOccurrences) {
+            if (!occ || typeof occ !== 'object') continue;
+            let targetItem: any = undefined;
+
+            if (occ.id !== undefined && occ.id !== null) {
+              targetItem = workingList.find((it) => it && String(it.id) === String(occ.id));
+              if (!targetItem) {
+                errors.push(
+                  `Component occurrence with id "${occ.id}" not found in "${rootKey}" on document "${options.docIdForError || existingDoc.documentId}".`
+                );
+                continue;
+              }
+            } else if (occ.index !== undefined && occ.index >= 0 && occ.index < workingList.length) {
+              targetItem = workingList[occ.index];
+              if (occ.__component && targetItem && targetItem.__component !== occ.__component) {
+                errors.push(
+                  `Component occurrence at index ${occ.index} expected type "${occ.__component}" but found "${targetItem.__component}".`
+                );
+                continue;
+              }
+            } else if (workingList.length === 1) {
+              targetItem = workingList[0];
+            } else {
+              errors.push(
+                `Ambiguous component occurrence in column "${colKey}" on document "${options.docIdForError || existingDoc.documentId}": missing occurrence id.`
+              );
+              continue;
+            }
+
+            if (targetItem) {
+              let targetVal = occ.value !== undefined ? occ.value : occ;
+              if (typeof targetVal === 'string') {
+                const normVal = targetVal.trim().toLowerCase();
+                if (EXPLICIT_CLEAR_TOKENS.has(normVal)) {
+                  targetVal = null;
+                } else if (targetVal === EXPLICIT_EMPTY_STRING_TOKEN) {
+                  targetVal = '';
+                }
+              }
+              const currentItemVal = getDeepProp(targetItem, nestedPath);
+              if (!deepEqualValues(targetVal, currentItemVal)) {
+                setDeepProp(targetItem, nestedPath, targetVal);
+                containerChanged[rootKey] = true;
+                hasRowChanges = true;
+              }
+            }
+          }
+        } else {
+          // Single component or JSON object
+          if (existingDoc && !isPlainObject(existingDoc[rootKey])) {
+            const isAttrRequired = Boolean(strapi.contentTypes?.[uid]?.attributes?.[rootKey]?.required);
+            if (!isAttrRequired) {
+              errors.push(
+                `Field "${rootKey}" is not applicable or absent on document "${options.docIdForError || existingDoc.documentId}". Selective import will not create a new "${rootKey}" object automatically.`
+              );
+              continue;
+            }
+          }
+
+          if (!modifiedContainers[rootKey]) {
+            modifiedContainers[rootKey] = isPlainObject(existingDoc?.[rootKey])
+              ? deepCloneValue(existingDoc[rootKey])
+              : {};
+            containerChanged[rootKey] = false;
+          }
+          const workingObj = modifiedContainers[rootKey];
+          const currentVal = getDeepProp(existingDoc?.[rootKey], nestedPath);
+          let targetVal: any;
+
+          if (isExplicitClear) {
+            targetVal = null;
+          } else if (isExplicitEmptyString) {
+            targetVal = '';
+          } else {
+            targetVal = parseFirstLevelCellValue(strCell, undefined, currentVal).value;
+          }
+
+          if (!deepEqualValues(targetVal, currentVal)) {
+            setDeepProp(workingObj, nestedPath, targetVal);
+            containerChanged[rootKey] = true;
+            hasRowChanges = true;
+          }
+        }
+      }
+    }
+
+    for (const [rKey, changed] of Object.entries(containerChanged)) {
+      if (changed) {
+        payload[rKey] = modifiedContainers[rKey];
+      }
+    }
+
+    if (errors.length > 0) {
+      return {
+        payload: {},
+        errors,
+        warnings,
+        detectedMode: 'selective',
+        rowMeta: rowInfo,
+      };
+    }
+
+    if (!hasRowChanges || Object.keys(payload).length === 0) {
+      return {
+        payload: {},
+        errors: [],
+        warnings: [],
+        detectedMode: 'selective',
+        rowMeta: rowInfo,
+      };
+    }
+
+    const schemaCheck = validateRecordSchemaConstraints(
+      strapi,
+      uid,
+      existingDoc,
+      payload,
+      unescapedRow,
+      {
+        isCreate: false,
+        detectedMode: 'selective',
+        rowMeta: rowInfo,
+      }
+    );
+    errors.push(...schemaCheck.errors);
+    warnings.push(...schemaCheck.warnings);
+
+    return {
+      payload,
+      errors,
+      warnings,
+      detectedMode: 'selective',
       rowMeta: rowInfo,
     };
   }
