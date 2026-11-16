@@ -182,14 +182,6 @@ interface PendingBatch {
   executionResult?: any;
 }
 
-export interface ColumnDef {
-  key: string;
-  label: string;
-  sortable?: boolean;
-  isPermanent?: boolean;
-  defaultVisible: boolean;
-}
-
 import {
   parseDynamicZonePath,
   formatComponentName,
@@ -197,6 +189,10 @@ import {
   getAllNestedValues,
   getPropertyValue,
   getNestedValue,
+  formatFullTooltipValue,
+  getCellTooltipText,
+  type ColumnDef,
+  getAvailableColumnsForCollection,
 } from '../utils/gridEdit';
 
 export {
@@ -206,153 +202,11 @@ export {
   getAllNestedValues,
   getPropertyValue,
   getNestedValue,
+  formatFullTooltipValue,
+  getCellTooltipText,
+  type ColumnDef,
+  getAvailableColumnsForCollection,
 } from '../utils/gridEdit';
-
-/**
- * Flat helper: Generates the list of available columns for a given collection model.
- * Zero deep nesting: returns a flat array of ColumnDef.
- */
-export function getAvailableColumnsForCollection(
-  col: CollectionModel,
-  selectedAttribute: string,
-  searchAttribute?: string
-): ColumnDef[] {
-  const cols: ColumnDef[] = [
-    {
-      key: 'select',
-      label: 'Select',
-      isPermanent: true,
-      defaultVisible: true,
-    },
-    {
-      key: 'identifier',
-      label: 'Identifier',
-      sortable: !col.isSingleType,
-      defaultVisible: true,
-    },
-  ];
-
-  // Schema-specific attributes
-  const candidateAttrs = col.attributes || [];
-  candidateAttrs.forEach((attr) => {
-    if (attr === 'name' || attr === 'title' || attr === selectedAttribute || (searchAttribute && attr === searchAttribute)) {
-      return;
-    }
-    let formattedLabel = attr;
-    if (attr === 'updated_at' || attr === 'updatedAt') {
-      formattedLabel = 'Updated At';
-    } else if (attr === 'created_at' || attr === 'createdAt') {
-      formattedLabel = 'Created At';
-    } else if (attr === 'published_at' || attr === 'publishedAt') {
-      formattedLabel = 'Published At';
-    } else {
-      const bracketMatch = attr.match(/^([^.[]+)\[([^\]]+)\]\.(.+)$/);
-      if (bracketMatch) {
-        const root = bracketMatch[1].charAt(0).toUpperCase() + bracketMatch[1].slice(1);
-        const comp = formatComponentName(bracketMatch[2]);
-        const sub = bracketMatch[3].split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
-        formattedLabel = `${root} [${comp}] > ${sub}`;
-      } else if (attr.includes('.')) {
-        formattedLabel = attr.split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
-      } else {
-        formattedLabel = attr.replace(/_/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase());
-      }
-    }
-
-    cols.push({
-      key: `attr_${attr}`,
-      label: formattedLabel,
-      sortable: !col.isSingleType,
-      defaultVisible: ['department', 'email', 'location', 'updated_at', 'updatedAt'].includes(attr),
-    });
-  });
-
-  // Ensure system timestamp columns are available to show/hide in the column picker if not already present
-  const hasUpdatedAt = candidateAttrs.some((a) => a === 'updatedAt' || a === 'updated_at');
-  const hasCreatedAt = candidateAttrs.some((a) => a === 'createdAt' || a === 'created_at');
-  const hasPublishedAt = candidateAttrs.some((a) => a === 'publishedAt' || a === 'published_at');
-
-  if (!hasUpdatedAt) {
-    cols.push({
-      key: 'attr_updatedAt',
-      label: 'Updated At',
-      sortable: !col.isSingleType,
-      defaultVisible: false,
-    });
-  }
-  if (!hasCreatedAt) {
-    cols.push({
-      key: 'attr_createdAt',
-      label: 'Created At',
-      sortable: !col.isSingleType,
-      defaultVisible: false,
-    });
-  }
-  if (!hasPublishedAt && col.draftAndPublish) {
-    cols.push({
-      key: 'attr_publishedAt',
-      label: 'Published At',
-      sortable: !col.isSingleType,
-      defaultVisible: false,
-    });
-  }
-
-  // Dedicated search attribute column if searchAttribute differs from selectedAttribute
-  if (searchAttribute && searchAttribute !== selectedAttribute) {
-    let formattedSearchLabel = searchAttribute;
-    const bracketMatch = searchAttribute.match(/^([^.[]+)\[([^\]]+)\]\.(.+)$/);
-    if (bracketMatch) {
-      const root = bracketMatch[1].charAt(0).toUpperCase() + bracketMatch[1].slice(1);
-      const comp = formatComponentName(bracketMatch[2]);
-      const sub = bracketMatch[3].split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
-      formattedSearchLabel = `${root} [${comp}] > ${sub}`;
-    } else if (searchAttribute.includes('.')) {
-      formattedSearchLabel = searchAttribute.split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
-    }
-
-    cols.push({
-      key: 'search_attr',
-      label: `Search: "${formattedSearchLabel}"`,
-      sortable: !col.isSingleType && col.attributes.includes(searchAttribute),
-      defaultVisible: true,
-    });
-  }
-
-  // Target attribute column (only if an update attribute has been selected)
-  if (selectedAttribute && selectedAttribute.trim()) {
-    let formattedTargetLabel = selectedAttribute;
-    const bracketMatch = selectedAttribute.match(/^([^.[]+)\[([^\]]+)\]\.(.+)$/);
-    if (bracketMatch) {
-      const root = bracketMatch[1].charAt(0).toUpperCase() + bracketMatch[1].slice(1);
-      const comp = formatComponentName(bracketMatch[2]);
-      const sub = bracketMatch[3].split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
-      formattedTargetLabel = `${root} [${comp}] > ${sub}`;
-    } else if (selectedAttribute.includes('.')) {
-      formattedTargetLabel = selectedAttribute.split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
-    }
-
-    const targetLabel = searchAttribute && searchAttribute !== selectedAttribute
-      ? `Update Target: "${formattedTargetLabel}"`
-      : `Current "${formattedTargetLabel}"`;
-
-    cols.push({
-      key: 'target_attr',
-      label: targetLabel,
-      sortable: !col.isSingleType && col.attributes.includes(selectedAttribute),
-      defaultVisible: true,
-    });
-  }
-
-  // Status column
-  cols.push({
-    key: 'status',
-    label: 'Status',
-    sortable: false,
-    defaultVisible: true,
-  });
-
-  return cols;
-}
 
 export interface SortOptionItem {
   field: string;
@@ -535,7 +389,7 @@ function renderHeaderCell(
   const isCurrentSorted =
     (colDef.key === 'identifier' && (currentSort.field === 'name' || currentSort.field === 'title' || currentSort.field === 'id')) ||
     (colDef.key === 'search_attr' && currentSort.field === searchAttribute) ||
-    (colDef.key === 'target_attr' && currentSort.field === selectedAttribute) ||
+    ((colDef.key === 'target_attr' || colDef.key === 'current_attr') && currentSort.field === selectedAttribute) ||
     (colDef.key.startsWith('attr_') && (
       currentSort.field === colDef.key.replace('attr_', '') ||
       (currentSort.field === 'updatedAt' && colDef.key === 'attr_updated_at') ||
@@ -555,7 +409,7 @@ function renderHeaderCell(
       onSort(col.uid, field);
     } else if (colDef.key === 'search_attr') {
       onSort(col.uid, searchAttribute);
-    } else if (colDef.key === 'target_attr') {
+    } else if (colDef.key === 'target_attr' || colDef.key === 'current_attr') {
       onSort(col.uid, selectedAttribute);
     } else if (colDef.key.startsWith('attr_')) {
       onSort(col.uid, colDef.key.replace('attr_', ''));
@@ -643,7 +497,8 @@ function renderCellContent(
   isDzExpanded = false,
   onToggleExpandDz?: () => void,
   filterQuery = '',
-  gridCtx?: GridCellRenderContext
+  gridCtx?: GridCellRenderContext,
+  cellTooltip?: string
 ): React.ReactNode {
   switch (colDef.key) {
     case 'select':
@@ -719,6 +574,7 @@ function renderCellContent(
         const isUnset = displayStr === '(empty / not set)' || displayStr === '(empty / unlinked)';
         return (
           <Typography
+            title={cellTooltip || displayStr}
             textColor={isUnset ? 'neutral500' : 'primary700'}
             fontWeight="semiBold"
             style={{
@@ -741,9 +597,11 @@ function renderCellContent(
           {matches.map((m) => {
             const displayStr = formatDisplayValue(m.value);
             const isMatchItem = qLower && displayStr.toLowerCase().includes(qLower);
+            const occTooltip = `#${m.index} ${m.componentName || 'Item'}${m.componentId !== undefined ? ` (id: ${m.componentId})` : ''}: ${formatFullTooltipValue(m.value)}`;
             return (
               <Flex
                 key={m.index}
+                title={occTooltip}
                 gap={1}
                 alignItems="center"
                 style={{
@@ -758,8 +616,92 @@ function renderCellContent(
                 </Badge>
                 <Typography
                   variant="pi"
+                  title={occTooltip}
                   fontWeight={isMatchItem ? 'bold' : 'normal'}
                   textColor={isMatchItem ? 'success700' : 'neutral800'}
+                  style={{
+                    maxWidth: 200,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {displayStr}
+                </Typography>
+              </Flex>
+            );
+          })}
+        </Flex>
+      );
+    }
+
+    case 'current_attr': {
+      if (selectedAttribute && !hasAttr) {
+        return (
+          <Badge backgroundColor="neutral200" textColor="neutral600">
+            Ignored (absent in schema)
+          </Badge>
+        );
+      }
+
+      const matches = getAllNestedValues(entry, selectedAttribute, col?.attributes);
+      if (matches.length === 0) {
+        return (
+          <Typography textColor="neutral500" style={{ fontStyle: 'italic' }}>
+            (empty / not set)
+          </Typography>
+        );
+      }
+      if (matches.length === 1 && !matches[0].componentUid && !matches[0].path.includes('[#')) {
+        const displayStr = formatDisplayValue(matches[0].value);
+        const isUnset = displayStr === '(empty / not set)' || displayStr === '(empty / unlinked)';
+        return (
+          <Typography
+            title={cellTooltip || displayStr}
+            textColor={isUnset ? 'neutral500' : 'neutral800'}
+            style={{
+              fontStyle: isUnset ? 'italic' : 'normal',
+              display: 'inline-block',
+              maxWidth: 260,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {displayStr}
+          </Typography>
+        );
+      }
+
+      return (
+        <Flex direction="column" gap={1} alignItems="flex-start" style={{ maxWidth: 320 }}>
+          {matches.map((m) => {
+            const displayStr = formatDisplayValue(m.value);
+            const occTooltip = `#${m.index} ${m.componentName || 'Item'}${m.componentId !== undefined ? ` (id: ${m.componentId})` : ''}: ${formatFullTooltipValue(m.value)}`;
+            return (
+              <Flex
+                key={m.index}
+                title={occTooltip}
+                gap={1}
+                alignItems="center"
+                style={{
+                  backgroundColor: 'rgba(0, 0, 0, 0.03)',
+                  padding: '2px 6px',
+                  borderRadius: 4,
+                }}
+              >
+                <Badge size="S" backgroundColor="neutral200" textColor="neutral800">
+                  #{m.index} {m.componentName || 'Item'}
+                </Badge>
+                {m.componentId !== undefined && (
+                  <Typography variant="pi" textColor="neutral500" style={{ fontSize: '0.68rem' }}>
+                    id:{m.componentId}
+                  </Typography>
+                )}
+                <Typography
+                  variant="pi"
+                  title={occTooltip}
+                  textColor="neutral800"
                   style={{
                     maxWidth: 200,
                     overflow: 'hidden',
@@ -891,6 +833,7 @@ function renderCellContent(
         const isUnset = displayStr === '(empty / not set)' || displayStr === '(empty / unlinked)';
         return (
           <Typography
+            title={cellTooltip || displayStr}
             textColor={isUnset ? 'neutral500' : 'neutral800'}
             style={{
               fontStyle: isUnset ? 'italic' : 'normal',
@@ -910,9 +853,11 @@ function renderCellContent(
         <Flex direction="column" gap={1} alignItems="flex-start" style={{ maxWidth: 320 }}>
           {matches.map((m) => {
             const displayStr = formatDisplayValue(m.value);
+            const occTooltip = `#${m.index} ${m.componentName || 'Item'}${m.componentId !== undefined ? ` (id: ${m.componentId})` : ''}: ${formatFullTooltipValue(m.value)}`;
             return (
               <Flex
                 key={m.index}
+                title={occTooltip}
                 gap={1}
                 alignItems="center"
                 style={{
@@ -922,10 +867,16 @@ function renderCellContent(
                 }}
               >
                 <Badge size="S" backgroundColor="neutral200" textColor="neutral800">
-                  #{m.index} {m.componentName}
+                  #{m.index} {m.componentName || 'Item'}
                 </Badge>
+                {m.componentId !== undefined && (
+                  <Typography variant="pi" textColor="neutral500" style={{ fontSize: '0.68rem' }}>
+                    id:{m.componentId}
+                  </Typography>
+                )}
                 <Typography
                   variant="pi"
+                  title={occTooltip}
                   textColor="neutral800"
                   style={{
                     maxWidth: 200,
@@ -982,6 +933,7 @@ function renderCellContent(
         const displayStr = formatDisplayValue(matches[0].value);
         return (
           <Typography
+            title={cellTooltip || (displayStr === '(empty / not set)' ? undefined : displayStr)}
             textColor="neutral700"
             style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
           >
@@ -995,9 +947,11 @@ function renderCellContent(
         <Flex direction="column" gap={1} alignItems="flex-start" style={{ maxWidth: 320 }}>
           {matches.map((m, mIdx) => {
             const displayStr = formatDisplayValue(m.value);
+            const occTooltip = `#${m.index} ${m.componentName || 'Item'}${m.componentId !== undefined ? ` (id: ${m.componentId})` : ''}: ${formatFullTooltipValue(m.value)}`;
             return (
               <Flex
                 key={`${m.index}_${m.componentId ?? mIdx}_${m.componentUid ?? ''}`}
+                title={occTooltip}
                 gap={1}
                 alignItems="center"
                 style={{
@@ -1016,6 +970,7 @@ function renderCellContent(
                 )}
                 <Typography
                   variant="pi"
+                  title={occTooltip}
                   textColor="neutral800"
                   style={{
                     maxWidth: 200,
@@ -1778,8 +1733,11 @@ const BulkUpdater: React.FC = () => {
       if (selectedCollectionUid) {
         setCollectionColumnVisibility((prev) => {
           const existing = prev[selectedCollectionUid];
-          if (existing && !existing.includes('target_attr')) {
-            return { ...prev, [selectedCollectionUid]: [...existing, 'target_attr'] };
+          if (existing) {
+            const next = [...existing];
+            if (!next.includes('current_attr')) next.push('current_attr');
+            if (!next.includes('target_attr')) next.push('target_attr');
+            return { ...prev, [selectedCollectionUid]: next };
           }
           return prev;
         });
@@ -1871,6 +1829,18 @@ const BulkUpdater: React.FC = () => {
       }
       setGridEdits({});
       setSelectedAttribute(newAttr);
+      if (newAttr && selectedCollectionUid) {
+        setCollectionColumnVisibility((prev) => {
+          const existing = prev[selectedCollectionUid];
+          if (existing) {
+            const next = [...existing];
+            if (!next.includes('current_attr')) next.push('current_attr');
+            if (!next.includes('target_attr')) next.push('target_attr');
+            return { ...prev, [selectedCollectionUid]: next };
+          }
+          return prev;
+        });
+      }
       try {
         if (newAttr) {
           localStorage.setItem(LAST_ATTR_KEY, newAttr);
@@ -2729,7 +2699,7 @@ const BulkUpdater: React.FC = () => {
           if (c.key.startsWith('attr_')) {
             const attr = c.key.slice(5);
             if (!selectedDataAttrs.includes(attr)) selectedDataAttrs.push(attr);
-          } else if (c.key === 'target_attr' && selectedAttribute) {
+          } else if ((c.key === 'target_attr' || c.key === 'current_attr') && selectedAttribute) {
             if (!selectedDataAttrs.includes(selectedAttribute)) selectedDataAttrs.push(selectedAttribute);
           } else if (c.key === 'search_attr' && searchAttribute) {
             if (!selectedDataAttrs.includes(searchAttribute)) selectedDataAttrs.push(searchAttribute);
@@ -4096,7 +4066,7 @@ const BulkUpdater: React.FC = () => {
                                 if (c.key.startsWith('attr_')) {
                                   const attr = c.key.slice(5);
                                   if (!selectedDataAttrs.includes(attr)) selectedDataAttrs.push(attr);
-                                } else if (c.key === 'target_attr' && selectedAttribute) {
+                                } else if ((c.key === 'target_attr' || c.key === 'current_attr') && selectedAttribute) {
                                   if (!selectedDataAttrs.includes(selectedAttribute)) selectedDataAttrs.push(selectedAttribute);
                                 } else if (c.key === 'search_attr' && searchAttribute) {
                                   if (!selectedDataAttrs.includes(searchAttribute)) selectedDataAttrs.push(searchAttribute);
@@ -4302,26 +4272,37 @@ const BulkUpdater: React.FC = () => {
                                         : undefined,
                                     }}
                                   >
-                                    {activeColumns.map((colDef) => (
-                                      <Td key={colDef.key}>
-                                        {renderCellContent(
-                                          colDef,
-                                          entry,
-                                          col,
-                                          selectedAttribute,
-                                          searchAttribute,
-                                          isMatch,
-                                          hasAttr,
-                                          isSelected,
-                                          () => toggleEntry(col.uid, entry.documentId),
-                                          pendingBatches,
-                                          isDzExpanded,
-                                          onToggleExpandDz,
-                                          filterQuery,
-                                          gridCtx
-                                        )}
-                                      </Td>
-                                    ))}
+                                    {activeColumns.map((colDef) => {
+                                      const cellTooltip = getCellTooltipText(
+                                        colDef,
+                                        entry,
+                                        col?.attributes,
+                                        selectedAttribute,
+                                        searchAttribute,
+                                        recordEdits
+                                      );
+                                      return (
+                                        <Td key={colDef.key} title={cellTooltip}>
+                                          {renderCellContent(
+                                            colDef,
+                                            entry,
+                                            col,
+                                            selectedAttribute,
+                                            searchAttribute,
+                                            isMatch,
+                                            hasAttr,
+                                            isSelected,
+                                            () => toggleEntry(col.uid, entry.documentId),
+                                            pendingBatches,
+                                            isDzExpanded,
+                                            onToggleExpandDz,
+                                            filterQuery,
+                                            gridCtx,
+                                            cellTooltip
+                                          )}
+                                        </Td>
+                                      );
+                                    })}
                                   </Tr>
 
                                   {/* Dynamic Zone / Repeatable Component Expandable Drawer Sub-Table */}

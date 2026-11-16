@@ -814,3 +814,343 @@ export function getAllNestedValues(
 
   return [];
 }
+
+export interface ColumnDef {
+  key: string;
+  label: string;
+  sortable?: boolean;
+  isPermanent?: boolean;
+  defaultVisible: boolean;
+}
+
+export interface CollectionModelLike {
+  uid: string;
+  isSingleType?: boolean;
+  draftAndPublish?: boolean;
+  attributes: string[];
+}
+
+/**
+ * Flat helper: Generates the list of available columns for a given collection model.
+ * Zero deep nesting: returns a flat array of ColumnDef.
+ */
+export function getAvailableColumnsForCollection(
+  col: CollectionModelLike,
+  selectedAttribute: string,
+  searchAttribute?: string
+): ColumnDef[] {
+  const cols: ColumnDef[] = [
+    {
+      key: 'select',
+      label: 'Select',
+      isPermanent: true,
+      defaultVisible: true,
+    },
+    {
+      key: 'identifier',
+      label: 'Identifier',
+      sortable: !col.isSingleType,
+      defaultVisible: true,
+    },
+  ];
+
+  // Schema-specific attributes
+  const candidateAttrs = col.attributes || [];
+  candidateAttrs.forEach((attr) => {
+    if (attr === 'name' || attr === 'title' || attr === selectedAttribute || (searchAttribute && attr === searchAttribute)) {
+      return;
+    }
+    let formattedLabel = attr;
+    if (attr === 'updated_at' || attr === 'updatedAt') {
+      formattedLabel = 'Updated At';
+    } else if (attr === 'created_at' || attr === 'createdAt') {
+      formattedLabel = 'Created At';
+    } else if (attr === 'published_at' || attr === 'publishedAt') {
+      formattedLabel = 'Published At';
+    } else {
+      const bracketMatch = attr.match(/^([^.[]+)\[([^\]]+)\]\.(.+)$/);
+      if (bracketMatch) {
+        const root = bracketMatch[1].charAt(0).toUpperCase() + bracketMatch[1].slice(1);
+        const comp = formatComponentName(bracketMatch[2]);
+        const sub = bracketMatch[3].split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
+        formattedLabel = `${root} [${comp}] > ${sub}`;
+      } else if (attr.includes('.')) {
+        formattedLabel = attr.split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
+      } else {
+        formattedLabel = attr.replace(/_/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase());
+      }
+    }
+
+    cols.push({
+      key: `attr_${attr}`,
+      label: formattedLabel,
+      sortable: !col.isSingleType,
+      defaultVisible: ['department', 'email', 'location', 'updated_at', 'updatedAt'].includes(attr),
+    });
+  });
+
+  // Ensure system timestamp columns are available to show/hide in the column picker if not already present
+  const hasUpdatedAt = candidateAttrs.some((a) => a === 'updatedAt' || a === 'updated_at');
+  const hasCreatedAt = candidateAttrs.some((a) => a === 'createdAt' || a === 'created_at');
+  const hasPublishedAt = candidateAttrs.some((a) => a === 'publishedAt' || a === 'published_at');
+
+  if (!hasUpdatedAt) {
+    cols.push({
+      key: 'attr_updatedAt',
+      label: 'Updated At',
+      sortable: !col.isSingleType,
+      defaultVisible: false,
+    });
+  }
+  if (!hasCreatedAt) {
+    cols.push({
+      key: 'attr_createdAt',
+      label: 'Created At',
+      sortable: !col.isSingleType,
+      defaultVisible: false,
+    });
+  }
+  if (!hasPublishedAt && col.draftAndPublish) {
+    cols.push({
+      key: 'attr_publishedAt',
+      label: 'Published At',
+      sortable: !col.isSingleType,
+      defaultVisible: false,
+    });
+  }
+
+  // Dedicated search attribute column if searchAttribute differs from selectedAttribute
+  if (searchAttribute && searchAttribute !== selectedAttribute) {
+    let formattedSearchLabel = searchAttribute;
+    const bracketMatch = searchAttribute.match(/^([^.[]+)\[([^\]]+)\]\.(.+)$/);
+    if (bracketMatch) {
+      const root = bracketMatch[1].charAt(0).toUpperCase() + bracketMatch[1].slice(1);
+      const comp = formatComponentName(bracketMatch[2]);
+      const sub = bracketMatch[3].split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
+      formattedSearchLabel = `${root} [${comp}] > ${sub}`;
+    } else if (searchAttribute.includes('.')) {
+      formattedSearchLabel = searchAttribute.split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
+    }
+
+    cols.push({
+      key: 'search_attr',
+      label: `Search: "${formattedSearchLabel}"`,
+      sortable: !col.isSingleType && col.attributes.includes(searchAttribute),
+      defaultVisible: true,
+    });
+  }
+
+  // Current Value & Target Updated Value columns (only if an update attribute has been selected)
+  if (selectedAttribute && selectedAttribute.trim()) {
+    let formattedTargetLabel = selectedAttribute;
+    const bracketMatch = selectedAttribute.match(/^([^.[]+)\[([^\]]+)\]\.(.+)$/);
+    if (bracketMatch) {
+      const root = bracketMatch[1].charAt(0).toUpperCase() + bracketMatch[1].slice(1);
+      const comp = formatComponentName(bracketMatch[2]);
+      const sub = bracketMatch[3].split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
+      formattedTargetLabel = `${root} [${comp}] > ${sub}`;
+    } else if (selectedAttribute.includes('.')) {
+      formattedTargetLabel = selectedAttribute.split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
+    } else {
+      formattedTargetLabel = selectedAttribute.replace(/_/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase());
+    }
+
+    cols.push({
+      key: 'current_attr',
+      label: `Current Value: "${formattedTargetLabel}"`,
+      sortable: !col.isSingleType && col.attributes.includes(selectedAttribute),
+      defaultVisible: true,
+    });
+
+    cols.push({
+      key: 'target_attr',
+      label: `Target Updated Value: "${formattedTargetLabel}"`,
+      sortable: !col.isSingleType && col.attributes.includes(selectedAttribute),
+      defaultVisible: true,
+    });
+  }
+
+  // Status column
+  cols.push({
+    key: 'status',
+    label: 'Status',
+    sortable: false,
+    defaultVisible: true,
+  });
+
+  return cols;
+}
+
+/**
+ * Formats a value safely and completely for tooltip display on hover.
+ * Handles null, undefined, empty strings, numbers, booleans, arrays, objects (formatted JSON), and long strings.
+ */
+export function formatFullTooltipValue(val: any): string {
+  if (val === undefined || val === null || val === '') {
+    return '(empty / not set)';
+  }
+  if (typeof val === 'boolean') {
+    return String(val);
+  }
+  if (typeof val === 'number') {
+    return String(val);
+  }
+  if (val instanceof Date) {
+    return isNaN(val.getTime()) ? '(invalid date)' : val.toISOString();
+  }
+  if (typeof val === 'string') {
+    return val;
+  }
+  if (Array.isArray(val)) {
+    if (val.length === 0) return '(empty array)';
+    try {
+      return JSON.stringify(val, null, 2);
+    } catch {
+      return String(val);
+    }
+  }
+  if (typeof val === 'object') {
+    if (val.isRelation && val.display) return val.display;
+    try {
+      return JSON.stringify(val, null, 2);
+    } catch {
+      return String(val);
+    }
+  }
+  return String(val);
+}
+
+/**
+ * Resolves the complete cell value string for display in the hover tooltip.
+ */
+export function getCellTooltipText(
+  colDef: { key: string; label?: string },
+  entry: any,
+  colAttributes?: string[],
+  selectedAttribute?: string,
+  searchAttribute?: string,
+  recordEdits?: any
+): string | undefined {
+  if (!colDef || !entry) return undefined;
+
+  switch (colDef.key) {
+    case 'select':
+      return undefined;
+
+    case 'identifier': {
+      const mainText = entry.name || entry.title || `Entry #${entry.id || entry.documentId}`;
+      const parts = [String(mainText)];
+      if (entry.documentId) parts.push(`Document ID: ${entry.documentId}`);
+      if (entry.id && String(entry.id) !== String(entry.documentId)) parts.push(`ID: ${entry.id}`);
+      if (entry.email) parts.push(`Email: ${entry.email}`);
+      return parts.join('\n');
+    }
+
+    case 'status': {
+      if (selectedAttribute && colAttributes && !colAttributes.includes(selectedAttribute)) {
+        return 'Status: Ignored (absent in schema)';
+      }
+      return undefined;
+    }
+
+    case 'current_attr': {
+      if (!selectedAttribute) return undefined;
+      const rootKey = selectedAttribute.split('[')[0].split('.')[0];
+      const hasSchemaAttr = !colAttributes || colAttributes.includes(selectedAttribute) || colAttributes.includes(rootKey);
+      if (!hasSchemaAttr) {
+        return 'Ignored (absent in schema)';
+      }
+      const matches = getAllNestedValues(entry, selectedAttribute, colAttributes);
+      if (matches.length === 0) return '(empty / not set)';
+      if (matches.length === 1 && !matches[0].componentUid && !matches[0].path.includes('[#')) {
+        return formatFullTooltipValue(matches[0].value);
+      }
+      return matches
+        .map((m) => {
+          const compLabel = m.componentName
+            ? `#${m.index} ${m.componentName}${m.componentId !== undefined ? ` (id: ${m.componentId})` : ''}`
+            : `#${m.index}`;
+          const valStr = formatFullTooltipValue(m.value);
+          return `${compLabel}: ${valStr}`;
+        })
+        .join('\n\n');
+    }
+
+    case 'target_attr': {
+      if (!selectedAttribute) return undefined;
+      const rootKey = selectedAttribute.split('[')[0].split('.')[0];
+      const hasSchemaAttr = !colAttributes || colAttributes.includes(selectedAttribute) || colAttributes.includes(rootKey);
+      if (!hasSchemaAttr) {
+        return 'Ignored (absent in schema)';
+      }
+      // If user has edited values in gridEditMode, reflect the target edited value in the tooltip
+      if (recordEdits?.occurrences) {
+        const occEntries = Object.entries(recordEdits.occurrences);
+        if (occEntries.length > 0) {
+          return occEntries
+            .map(([occKey, editObj]: [string, any]) => {
+              const valStr = formatFullTooltipValue(editObj?.value);
+              return `Target [${occKey}]: ${valStr}${editObj?.validationError ? ` (Error: ${editObj.validationError})` : ''}`;
+            })
+            .join('\n\n');
+        }
+      }
+      // Otherwise baseline target matches original value
+      const matches = getAllNestedValues(entry, selectedAttribute, colAttributes);
+      if (matches.length === 0) return '(empty / not set)';
+      if (matches.length === 1 && !matches[0].componentUid && !matches[0].path.includes('[#')) {
+        return formatFullTooltipValue(matches[0].value);
+      }
+      return matches
+        .map((m) => {
+          const compLabel = m.componentName
+            ? `#${m.index} ${m.componentName}${m.componentId !== undefined ? ` (id: ${m.componentId})` : ''}`
+            : `#${m.index}`;
+          const valStr = formatFullTooltipValue(m.value);
+          return `${compLabel}: ${valStr}`;
+        })
+        .join('\n\n');
+    }
+
+    case 'search_attr': {
+      if (!searchAttribute) return undefined;
+      const rootKey = searchAttribute.split('[')[0].split('.')[0];
+      const hasSchemaAttr = !colAttributes || colAttributes.includes(searchAttribute) || colAttributes.includes(rootKey);
+      if (!hasSchemaAttr) {
+        return 'Ignored (absent in schema)';
+      }
+      const matches = getAllNestedValues(entry, searchAttribute, colAttributes);
+      if (matches.length === 0) return '(empty / not set)';
+      if (matches.length === 1 && !matches[0].componentUid && !matches[0].path.includes('[#')) {
+        return formatFullTooltipValue(matches[0].value);
+      }
+      return matches
+        .map((m) => {
+          const compLabel = m.componentName
+            ? `#${m.index} ${m.componentName}${m.componentId !== undefined ? ` (id: ${m.componentId})` : ''}`
+            : `#${m.index}`;
+          const valStr = formatFullTooltipValue(m.value);
+          return `${compLabel}: ${valStr}`;
+        })
+        .join('\n\n');
+    }
+
+    default: {
+      const attrName = colDef.key.replace('attr_', '');
+      const matches = getAllNestedValues(entry, attrName, colAttributes);
+      if (matches.length === 0) return '(empty / not set)';
+      if (matches.length === 1 && !matches[0].componentUid && !matches[0].path.includes('[#')) {
+        return formatFullTooltipValue(matches[0].value);
+      }
+      return matches
+        .map((m) => {
+          const compLabel = m.componentName
+            ? `#${m.index} ${m.componentName}${m.componentId !== undefined ? ` (id: ${m.componentId})` : ''}`
+            : `#${m.index}`;
+          const valStr = formatFullTooltipValue(m.value);
+          return `${compLabel}: ${valStr}`;
+        })
+        .join('\n\n');
+    }
+  }
+}
