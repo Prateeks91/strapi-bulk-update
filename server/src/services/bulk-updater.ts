@@ -3,6 +3,12 @@ import crypto from 'crypto';
 import { recordContentHistoryVersion } from './content-history';
 import { validateEntityQuotas, deepMergeEntities } from './validation-rules';
 import {
+  formatErrorWithCause,
+  getBatchConcurrency,
+  isFetchFailedError,
+  trackActiveBulkOperation,
+} from './error-utils';
+import {
   buildRichAttributeMeta,
   applyOccurrenceUpdatesToDocument,
   enumerateOccurrences,
@@ -1410,7 +1416,9 @@ async function resolveAndMaybePublishTarget({
           if (isLocalized) pubArgs.locale = candLocale;
           await (strapi.documents(target.uid as any) as any).publish(pubArgs);
         } catch (publishErr) {
-          strapi.log.warn(`[bulk-updater] Failed to auto-publish ${target.uid}/${target.documentId}:`, publishErr);
+          strapi.log.warn(
+            `[bulk-updater] Failed to auto-publish ${target.uid}/${target.documentId}: ${formatErrorWithCause(publishErr)}`
+          );
         }
       }
       invalidateCollectionCache(target.uid);
@@ -1726,11 +1734,13 @@ async function executeBatchInternal(
   };
   batchJobsMap.set(batchId, jobState);
 
+  return await trackActiveBulkOperation(async () => {
+    try {
   let regexObj: RegExp | null = null;
   if (effectiveEditMode !== 'grid' && isRegex && regexPattern) {
     regexObj = new RegExp(regexPattern, 'g');
   }
-  const CHUNK_SIZE = 25; // 25 concurrent updates per batch window
+  const CHUNK_SIZE = getBatchConcurrency(strapi); // Bounded concurrency to prevent socket/webhook exhaustion
 
   // Pre-fetch published counterparts for all draftAndPublish targets in a single batched query per collection
   const publishedCounterparts = new Map<string, any>();
@@ -1945,7 +1955,9 @@ async function executeBatchInternal(
                 }
                 await (strapi.documents(target.uid as any) as any).publish(pubArgs);
               } catch (publishErr) {
-                strapi.log.warn(`[bulk-updater] Failed to auto-publish ${target.uid}/${target.documentId}:`, publishErr);
+                strapi.log.warn(
+                  `[bulk-updater] Failed to auto-publish ${target.uid}/${target.documentId}: ${formatErrorWithCause(publishErr)}`
+                );
               }
             }
 
@@ -2125,7 +2137,9 @@ async function executeBatchInternal(
                 }
                 await (strapi.documents(target.uid as any) as any).publish(pubArgs);
               } catch (publishErr) {
-                strapi.log.warn(`[bulk-updater] Failed to auto-publish ${target.uid}/${target.documentId}:`, publishErr);
+                strapi.log.warn(
+                  `[bulk-updater] Failed to auto-publish ${target.uid}/${target.documentId}: ${formatErrorWithCause(publishErr)}`
+                );
               }
             }
 
@@ -2239,7 +2253,9 @@ async function executeBatchInternal(
               }
               await (strapi.documents(target.uid as any) as any).publish(pubArgs);
             } catch (publishErr) {
-              strapi.log.warn(`[bulk-updater] Failed to auto-publish ${target.uid}/${target.documentId}:`, publishErr);
+              strapi.log.warn(
+                `[bulk-updater] Failed to auto-publish ${target.uid}/${target.documentId}: ${formatErrorWithCause(publishErr)}`
+              );
             }
           }
 
@@ -2273,6 +2289,12 @@ async function executeBatchInternal(
           };
         }
       } catch (updateErr: any) {
+        const formattedErr = formatErrorWithCause(updateErr, 'Failed to update record');
+        if (isFetchFailedError(updateErr)) {
+          strapi.log?.error?.(
+            `[bulk-updater] Network/webhook fetch error during batch ${batchId} update of ${target.uid}/${target.documentId}: ${formattedErr}`
+          );
+        }
         return {
           uid: target.uid,
           collectionName: displayName,
@@ -2280,7 +2302,7 @@ async function executeBatchInternal(
           label: `Entry #${target.documentId}`,
           attribute,
           status: 'error' as const,
-          message: updateErr.message,
+          message: formattedErr,
         };
       }
     });
@@ -2295,6 +2317,11 @@ async function executeBatchInternal(
     jobState.updatedCount = updatedCount;
     jobState.skippedCount = skippedCount;
     jobState.failedCount = results.filter((r) => r.status === 'error').length;
+
+    // Yield to event loop between chunks so undici sockets and incoming requests drain cleanly
+    if (i + CHUNK_SIZE < targets.length) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
   }
 
   // Invalidate local in-process cache for all affected collection UIDs
@@ -2356,12 +2383,18 @@ async function executeBatchInternal(
     unreviewedConsent,
   };
 
-  // Stateless audit recording via consumer's declared audit schema
-  await strapi.plugin('bulk-updater').service('audit').recordBatch(
-    batchSummary,
-    flattenedDiffs,
-    currentUser
-  );
+  // Stateless audit recording via consumer's declared audit schema (non-fatal)
+  try {
+    await strapi.plugin('bulk-updater').service('audit').recordBatch(
+      batchSummary,
+      flattenedDiffs,
+      currentUser
+    );
+  } catch (auditErr: any) {
+    strapi.log?.warn?.(
+      `[bulk-updater] Non-fatal audit logging failure for batch ${batchId}: ${formatErrorWithCause(auditErr)}`
+    );
+  }
 
   return {
     success: true,
@@ -2377,6 +2410,15 @@ async function executeBatchInternal(
     status: jobState.status,
     results,
   };
+    } catch (fatalErr: any) {
+      const formattedFatal = formatErrorWithCause(fatalErr, 'Batch execution failed');
+      jobState.status = 'failed';
+      jobState.error = formattedFatal;
+      jobState.completedAt = new Date().toISOString();
+      strapi.log?.error?.(`[bulk-updater] Batch ${batchId} aborted with error: ${formattedFatal}`);
+      throw fatalErr;
+    }
+  });
 }
 
 /**
@@ -2453,8 +2495,10 @@ async function executePublishBatchInternal(
   };
   batchJobsMap.set(batchId, jobState);
 
+  return await trackActiveBulkOperation(async () => {
+    try {
   const targets = Array.from(targetsMap.values());
-  const CHUNK_SIZE = 25;
+  const CHUNK_SIZE = getBatchConcurrency(strapi);
 
   for (let i = 0; i < targets.length; i += CHUNK_SIZE) {
     const chunk = targets.slice(i, i + CHUNK_SIZE);
@@ -2522,6 +2566,12 @@ async function executePublishBatchInternal(
             : 'Successfully published to live',
         };
       } catch (pubErr: any) {
+        const formattedPubErr = formatErrorWithCause(pubErr, 'Failed to publish entry');
+        if (isFetchFailedError(pubErr)) {
+          strapi.log?.error?.(
+            `[bulk-updater] Network/webhook fetch error during batch publish ${batchId} of ${target.uid}/${target.documentId}: ${formattedPubErr}`
+          );
+        }
         return {
           uid: target.uid,
           collectionName: strapi.contentTypes[target.uid]?.info?.displayName || target.uid,
@@ -2529,7 +2579,7 @@ async function executePublishBatchInternal(
           label: `Entry #${target.documentId}`,
           attribute: '(publish)',
           status: 'error' as const,
-          message: pubErr.message || 'Failed to publish entry',
+          message: formattedPubErr,
         };
       }
     });
@@ -2544,6 +2594,10 @@ async function executePublishBatchInternal(
     jobState.updatedCount = publishedCount;
     jobState.skippedCount = skippedCount;
     jobState.failedCount = results.filter((r) => r.status === 'error').length;
+
+    if (i + CHUNK_SIZE < targets.length) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
   }
 
   const affectedUids = new Set(targets.map((t) => t.uid));
@@ -2579,12 +2633,18 @@ async function executePublishBatchInternal(
     unreviewedConsent,
   };
 
-  // Stateless audit recording
-  await strapi.plugin('bulk-updater').service('audit').recordBatch(
-    batchSummary,
-    results,
-    currentUser
-  );
+  // Stateless audit recording (non-fatal)
+  try {
+    await strapi.plugin('bulk-updater').service('audit').recordBatch(
+      batchSummary,
+      results,
+      currentUser
+    );
+  } catch (auditErr: any) {
+    strapi.log?.warn?.(
+      `[bulk-updater] Non-fatal audit logging failure for publish batch ${batchId}: ${formatErrorWithCause(auditErr)}`
+    );
+  }
 
   return {
     success: true,
@@ -2598,6 +2658,15 @@ async function executePublishBatchInternal(
     status: jobState.status,
     results,
   };
+    } catch (fatalErr: any) {
+      const formattedFatal = formatErrorWithCause(fatalErr, 'Batch publish failed');
+      jobState.status = 'failed';
+      jobState.error = formattedFatal;
+      jobState.completedAt = new Date().toISOString();
+      strapi.log?.error?.(`[bulk-updater] Publish batch ${batchId} aborted with error: ${formattedFatal}`);
+      throw fatalErr;
+    }
+  });
 }
 
 async function executeBatchByPayload(

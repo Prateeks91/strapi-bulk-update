@@ -1,4 +1,5 @@
 import type { Core } from '@strapi/strapi';
+import { formatErrorWithCause, isFetchFailedError } from '../services/error-utils';
 
 export default ({ strapi }: { strapi: Core.Strapi }) => ({
   async getTemplate(ctx: any) {
@@ -156,8 +157,10 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
       ctx.body = result;
     } catch (err: any) {
-      ctx.status = 500;
-      ctx.body = { success: false, error: err.message };
+      const formatted = formatErrorWithCause(err, 'CSV import failed');
+      strapi.log?.error?.(`[bulk-updater] POST /csv/import error: ${formatted}`);
+      ctx.status = isFetchFailedError(err) ? 502 : 500;
+      ctx.body = { success: false, error: formatted };
     }
   },
 
@@ -191,8 +194,10 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
       ctx.body = result;
     } catch (err: any) {
-      ctx.status = 500;
-      ctx.body = { success: false, error: err.message };
+      const formatted = formatErrorWithCause(err, 'CSV chunk import failed');
+      strapi.log?.error?.(`[bulk-updater] POST /csv/import-chunk error: ${formatted}`);
+      ctx.status = isFetchFailedError(err) ? 502 : 500;
+      ctx.body = { success: false, error: formatted };
     }
   },
 
@@ -251,8 +256,10 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
       ctx.body = result;
     } catch (err: any) {
-      ctx.status = 500;
-      ctx.body = { success: false, error: err.message };
+      const formatted = formatErrorWithCause(err, 'CSV batch submission failed');
+      strapi.log?.error?.(`[bulk-updater] POST /csv/submit-batch error: ${formatted}`);
+      ctx.status = isFetchFailedError(err) ? 502 : 500;
+      ctx.body = { success: false, error: formatted };
     }
   },
 });
