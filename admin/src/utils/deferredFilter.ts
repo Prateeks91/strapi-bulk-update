@@ -126,7 +126,7 @@ export function buildEntriesQueryParams(options: {
   return params;
 }
 
-export type CsvExportMode = 'all' | 'metafields' | 'topbarconfig';
+export type CsvExportMode = 'all' | 'metafields' | 'topbarconfig' | 'selective';
 
 /**
  * Builds `/csv/export/:uid` query parameters strictly from an applied filter snapshot.
@@ -135,8 +135,9 @@ export function buildCsvExportQueryParams(options: {
   limit?: number;
   filter: SearchFilterSnapshot;
   exportMode?: CsvExportMode;
+  selectedColumns?: string[] | string;
 }): URLSearchParams {
-  const { limit, filter, exportMode } = options;
+  const { limit, filter, exportMode, selectedColumns } = options;
   const queryParams = new URLSearchParams();
 
   if (limit && limit > 0) {
@@ -144,6 +145,14 @@ export function buildCsvExportQueryParams(options: {
   }
   if (exportMode) {
     queryParams.set('exportMode', exportMode);
+  } else if (selectedColumns && (Array.isArray(selectedColumns) ? selectedColumns.length > 0 : Boolean(selectedColumns))) {
+    queryParams.set('exportMode', 'selective');
+  }
+  if (selectedColumns) {
+    const colsStr = Array.isArray(selectedColumns) ? selectedColumns.join(',') : String(selectedColumns);
+    if (colsStr.trim()) {
+      queryParams.set('selectedColumns', colsStr.trim());
+    }
   }
   if (filter.searchAttribute) {
     queryParams.set('searchAttribute', filter.searchAttribute);

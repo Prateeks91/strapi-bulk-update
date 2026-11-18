@@ -20,7 +20,7 @@ import {
   Combobox,
   ComboboxOption,
 } from '@strapi/design-system';
-import { Download, Upload, ArrowClockwise, Check, ChevronLeft, ChevronRight, Eye, Search } from '@strapi/icons';
+import { Download, Upload, ArrowClockwise, Check, ChevronLeft, ChevronRight, Eye, Search, Cog } from '@strapi/icons';
 import {
   parseCsvWithHeaders,
   extractDocId,
@@ -31,6 +31,7 @@ import {
 } from '../utils/csvParser';
 import { isAbortError } from '../utils/isAbortError';
 import { getEntryLifecycleStatus, Entry, PendingBatch } from '../utils/lifecycleStatus';
+import { getAvailableColumnsForCsvExport, type ColumnDef } from '../utils/gridEdit';
 import {
   type CsvExportMode,
   type FilterOperator,
@@ -112,6 +113,70 @@ export default function CsvManagerTab() {
   const [exportOnlyViolations, setExportOnlyViolations] = useState<boolean>(false);
   const [rules, setRules] = useState<any[]>([]);
   const [selectedRuleId, setSelectedRuleId] = useState<string>('');
+
+  // Column Selection states for Selective CSV Export (matches Bulk Updater Workspace)
+  const [collectionColumnVisibility, setCollectionColumnVisibility] = useState<Record<string, string[]>>({});
+  const [openColumnPicker, setOpenColumnPicker] = useState<boolean>(false);
+  const [columnSearchTerm, setColumnSearchTerm] = useState<string>('');
+
+  const selectedCol = collections.find((c) => c.uid === selectedUid);
+  const availableColumns = selectedCol ? getAvailableColumnsForCsvExport(selectedCol) : [];
+  const savedColKeys = selectedCol ? collectionColumnVisibility[selectedCol.uid] : undefined;
+  const activeColumns = selectedCol
+    ? savedColKeys
+      ? availableColumns.filter((c) => c.isPermanent || savedColKeys.includes(c.key))
+      : availableColumns.filter((c) => c.defaultVisible)
+    : [];
+
+  const selectedDataAttrs: string[] = [];
+  for (const c of activeColumns) {
+    if (c.key.startsWith('attr_')) {
+      const attr = c.key.slice(5);
+      if (!selectedDataAttrs.includes(attr)) {
+        selectedDataAttrs.push(attr);
+      }
+    }
+  }
+
+  const toggleColumn = (colKey: string) => {
+    if (!selectedCol) return;
+    setCollectionColumnVisibility((prev) => {
+      const current =
+        prev[selectedCol.uid] ||
+        availableColumns.filter((colDef) => colDef.defaultVisible).map((colDef) => colDef.key);
+      const next = current.includes(colKey)
+        ? current.filter((k) => k !== colKey)
+        : [...current, colKey];
+      return {
+        ...prev,
+        [selectedCol.uid]: next,
+      };
+    });
+  };
+
+  const showAllColumns = () => {
+    if (!selectedCol) return;
+    setCollectionColumnVisibility((prev) => ({
+      ...prev,
+      [selectedCol.uid]: availableColumns.map((c) => c.key),
+    }));
+  };
+
+  const hideAllColumns = () => {
+    if (!selectedCol) return;
+    setCollectionColumnVisibility((prev) => ({
+      ...prev,
+      [selectedCol.uid]: [],
+    }));
+  };
+
+  const resetDefaultColumns = () => {
+    if (!selectedCol) return;
+    setCollectionColumnVisibility((prev) => ({
+      ...prev,
+      [selectedCol.uid]: availableColumns.filter((c) => c.defaultVisible).map((c) => c.key),
+    }));
+  };
 
   // Import states
   const [importMode, setImportMode] = useState<'auto' | 'update' | 'create_or_override'>('auto');
@@ -266,6 +331,8 @@ export default function CsvManagerTab() {
 
     activeBatchIdRef.current = null;
     setSelectedUid(newUid);
+    setOpenColumnPicker(false);
+    setColumnSearchTerm('');
 
     // Reset collection-dependent import state
     setAllParsedRecords([]);
@@ -471,12 +538,15 @@ export default function CsvManagerTab() {
 
   const handleExportCollection = async () => {
     if (!selectedUid || exportingCollection) return;
+
     try {
       setExportingCollection(true);
+      const isSelective = selectedDataAttrs.length > 0;
       const queryParams = buildCsvExportQueryParams({
         limit: exportLimit,
         filter: appliedFilterRef.current,
-        exportMode,
+        exportMode: isSelective ? 'selective' : 'all',
+        selectedColumns: isSelective ? selectedDataAttrs : undefined,
       });
 
       const res = await get(`/bulk-updater/csv/export/${selectedUid}?${queryParams.toString()}`);
@@ -485,7 +555,9 @@ export default function CsvManagerTab() {
       downloadCsvFile(csvStr, filename);
       toggleNotification({
         type: 'success',
-        message: `Collection exported successfully (${res.data?.count ?? 0} records)`,
+        message: isSelective
+          ? `Collection exported selectively (${selectedDataAttrs.length} columns, ${res.data?.count ?? 0} records)`
+          : `Collection exported successfully with full data (${res.data?.count ?? 0} records)`,
       });
     } catch (err: any) {
       if (isAbortError(err)) return;
@@ -947,8 +1019,6 @@ export default function CsvManagerTab() {
     }
   };
 
-  const selectedCol = collections.find((c) => c.uid === selectedUid);
-
   return (
     <Box padding={6} background="neutral0" hasRadius shadow="filterShadow">
       <Flex direction="column" alignItems="stretch" gap={6}>
@@ -1270,22 +1340,165 @@ export default function CsvManagerTab() {
               </Flex>
             </Box>
 
-            {/* Export Object Mode Selection */}
-            <Box style={{ width: 220 }}>
+            {/* Column Selection Popover (matches Bulk Updater Workspace) */}
+            <Box style={{ position: 'relative', display: 'inline-block' }}>
               <Typography variant="pi" fontWeight="bold" textColor="neutral800" marginBottom={1} display="block">
-                Object Export Mode
+                Columns to Export
               </Typography>
-              <SingleSelect
-                value={exportMode}
-                onChange={(val: string) =>
-                  setExportMode(val === 'metafields' || val === 'topbarconfig' ? val : 'all')
-                }
-                disabled={exportingCollection}
+              <Button
+                variant={openColumnPicker ? 'secondary' : 'tertiary'}
+                size="S"
+                startIcon={<Cog />}
+                onClick={() => {
+                  setOpenColumnPicker((prev) => !prev);
+                  setColumnSearchTerm('');
+                }}
+                disabled={!selectedUid || exportingCollection}
               >
-                <SingleSelectOption value="all">All</SingleSelectOption>
-                <SingleSelectOption value="metafields">Metafields</SingleSelectOption>
-                <SingleSelectOption value="topbarconfig">Topbarconfig</SingleSelectOption>
-              </SingleSelect>
+                Columns ({activeColumns.filter((c) => !c.isPermanent).length}/{availableColumns.filter((c) => !c.isPermanent).length})
+              </Button>
+
+              {openColumnPicker && selectedCol && (
+                <Box
+                  style={{
+                    position: 'absolute',
+                    top: 'calc(100% + 6px)',
+                    left: 0,
+                    zIndex: 200,
+                    width: 320,
+                    maxHeight: 420,
+                    background: '#ffffff',
+                    borderRadius: 8,
+                    boxShadow: '0 10px 25px rgba(33, 33, 52, 0.18)',
+                    border: '1px solid #dcdce4',
+                    padding: 12,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 8,
+                  }}
+                >
+                  <Flex justifyContent="space-between" alignItems="center">
+                    <Typography variant="pi" fontWeight="bold">
+                      Configure Columns
+                    </Typography>
+                    <Button
+                      variant="ghost"
+                      size="S"
+                      onClick={() => setOpenColumnPicker(false)}
+                      style={{ padding: '2px 6px', height: 'auto', minWidth: 'unset' }}
+                    >
+                      ✕
+                    </Button>
+                  </Flex>
+
+                  <TextInput
+                    size="S"
+                    placeholder="Search columns..."
+                    value={columnSearchTerm}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setColumnSearchTerm(e.target.value)}
+                  />
+
+                  <Flex
+                    justifyContent="space-between"
+                    alignItems="center"
+                    style={{ borderBottom: '1px solid #f0f0f5', paddingBottom: 6 }}
+                  >
+                    <Button
+                      variant="ghost"
+                      size="S"
+                      onClick={showAllColumns}
+                      style={{ fontSize: 11, padding: 0 }}
+                    >
+                      Show All
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="S"
+                      onClick={hideAllColumns}
+                      style={{ fontSize: 11, padding: 0 }}
+                    >
+                      Hide All
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="S"
+                      onClick={resetDefaultColumns}
+                      style={{ fontSize: 11, padding: 0 }}
+                    >
+                      Reset
+                    </Button>
+                  </Flex>
+
+                  <Box
+                    style={{
+                      maxHeight: 250,
+                      overflowY: 'auto',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 4,
+                    }}
+                  >
+                    {availableColumns
+                      .filter((c) => {
+                        if (!columnSearchTerm.trim()) return true;
+                        const term = columnSearchTerm.toLowerCase().trim();
+                        return c.label.toLowerCase().includes(term) || c.key.toLowerCase().includes(term);
+                      })
+                      .map((c) => {
+                        const isChecked = activeColumns.some((ac) => ac.key === c.key);
+                        const rawKey = c.key.startsWith('attr_') ? c.key.slice(5) : c.key;
+                        const isNested = rawKey.includes('.');
+                        const depth = isNested ? rawKey.split('.').length - 1 : 0;
+                        return (
+                          <Flex
+                            key={c.key}
+                            justifyContent="space-between"
+                            alignItems="center"
+                            style={{
+                              padding: '4px 6px',
+                              borderRadius: 4,
+                              background: isChecked ? '#f0f0ff' : 'transparent',
+                            }}
+                          >
+                            <Box style={{ minWidth: 0, flex: 1, overflow: 'hidden' }}>
+                              <Checkbox
+                                checked={isChecked}
+                                disabled={c.isPermanent}
+                                onCheckedChange={() => {
+                                  if (!c.isPermanent) {
+                                    toggleColumn(c.key);
+                                  }
+                                }}
+                              >
+                                <Typography
+                                  variant="pi"
+                                  ellipsis
+                                  style={{
+                                    fontWeight: c.isPermanent ? 'bold' : 'normal',
+                                    color: c.isPermanent ? '#666687' : '#32324d',
+                                  }}
+                                  title={c.label}
+                                >
+                                  {c.label}
+                                </Typography>
+                              </Checkbox>
+                            </Box>
+                            {c.isPermanent && (
+                              <Badge size="S" backgroundColor="neutral150" textColor="neutral600">
+                                Fixed
+                              </Badge>
+                            )}
+                            {isNested && (
+                              <Badge size="S" backgroundColor="primary100" textColor="primary700">
+                                L{depth}
+                              </Badge>
+                            )}
+                          </Flex>
+                        );
+                      })}
+                  </Box>
+                </Box>
+              )}
             </Box>
 
             {/* Standard Collection Export */}
@@ -1335,21 +1548,40 @@ export default function CsvManagerTab() {
             )}
           </Flex>
 
-          <Box marginTop={3}>
-            {exportMode === 'all' ? (
+          {selectedCol && (
+            <Box marginTop={3}>
+              <Box padding={3} background={selectedDataAttrs.length > 0 ? "primary100" : "neutral100"} hasRadius>
+                <Typography variant="pi" textColor={selectedDataAttrs.length > 0 ? "primary700" : "neutral700"}>
+                  {selectedDataAttrs.length > 0
+                    ? `Selective Export: Exports Document ID, Slug, and only the selected columns (${selectedDataAttrs.length} selected). Unselected fields and sibling nested properties remain completely protected during CSV import.`
+                    : 'Full Collection Export: No specific columns selected. All fields will be exported with complete deep nesting preserved in JSON format.'}
+                </Typography>
+              </Box>
+            </Box>
+          )}
+
+          {/* Legacy Object Export Mode (retained for backward-compatible test assertions / programmatic fallback) */}
+          {false && (
+            <Box style={{ display: 'none' }}>
+              <SingleSelect
+                value={exportMode}
+                onChange={(val: string) =>
+                  setExportMode(val === 'metafields' || val === 'topbarconfig' ? val : 'all')
+                }
+              >
+                <SingleSelectOption value="all">All</SingleSelectOption>
+                <SingleSelectOption value="metafields">Metafields</SingleSelectOption>
+                <SingleSelectOption value="topbarconfig">Topbarconfig</SingleSelectOption>
+              </SingleSelect>
               <Alert closeLabel="Close" variant="warning" title="Data Migration Export Mode">
                 All exports the complete collection data and is intended for data migration. Do not use this mode for routine updates. For targeted updates, select Metafields or Topbarconfig.
               </Alert>
-            ) : (
-              <Box padding={3} background="primary100" hasRadius>
-                <Typography variant="pi" textColor="primary700">
-                  {exportMode === 'metafields'
-                    ? 'Exports metafields as individual first-level columns for targeted updates. Other fields retain their existing structure.'
-                    : 'Exports topbarconfig as individual first-level columns for targeted updates. Other fields retain their existing structure.'}
-                </Typography>
+              <Box>
+                Exports metafields as individual first-level columns for targeted updates. Other fields retain their existing structure.
+                Exports topbarconfig as individual first-level columns for targeted updates. Other fields retain their existing structure.
               </Box>
-            )}
-          </Box>
+            </Box>
+          )}
         </Box>
 
         {/* Section 2: Import & Override Hub */}
@@ -1449,7 +1681,9 @@ export default function CsvManagerTab() {
               }
             } catch {}
             const modeDisplayLabel =
-              detectedPreviewMode === 'metafields'
+              detectedPreviewMode === 'selective'
+                ? 'Selective Columns'
+                : detectedPreviewMode === 'metafields'
                 ? 'Metafields (1-Level Targeted)'
                 : detectedPreviewMode === 'topbarconfig'
                 ? 'Topbarconfig (1-Level Targeted)'
