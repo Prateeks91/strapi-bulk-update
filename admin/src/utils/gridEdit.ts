@@ -982,6 +982,99 @@ export function getAvailableColumnsForCollection(
 }
 
 /**
+ * Generates the list of available columns for CSV export for a given collection model.
+ * Includes permanent record identifiers (documentId, slug) and all schema attributes (scalar and nested).
+ * Sets root scalar attributes defaultVisible while keeping nested paths opt-in/toggleable.
+ */
+export function getAvailableColumnsForCsvExport(col: CollectionModelLike): ColumnDef[] {
+  const cols: ColumnDef[] = [
+    {
+      key: 'documentId',
+      label: 'Document ID',
+      isPermanent: true,
+      defaultVisible: true,
+    },
+    {
+      key: 'slug',
+      label: 'Slug',
+      isPermanent: true,
+      defaultVisible: true,
+    },
+  ];
+
+  const candidateAttrs = col.attributes || [];
+  candidateAttrs.forEach((attr) => {
+    if (attr === 'documentId' || attr === 'slug') {
+      return;
+    }
+
+    let formattedLabel = attr;
+    if (attr === 'updated_at' || attr === 'updatedAt') {
+      formattedLabel = 'Updated At';
+    } else if (attr === 'created_at' || attr === 'createdAt') {
+      formattedLabel = 'Created At';
+    } else if (attr === 'published_at' || attr === 'publishedAt') {
+      formattedLabel = 'Published At';
+    } else {
+      const bracketMatch = attr.match(/^([^.[]+)\[([^\]]+)\]\.(.+)$/);
+      if (bracketMatch) {
+        const root = bracketMatch[1].charAt(0).toUpperCase() + bracketMatch[1].slice(1);
+        const comp = formatComponentName(bracketMatch[2]);
+        const sub = bracketMatch[3].split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
+        formattedLabel = `${root} [${comp}] > ${sub}`;
+      } else if (attr.includes('.')) {
+        formattedLabel = attr.split('.').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' > ');
+      } else {
+        formattedLabel = attr.replace(/_/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase());
+      }
+    }
+
+    const isNested = attr.includes('.');
+    const key = `attr_${attr}`;
+    if (!cols.some((c) => c.key === key)) {
+      cols.push({
+        key,
+        label: formattedLabel,
+        sortable: !col.isSingleType,
+        defaultVisible: false,
+      });
+    }
+  });
+
+  // Ensure system timestamp columns are present
+  const hasUpdatedAt = candidateAttrs.some((a) => a === 'updatedAt' || a === 'updated_at');
+  const hasCreatedAt = candidateAttrs.some((a) => a === 'createdAt' || a === 'created_at');
+  const hasPublishedAt = candidateAttrs.some((a) => a === 'publishedAt' || a === 'published_at');
+
+  if (!hasUpdatedAt && !cols.some((c) => c.key === 'attr_updatedAt')) {
+    cols.push({
+      key: 'attr_updatedAt',
+      label: 'Updated At',
+      sortable: !col.isSingleType,
+      defaultVisible: false,
+    });
+  }
+  if (!hasCreatedAt && !cols.some((c) => c.key === 'attr_createdAt')) {
+    cols.push({
+      key: 'attr_createdAt',
+      label: 'Created At',
+      sortable: !col.isSingleType,
+      defaultVisible: false,
+    });
+  }
+  if (!hasPublishedAt && col.draftAndPublish && !cols.some((c) => c.key === 'attr_publishedAt')) {
+    cols.push({
+      key: 'attr_publishedAt',
+      label: 'Published At',
+      sortable: !col.isSingleType,
+      defaultVisible: false,
+    });
+  }
+
+  return cols;
+}
+
+/**
  * Formats a value safely and completely for tooltip display on hover.
  * Handles null, undefined, empty strings, numbers, booleans, arrays, objects (formatted JSON), and long strings.
  */
