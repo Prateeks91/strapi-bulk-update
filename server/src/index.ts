@@ -9,11 +9,21 @@ import auditService from './services/audit';
 import validationRulesService, { extractHeadingsFromRichText, matchesPath, cleanKey, validateEntityQuotas, deepMergeEntities } from './services/validation-rules';
 import csvService from './services/csv';
 import contentHistoryService, { recordContentHistoryVersion } from './services/content-history';
+import { installUndiciCrashGuard } from './services/error-utils';
 
 export * from './services/csv/index';
 export { extractHeadingsFromRichText, validateEntityQuotas, deepMergeEntities } from './services/validation-rules';
 export { sortAuditRecordsDesc, withRollbackLock } from './services/audit';
 export { buildCollectionQueryFilters, getAllNestedValues } from './services/bulk-updater';
+export {
+  isFetchFailedError,
+  formatErrorWithCause,
+  sanitizeSensitiveErrorText,
+  installUndiciCrashGuard,
+  getBatchConcurrency,
+  trackActiveBulkOperation,
+  getActiveBulkOperationCount,
+} from './services/error-utils';
 export {
   enumerateOccurrences,
   applyOccurrenceUpdatesToDocument,
@@ -47,6 +57,10 @@ export default {
     });
   },
   bootstrap({ strapi }: { strapi: any }) {
+    // Prevent detached undici fetch/webhook rejections triggered during Document Service
+    // mutations from crashing the Strapi Node.js process while logging sanitized diagnostics
+    installUndiciCrashGuard(strapi);
+
     // Intercept quota validation errors to return HTTP 400 ApplicationError so Strapi's admin UI displays specific danger banner
     strapi.server.use(async (ctx: any, next: any) => {
       try {
@@ -78,6 +92,9 @@ export default {
 
     // Register Document Service middleware to enforce validation & cross-component quotas on the backend
     strapi.documents.use(async (context: any, next: any) => {
+      if (typeof context.uid === 'string' && context.uid.startsWith('plugin::bulk-updater.')) {
+        return await next();
+      }
       const params = context.params as any;
       if (['create', 'update'].includes(context.action)) {
         const data = params?.data;

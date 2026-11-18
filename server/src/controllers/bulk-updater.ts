@@ -1,4 +1,5 @@
 import type { Core } from '@strapi/strapi';
+import { formatErrorWithCause, isFetchFailedError } from '../services/error-utils';
 
 export default ({ strapi }: { strapi: Core.Strapi }) => ({
   async getModels(ctx: any) {
@@ -83,8 +84,10 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       const result = await service.batchUpdate(ctx.request.body || {}, currentUser);
       ctx.body = result;
     } catch (err: any) {
-      ctx.status = 400;
-      ctx.body = { success: false, error: err.message };
+      const formatted = formatErrorWithCause(err, 'Batch update failed');
+      strapi.log?.error?.(`[bulk-updater] POST /batch-update error: ${formatted}`);
+      ctx.status = isFetchFailedError(err) ? 502 : 400;
+      ctx.body = { success: false, error: formatted };
     }
   },
 
@@ -95,8 +98,10 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       const result = await service.batchPublish(ctx.request.body || {}, currentUser);
       ctx.body = result;
     } catch (err: any) {
-      ctx.status = 400;
-      ctx.body = { success: false, error: err.message };
+      const formatted = formatErrorWithCause(err, 'Batch publish failed');
+      strapi.log?.error?.(`[bulk-updater] POST /batch-publish error: ${formatted}`);
+      ctx.status = isFetchFailedError(err) ? 502 : 400;
+      ctx.body = { success: false, error: formatted };
     }
   },
 
@@ -131,8 +136,10 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       const result = await service.approveBatch(batchId, currentUser, { executeImmediately });
       ctx.body = result;
     } catch (err: any) {
-      ctx.status = 400;
-      ctx.body = { success: false, error: err.message };
+      const formatted = formatErrorWithCause(err, 'Batch approval failed');
+      strapi.log?.error?.(`[bulk-updater] POST /batches/${ctx.params?.batchId}/approve error: ${formatted}`);
+      ctx.status = isFetchFailedError(err) ? 502 : 400;
+      ctx.body = { success: false, error: formatted };
     }
   },
 
@@ -158,8 +165,10 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       const result = await service.executeNow(batchId, currentUser);
       ctx.body = result;
     } catch (err: any) {
-      ctx.status = 400;
-      ctx.body = { success: false, error: err.message };
+      const formatted = formatErrorWithCause(err, 'Batch execution failed');
+      strapi.log?.error?.(`[bulk-updater] POST /batches/${ctx.params?.batchId}/execute-now error: ${formatted}`);
+      ctx.status = isFetchFailedError(err) ? 502 : 400;
+      ctx.body = { success: false, error: formatted };
     }
   },
 

@@ -11,6 +11,7 @@ import {
   getAllNestedValues,
 } from './bulk-updater';
 import { extractHeadingsFromRichText, validateEntityQuotas, deepMergeEntities } from './validation-rules';
+import { formatErrorWithCause, isFetchFailedError, trackActiveBulkOperation } from './error-utils';
 import {
   discoverSchema,
   buildLosslessPopulate,
@@ -383,7 +384,12 @@ export function extractDetailedErrorMessage(err: any): string {
     return err.details.message;
   }
 
-  // 5. Check err.message if descriptive
+  // 5. Preserve undici / network cause diagnostics when fetch failed or err.cause is present
+  if (isFetchFailedError(err) || err.cause) {
+    return formatErrorWithCause(err, 'Error processing row');
+  }
+
+  // 6. Check err.message if descriptive
   if (err.message && err.message !== '[object Object]') {
     return err.message;
   }
@@ -1329,7 +1335,9 @@ async function executeUpdateMutation(
       if (effectiveLocale) pubArgs.locale = effectiveLocale;
       await (strapi.documents(uid as any) as any).publish(pubArgs);
     } catch (pubErr) {
-      strapi.log.warn(`[bulk-updater] Auto-publish failed for ${resolvedDocId}:`, pubErr);
+      strapi.log.warn(
+        `[bulk-updater] Auto-publish failed for ${uid}/${resolvedDocId}: ${formatErrorWithCause(pubErr)}`
+      );
     }
   }
 
@@ -1477,7 +1485,9 @@ async function executeCreateMutation(
       if (effectiveLocale) pubArgs.locale = effectiveLocale;
       await (strapi.documents(uid as any) as any).publish(pubArgs);
     } catch (pubErr) {
-      strapi.log.warn(`[bulk-updater] Auto-publish failed for ${newDocId}:`, pubErr);
+      strapi.log.warn(
+        `[bulk-updater] Auto-publish failed for ${uid}/${newDocId}: ${formatErrorWithCause(pubErr)}`
+      );
     }
   }
 
@@ -1526,6 +1536,7 @@ export async function processCsvRows(
     originalHeaders?: string[];
   }
 ): Promise<ProcessRowsStats> {
+  return await trackActiveBulkOperation(async () => {
   const attrs = ct.attributes || {};
   const { mode = 'auto', publish = true, publishStrategy = 'safe', user, originalHeaders } = options;
   const isDraftAndPublish = Boolean(ct.options?.draftAndPublish);
@@ -1745,6 +1756,11 @@ export async function processCsvRows(
       stats.skipped++;
       if (stats.failed !== undefined) stats.failed++;
       const errMsg = sanitizeUserErrorMessage(extractDetailedErrorMessage(err));
+      if (isFetchFailedError(err)) {
+        strapi.log?.error?.(
+          `[bulk-updater] Network/webhook fetch error during CSV import row ${rowNumber} (${uid}/${docId || 'new'}): ${errMsg}`
+        );
+      }
       recordFailedCsvRow(
         stats,
         rowNumber,
@@ -1765,9 +1781,15 @@ export async function processCsvRows(
         message: `Failed to process row ${rowNumber}: ${errMsg}`,
       });
     }
+
+    // Periodically yield to event loop so undici sockets and HTTP traffic stay responsive
+    if (i > 0 && i % 10 === 0) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
   }
 
   return stats;
+  });
 }
 
 async function recordCsvAuditLog(
