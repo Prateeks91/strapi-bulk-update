@@ -507,24 +507,23 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             item.locale !== 'null' &&
             item.locale !== 'undefined';
 
-          let wasPublished = false;
+          const isDraftAndPublish = Boolean(ct?.options?.draftAndPublish ?? item.isDraftAndPublish);
+
+          // Retrieve current document with recursive deep populate to preserve all sibling fields, components, media, and relations
+          const populateOption = isNested ? buildDeepPopulate(ct.attributes, strapi.components) : undefined;
+          const findOneArgs: any = { documentId: item.documentId };
+          if (populateOption) {
+            findOneArgs.populate = populateOption;
+          }
+          if (isLocalized) {
+            findOneArgs.locale = item.locale;
+          }
+          const currentDoc: any = await strapi.documents(item.uid as any).findOne(findOneArgs);
+          if (!currentDoc) {
+            throw new Error(`Document "${item.documentId}" not found in collection "${item.uid}".`);
+          }
 
           if (isNested && (isComponent || isDynamicZone || rootAttrDef)) {
-            // Retrieve current document with recursive deep populate to preserve all sibling fields, components, media, and relations
-            const populateOption = buildDeepPopulate(ct.attributes, strapi.components);
-            const findOneArgs: any = { documentId: item.documentId };
-            if (populateOption) {
-              findOneArgs.populate = populateOption;
-            }
-            if (isLocalized) {
-              findOneArgs.locale = item.locale;
-            }
-            const currentDoc: any = await strapi.documents(item.uid as any).findOne(findOneArgs);
-            if (!currentDoc) {
-              throw new Error(`Document "${item.documentId}" not found in collection "${item.uid}".`);
-            }
-            wasPublished = Boolean(currentDoc?.publishedAt);
-
             const isRootDz = isDynamicZone;
             const existingRoot = currentDoc?.[rootKey] || (isRootDz ? [] : {});
 
@@ -603,12 +602,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             });
           } else {
             // Top-level scalar or relation
-            const currentDoc: any = await strapi.documents(item.uid as any).findOne({
-              documentId: item.documentId,
-              ...(isLocalized ? { locale: item.locale } : {}),
-            });
-            wasPublished = Boolean(currentDoc?.publishedAt);
-
             await strapi.documents(item.uid as any).update({
               documentId: item.documentId,
               ...(isLocalized ? { locale: item.locale } : {}),
@@ -618,15 +611,97 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             });
           }
 
-          if (ct?.options?.draftAndPublish && wasPublished) {
+          // Determine the exact pre-update lifecycle status to restore
+          let targetStatus: 'published' | 'modified' | 'draft' | undefined = undefined;
+          if (
+            item.previousStatus === 'published' ||
+            item.previousStatus === 'modified' ||
+            item.previousStatus === 'draft'
+          ) {
+            targetStatus = item.previousStatus;
+          } else if (item.hadPublishedVersion === false) {
+            targetStatus = 'draft';
+          } else if (item.hadPublishedVersion === true) {
+            targetStatus = 'published';
+          }
+
+          // Fallback for legacy audit records where previousStatus is absent
+          if (isDraftAndPublish && !targetStatus) {
+            let publishedCounterpart: any = null;
             try {
-              await (strapi.documents(item.uid as any) as any).publish({
-                documentId: item.documentId,
-                ...(isLocalized ? { locale: item.locale } : {}),
-              });
-            } catch (publishErr: any) {
-              strapi.log.warn(`[bulk-updater] Failed to auto-publish rollback for ${item.uid}/${item.documentId}:`, publishErr?.message);
+              const docSvc = strapi.documents(item.uid as any) as any;
+              if (typeof docSvc.findMany === 'function') {
+                const pubs = await docSvc.findMany({
+                  status: 'published',
+                  filters: { documentId: item.documentId },
+                  fields: ['documentId', 'publishedAt'],
+                  limit: 1,
+                  ...(isLocalized ? { locale: item.locale } : {}),
+                });
+                if (pubs && pubs.length > 0) {
+                  publishedCounterpart = pubs[0];
+                }
+              }
+            } catch {}
+
+            if (publishedCounterpart?.publishedAt || currentDoc?.publishedAt) {
+              targetStatus = 'published';
+            } else {
+              targetStatus = 'draft';
             }
+          }
+
+          if (isDraftAndPublish) {
+            const docSvc = strapi.documents(item.uid as any) as any;
+            if (targetStatus === 'published') {
+              try {
+                if (typeof docSvc.publish === 'function') {
+                  await docSvc.publish({
+                    documentId: item.documentId,
+                    ...(isLocalized ? { locale: item.locale } : {}),
+                  });
+                }
+              } catch (publishErr: any) {
+                strapi.log.warn(
+                  `[bulk-updater] Failed to auto-publish rollback for ${item.uid}/${item.documentId}:`,
+                  publishErr?.message
+                );
+              }
+            } else if (targetStatus === 'draft') {
+              try {
+                if (typeof docSvc.unpublish === 'function') {
+                  let hasPublished = false;
+                  if (typeof docSvc.findMany === 'function') {
+                    const pubs = await docSvc.findMany({
+                      status: 'published',
+                      filters: { documentId: item.documentId },
+                      fields: ['documentId', 'publishedAt'],
+                      limit: 1,
+                      ...(isLocalized ? { locale: item.locale } : {}),
+                    });
+                    if (pubs && pubs.length > 0) {
+                      hasPublished = true;
+                    }
+                  } else if (currentDoc?.publishedAt) {
+                    hasPublished = true;
+                  }
+                  if (hasPublished) {
+                    await docSvc.unpublish({
+                      documentId: item.documentId,
+                      ...(isLocalized ? { locale: item.locale } : {}),
+                    });
+                  }
+                }
+              } catch (unpubErr: any) {
+                strapi.log.warn(
+                  `[bulk-updater] Failed to unpublish rollback for ${item.uid}/${item.documentId}:`,
+                  unpubErr?.message
+                );
+              }
+            }
+            // If targetStatus === 'modified', the draft has been updated with oldValue,
+            // and neither publish nor unpublish is called. Thus, Strapi preserves the published
+            // version alongside the restored draft modifications, maintaining Modified status.
           }
 
           // Record Content History Version for Strapi Content Manager
@@ -635,7 +710,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
               uid: item.uid,
               documentId: item.documentId,
               userId,
-              statusOverride: ct?.options?.draftAndPublish ? (wasPublished ? 'published' : 'draft') : undefined,
+              statusOverride: isDraftAndPublish ? targetStatus : 'published',
             });
           } catch {}
 
@@ -654,6 +729,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
             attribute: item.attribute,
             revertedTo: item.oldValue,
             status: 'reverted',
+            restoredLifecycleStatus: isDraftAndPublish ? targetStatus : 'published',
           });
         } catch (err: any) {
           rollbackDetails.push({

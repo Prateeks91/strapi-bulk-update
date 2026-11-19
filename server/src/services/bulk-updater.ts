@@ -1393,7 +1393,7 @@ async function resolveAndMaybePublishTarget({
       ? { ...currentEntry, status: (target as any).status, publishedAt: (target as any).publishedAt }
       : currentEntry;
 
-  const { hadPublishedVersion } = resolveRecordPublicationStatus(inspectionTarget, pubRecord, isDraftAndPublish);
+  const { hadPublishedVersion, status: preStatus } = resolveRecordPublicationStatus(inspectionTarget, pubRecord, isDraftAndPublish);
   const isEditing = isRowInEditingStage(inspectionTarget) || isRowInEditingStage(target as any);
   const shouldPublish = evaluateShouldPublish({
     isDraftAndPublish,
@@ -1408,6 +1408,7 @@ async function resolveAndMaybePublishTarget({
     candLocale: isLocalized ? candLocale : undefined,
     isDraftAndPublish,
     hadPublishedVersion,
+    previousStatus: preStatus,
     shouldPublish,
     async postUpdate(relatedTargetUid?: string) {
       if (shouldPublish) {
@@ -1625,6 +1626,9 @@ async function executeGridTargetUpdate({
     oldValue: oldSummaryVal,
     newValue: newSummaryVal,
     status: 'updated' as const,
+    previousStatus: lifecycle.previousStatus,
+    hadPublishedVersion: lifecycle.hadPublishedVersion,
+    isDraftAndPublish: lifecycle.isDraftAndPublish,
     message: isMultiOcc
       ? `Successfully updated ${changedDiffs.length} grid occurrence(s) in ${attribute}`
       : `Successfully updated ${attribute}`,
@@ -1900,7 +1904,7 @@ async function executeBatchInternal(
               ? { ...currentEntry, status: (target as any).status, publishedAt: (target as any).publishedAt }
               : currentEntry;
 
-            const { hadPublishedVersion: hadPubComp } = resolveRecordPublicationStatus(
+            const { hadPublishedVersion: hadPubComp, status: preStatusComp } = resolveRecordPublicationStatus(
               inspectionTargetComp,
               pubRecordComp,
               isDraftAndPublishComp
@@ -1985,11 +1989,15 @@ async function executeBatchInternal(
               uid: target.uid,
               collectionName: displayName,
               documentId: target.documentId,
+              locale: candLocaleComp,
               label: entryLabel,
               attribute,
               oldValue: currentVal ?? null,
               newValue,
               status: 'updated' as const,
+              previousStatus: preStatusComp,
+              hadPublishedVersion: hadPubComp,
+              isDraftAndPublish: isDraftAndPublishComp,
               message: isRootDz
                 ? `Successfully updated ${affectedMatches.length} dynamic zone item(s) in ${attribute}`
                 : `Successfully updated nested field ${attribute}`,
@@ -2082,7 +2090,7 @@ async function executeBatchInternal(
               ? { ...currentEntry, status: (target as any).status, publishedAt: (target as any).publishedAt }
               : currentEntry;
 
-            const { hadPublishedVersion: hadPubRel } = resolveRecordPublicationStatus(
+            const { hadPublishedVersion: hadPubRel, status: preStatusRel } = resolveRecordPublicationStatus(
               inspectionTargetRel,
               pubRecordRel,
               isDraftAndPublishRel
@@ -2159,11 +2167,15 @@ async function executeBatchInternal(
               uid: target.uid,
               collectionName: displayName,
               documentId: target.documentId,
+              locale: candLocaleRel,
               label: entryLabel,
               attribute,
               oldValue: { isRelation: true, documentIds: oldDocIds, display: oldDisplay },
               newValue: { isRelation: true, mode, documentIds: targetDocIds, display: newDisplay },
               status: 'updated' as const,
+              previousStatus: preStatusRel,
+              hadPublishedVersion: hadPubRel,
+              isDraftAndPublish: isDraftAndPublishRel,
               message: `Successfully updated relation "${attribute}"`,
             };
           }
@@ -2198,7 +2210,7 @@ async function executeBatchInternal(
             ? { ...currentEntry, status: (target as any).status, publishedAt: (target as any).publishedAt }
             : currentEntry;
 
-          const { hadPublishedVersion: hadPubScalar } = resolveRecordPublicationStatus(
+          const { hadPublishedVersion: hadPubScalar, status: preStatusScalar } = resolveRecordPublicationStatus(
             inspectionTargetScalar,
             pubRecordScalar,
             isDraftAndPublishScalar
@@ -2270,11 +2282,15 @@ async function executeBatchInternal(
             uid: target.uid,
             collectionName: displayName,
             documentId: target.documentId,
+            locale: candLocaleScalar,
             label: entryLabel,
             attribute,
             oldValue: currentVal ?? null,
             newValue,
             status: 'updated' as const,
+            previousStatus: preStatusScalar,
+            hadPublishedVersion: hadPubScalar,
+            isDraftAndPublish: isDraftAndPublishScalar,
             message: `Successfully updated ${attribute}`,
           };
         } else {
@@ -2357,11 +2373,15 @@ async function executeBatchInternal(
           uid: r.uid,
           collectionName: r.collectionName,
           documentId: r.documentId,
+          locale: r.locale,
           label: `${r.label} [Block #${dz.index} (${dz.componentName})]`,
           attribute: dz.attribute,
           oldValue: dz.oldValue,
           newValue: dz.newValue,
           status: 'updated',
+          previousStatus: r.previousStatus,
+          hadPublishedVersion: r.hadPublishedVersion,
+          isDraftAndPublish: r.isDraftAndPublish,
           message: `Updated ${dz.attribute}`,
         });
       }

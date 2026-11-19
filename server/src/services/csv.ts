@@ -1279,7 +1279,7 @@ async function executeUpdateMutation(
         }
       : existing;
 
-  const { hadPublishedVersion } = resolveRecordPublicationStatus(
+  const { hadPublishedVersion, status: preStatus } = resolveRecordPublicationStatus(
     inspectionExisting,
     pubRecord,
     isDraftAndPublish
@@ -1379,11 +1379,15 @@ async function executeUpdateMutation(
       uid,
       collectionName: ct.info?.displayName || uid,
       documentId: resolvedDocId,
+      locale: effectiveLocale,
       label: existing.title || existing.name || `Entry #${resolvedDocId}`,
       attribute: attrKey,
       oldValue: oldVal,
       newValue: newVal,
       status: 'updated',
+      previousStatus: preStatus,
+      hadPublishedVersion,
+      isDraftAndPublish,
       message: `${actionLabel} "${attrKey}" via CSV import (row ${rowNumber})`,
     });
   }
