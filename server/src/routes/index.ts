@@ -1,3 +1,17 @@
+import { PERMISSIONS } from '../constants/permissions';
+
+function requirePermissions(actions: string | string[], mode: 'all' | 'any' = 'all') {
+  return [
+    {
+      name: 'plugin::bulk-updater.hasPermissions',
+      config: {
+        actions: Array.isArray(actions) ? actions : [actions],
+        mode,
+      },
+    },
+  ];
+}
+
 export default {
   admin: {
     type: 'admin',
@@ -7,7 +21,15 @@ export default {
         path: '/models',
         handler: 'bulkUpdater.getModels',
         config: {
-          policies: [],
+          policies: requirePermissions(
+            [
+              PERMISSIONS.workspaceView,
+              PERMISSIONS.csvExport,
+              PERMISSIONS.csvImport,
+              PERMISSIONS.validationView,
+            ],
+            'any'
+          ),
         },
       },
       {
@@ -15,7 +37,10 @@ export default {
         path: '/collections/:uid/entries',
         handler: 'bulkUpdater.getCollectionEntries',
         config: {
-          policies: [],
+          policies: requirePermissions(
+            [PERMISSIONS.workspaceView, PERMISSIONS.csvExport, PERMISSIONS.csvImport],
+            'any'
+          ),
         },
       },
       {
@@ -23,7 +48,10 @@ export default {
         path: '/relation-options',
         handler: 'bulkUpdater.getRelationOptions',
         config: {
-          policies: [],
+          policies: requirePermissions(
+            [PERMISSIONS.workspaceView, PERMISSIONS.csvExport, PERMISSIONS.csvImport],
+            'any'
+          ),
         },
       },
       {
@@ -31,7 +59,10 @@ export default {
         path: '/media-options',
         handler: 'bulkUpdater.getMediaOptions',
         config: {
-          policies: [],
+          policies: requirePermissions(
+            [PERMISSIONS.workspaceView, PERMISSIONS.csvExport, PERMISSIONS.csvImport],
+            'any'
+          ),
         },
       },
       {
@@ -39,7 +70,7 @@ export default {
         path: '/batch-update',
         handler: 'bulkUpdater.batchUpdate',
         config: {
-          policies: [],
+          policies: requirePermissions(PERMISSIONS.workspaceExecute),
         },
       },
       {
@@ -47,7 +78,7 @@ export default {
         path: '/batch-publish',
         handler: 'bulkUpdater.batchPublish',
         config: {
-          policies: [],
+          policies: requirePermissions(PERMISSIONS.workspacePublish),
         },
       },
       {
@@ -55,7 +86,7 @@ export default {
         path: '/preview',
         handler: 'bulkUpdater.previewBatch',
         config: {
-          policies: [],
+          policies: requirePermissions(PERMISSIONS.workspaceExecute),
         },
       },
       {
@@ -63,7 +94,7 @@ export default {
         path: '/pending-batches',
         handler: 'bulkUpdater.getPendingBatches',
         config: {
-          policies: [],
+          policies: requirePermissions(PERMISSIONS.approvalView),
         },
       },
       {
@@ -71,7 +102,7 @@ export default {
         path: '/batches/:batchId/approve',
         handler: 'bulkUpdater.approveBatch',
         config: {
-          policies: [],
+          policies: requirePermissions(PERMISSIONS.approvalApprove),
         },
       },
       {
@@ -79,7 +110,7 @@ export default {
         path: '/batches/:batchId/reject',
         handler: 'bulkUpdater.rejectBatch',
         config: {
-          policies: [],
+          policies: requirePermissions(PERMISSIONS.approvalReject),
         },
       },
       {
@@ -87,7 +118,7 @@ export default {
         path: '/batches/:batchId/execute-now',
         handler: 'bulkUpdater.executeNow',
         config: {
-          policies: [],
+          policies: requirePermissions(PERMISSIONS.approvalApprove),
         },
       },
       {
@@ -95,7 +126,10 @@ export default {
         path: '/batches/recent',
         handler: 'bulkUpdater.getRecentBatches',
         config: {
-          policies: [],
+          policies: requirePermissions(
+            [PERMISSIONS.workspaceView, PERMISSIONS.auditView, PERMISSIONS.approvalView],
+            'any'
+          ),
         },
       },
       {
@@ -103,7 +137,16 @@ export default {
         path: '/batches/:batchId/status',
         handler: 'bulkUpdater.getBatchStatus',
         config: {
-          policies: [],
+          policies: requirePermissions(
+            [
+              PERMISSIONS.workspaceView,
+              PERMISSIONS.workspaceExecute,
+              PERMISSIONS.csvImport,
+              PERMISSIONS.auditView,
+              PERMISSIONS.approvalView,
+            ],
+            'any'
+          ),
         },
       },
       {
@@ -111,7 +154,7 @@ export default {
         path: '/batches/:batchId/report',
         handler: 'bulkUpdater.getBatchReport',
         config: {
-          policies: [],
+          policies: requirePermissions([PERMISSIONS.auditDetails, PERMISSIONS.approvalView], 'any'),
         },
       },
       {
@@ -119,7 +162,7 @@ export default {
         path: '/batches/:batchId/diffs',
         handler: 'bulkUpdater.getPendingBatchDiffs',
         config: {
-          policies: [],
+          policies: requirePermissions([PERMISSIONS.approvalView, PERMISSIONS.auditDetails], 'any'),
         },
       },
       {
@@ -127,7 +170,7 @@ export default {
         path: '/batches/:batchId/diffs/export',
         handler: 'bulkUpdater.exportPendingBatchDiffs',
         config: {
-          policies: [],
+          policies: requirePermissions([PERMISSIONS.approvalView, PERMISSIONS.auditDetails], 'any'),
         },
       },
       {
@@ -135,7 +178,7 @@ export default {
         path: '/audit/history',
         handler: 'audit.getHistory',
         config: {
-          policies: [],
+          policies: requirePermissions(PERMISSIONS.auditView),
         },
       },
       {
@@ -143,7 +186,7 @@ export default {
         path: '/audit/:batchId/rollback',
         handler: 'audit.rollback',
         config: {
-          policies: [],
+          policies: requirePermissions(PERMISSIONS.auditRollback),
         },
       },
       {
@@ -151,7 +194,7 @@ export default {
         path: '/validation-rules',
         handler: 'validationRules.getRules',
         config: {
-          policies: [],
+          policies: requirePermissions(PERMISSIONS.validationView),
         },
       },
       {
@@ -159,7 +202,7 @@ export default {
         path: '/validation-rules',
         handler: 'validationRules.saveRule',
         config: {
-          policies: [],
+          policies: requirePermissions(PERMISSIONS.validationManage),
         },
       },
       {
@@ -167,7 +210,7 @@ export default {
         path: '/validation-rules/:id',
         handler: 'validationRules.deleteRule',
         config: {
-          policies: [],
+          policies: requirePermissions(PERMISSIONS.validationManage),
         },
       },
       {
@@ -175,7 +218,7 @@ export default {
         path: '/validation-rules/:id/toggle',
         handler: 'validationRules.toggleRule',
         config: {
-          policies: [],
+          policies: requirePermissions(PERMISSIONS.validationManage),
         },
       },
       {
@@ -183,7 +226,7 @@ export default {
         path: '/validation-rules/:id/scan',
         handler: 'validationRules.scanViolations',
         config: {
-          policies: [],
+          policies: requirePermissions(PERMISSIONS.validationView),
         },
       },
       {
@@ -191,7 +234,7 @@ export default {
         path: '/csv/template/:uid',
         handler: 'csv.getTemplate',
         config: {
-          policies: [],
+          policies: requirePermissions([PERMISSIONS.csvExport, PERMISSIONS.csvImport], 'any'),
         },
       },
       {
@@ -199,7 +242,7 @@ export default {
         path: '/csv/export/:uid',
         handler: 'csv.exportCollection',
         config: {
-          policies: [],
+          policies: requirePermissions(PERMISSIONS.csvExport),
         },
       },
       {
@@ -207,7 +250,7 @@ export default {
         path: '/csv/export/:uid',
         handler: 'csv.exportCollection',
         config: {
-          policies: [],
+          policies: requirePermissions(PERMISSIONS.csvExport),
         },
       },
       {
@@ -215,7 +258,7 @@ export default {
         path: '/csv/export-bulk',
         handler: 'csv.exportBulk',
         config: {
-          policies: [],
+          policies: requirePermissions(PERMISSIONS.csvExport),
         },
       },
       {
@@ -223,7 +266,7 @@ export default {
         path: '/csv/export-violations/:ruleId',
         handler: 'csv.exportViolations',
         config: {
-          policies: [],
+          policies: requirePermissions(PERMISSIONS.csvExport),
         },
       },
       {
@@ -231,7 +274,7 @@ export default {
         path: '/csv/import',
         handler: 'csv.importCsv',
         config: {
-          policies: [],
+          policies: requirePermissions(PERMISSIONS.csvImport),
         },
       },
       {
@@ -239,7 +282,7 @@ export default {
         path: '/csv/import-chunk',
         handler: 'csv.importChunk',
         config: {
-          policies: [],
+          policies: requirePermissions(PERMISSIONS.csvImport),
         },
       },
       {
@@ -247,7 +290,7 @@ export default {
         path: '/csv/validate-preflight',
         handler: 'csv.validatePreflight',
         config: {
-          policies: [],
+          policies: requirePermissions(PERMISSIONS.csvImport),
         },
       },
       {
@@ -255,7 +298,7 @@ export default {
         path: '/csv/submit-batch',
         handler: 'csv.submitBatch',
         config: {
-          policies: [],
+          policies: requirePermissions(PERMISSIONS.csvImport),
         },
       },
     ],

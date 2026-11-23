@@ -4,9 +4,11 @@ import {
   Flex,
   Typography,
   Badge,
+  Alert,
 } from '@strapi/design-system';
 import { Check } from '@strapi/icons';
 import ValidationRulesTab from './ValidationRulesTab';
+import { useBulkUpdaterRBAC } from '../hooks/useBulkUpdaterRBAC';
 
 const ALL_FEATURES = [
   'Cross-collection batch attribute & relationship updates',
@@ -20,6 +22,18 @@ const ALL_FEATURES = [
 ];
 
 const SettingsPage: React.FC = () => {
+  const permissions = useBulkUpdaterRBAC();
+
+  if (!permissions.canSettingsView) {
+    return (
+      <Box padding={8} background="neutral100">
+        <Alert variant="warning" title="Access Denied">
+          You do not have permission to view Bulk Attribute Updater Settings (action: plugin::bulk-updater.settings.view).
+        </Alert>
+      </Box>
+    );
+  }
+
   return (
     <Box padding={8} background="neutral100">
       <Flex direction="column" alignItems="flex-start" gap={2} marginBottom={6}>
@@ -68,9 +82,11 @@ const SettingsPage: React.FC = () => {
       </Box>
 
       {/* Validation Rules Section */}
-      <Box marginTop={6}>
-        <ValidationRulesTab />
-      </Box>
+      {permissions.canValidationView && (
+        <Box marginTop={6}>
+          <ValidationRulesTab />
+        </Box>
+      )}
     </Box>
   );
 };

@@ -39,6 +39,7 @@ import {
   serializeGridTargets,
 } from '../utils/gridEdit';
 import { isAbortError } from '../utils/isAbortError';
+import { useBulkUpdaterRBAC } from '../hooks/useBulkUpdaterRBAC';
 import { getEntryLifecycleStatus } from '../utils/lifecycleStatus';
 import {
   type FilterOperator,
@@ -537,7 +538,13 @@ function renderCellContent(
           )}
           {dzItemsCount > 0 && (
             <Box marginTop={1}>
-              <Button
+              {permissions.canWorkspacePublish && (
+                {permissions.canApprovalApprove && (
+                                {permissions.canApprovalReject && (
+                                {permissions.canApprovalApprove && (
+                              {permissions.canAuditDetails && (
+                              {permissions.canAuditDetails && (
+                              <Button
                 variant="ghost"
                 size="S"
                 onClick={onToggleExpandDz}
@@ -993,6 +1000,27 @@ function renderCellContent(
 const BulkUpdater: React.FC = () => {
   const { get, post } = useFetchClient();
   const { toggleNotification } = useNotification();
+  const permissions = useBulkUpdaterRBAC();
+
+  // Dynamic RBAC tab alignment: redirect if current tab is unauthorized
+  useEffect(() => {
+    if (permissions.isLoading) return;
+
+    const isTabAllowed = (tab: 'editor' | 'audit' | 'rules' | 'csv') => {
+      if (tab === 'editor') return permissions.canWorkspaceView;
+      if (tab === 'audit') return permissions.canAuditView || permissions.canApprovalView;
+      if (tab === 'rules') return permissions.canValidationView;
+      if (tab === 'csv') return permissions.canCsvExport || permissions.canCsvImport;
+      return false;
+    };
+
+    if (!isTabAllowed(activeTab)) {
+      if (permissions.canWorkspaceView) setActiveTab('editor');
+      else if (permissions.canCsvExport || permissions.canCsvImport) setActiveTab('csv');
+      else if (permissions.canAuditView || permissions.canApprovalView) setActiveTab('audit');
+      else if (permissions.canValidationView) setActiveTab('rules');
+    }
+  }, [permissions, activeTab]);
 
   // Active view tab: 'editor' | 'audit' | 'rules' | 'csv' (synced with ?tab= query param)
   const getInitialTab = (): 'editor' | 'audit' | 'rules' | 'csv' => {
@@ -3190,6 +3218,7 @@ const BulkUpdater: React.FC = () => {
       {/* Tab Navigation */}
       <Flex gap={2} marginBottom={4} wrap="wrap" justifyContent="space-between" alignItems="center">
         <Flex gap={2}>
+          {permissions.canWorkspaceView && (
           <Button
             variant={activeTab === 'editor' ? 'default' : 'tertiary'}
             onClick={() => setActiveTab('editor')}
@@ -3197,6 +3226,8 @@ const BulkUpdater: React.FC = () => {
           >
             Bulk Updater Workspace
           </Button>
+          )}
+          {(permissions.canAuditView || permissions.canApprovalView) && (
           <Button
             variant={activeTab === 'audit' ? 'default' : 'tertiary'}
             onClick={() => setActiveTab('audit')}
@@ -3213,6 +3244,8 @@ const BulkUpdater: React.FC = () => {
               ''
             )}
           </Button>
+          )}
+          {permissions.canValidationView && (
           <Button
             variant={activeTab === 'rules' ? 'default' : 'tertiary'}
             onClick={() => setActiveTab('rules')}
@@ -3220,6 +3253,8 @@ const BulkUpdater: React.FC = () => {
           >
             Validation &amp; Quota Rules
           </Button>
+          )}
+          {(permissions.canCsvExport || permissions.canCsvImport) && (
           <Button
             variant={activeTab === 'csv' ? 'default' : 'tertiary'}
             onClick={() => setActiveTab('csv')}
@@ -3227,6 +3262,7 @@ const BulkUpdater: React.FC = () => {
           >
             CSV Import / Export &amp; Override
           </Button>
+          )}
         </Flex>
 
         {/* Server Policy Indicator */}
@@ -3244,8 +3280,19 @@ const BulkUpdater: React.FC = () => {
         )}
       </Flex>
 
+      
+
+      {/* Empty State Banner if user lacks permissions for all tabs */}
+      {!permissions.canWorkspaceView && !permissions.canAuditView && !permissions.canApprovalView && !permissions.canValidationView && !permissions.canCsvExport && !permissions.canCsvImport && (
+        <Box padding={8} background="neutral0" shadow="filterShadow" hasRadius marginTop={4}>
+          <Alert variant="warning" title="Access Denied">
+            You do not have permission to view any modules in Bulk Attribute Updater. Please contact your administrator to grant the required permissions in Settings &rarr; Roles.
+          </Alert>
+        </Box>
+      )}
+
       {/* Quick Rollback Banner for Workspace */}
-      {activeTab === 'editor' && latestActiveBatch && !updateSummary && (
+      {activeTab === 'editor' && permissions.canAuditRollback && latestActiveBatch && !updateSummary && (
         <Box
           padding={3}
           paddingLeft={4}
@@ -4624,14 +4671,15 @@ const BulkUpdater: React.FC = () => {
                   size="L"
                   onClick={handleOpenPreviewModal}
                   loading={previewLoading}
-                  disabled={
+                  disabled={!permissions.canWorkspaceExecute || (
                     loading ||
                     !selectedAttribute ||
                     !selectedAttribute.trim() ||
                     (gridEditMode
                       ? gridSerialized.targets.length === 0 || gridSerialized.hasValidationErrors
                       : totalSelectedCount === 0)
-                  }
+                  )}
+                  title={!permissions.canWorkspaceExecute ? "You do not have permission to execute bulk updates (action: plugin::bulk-updater.workspace.execute)." : undefined}
                 >
                   Preview Changes ({gridEditMode ? gridSerialized.targets.length : totalSelectedCount})
                 </Button>
@@ -4641,14 +4689,15 @@ const BulkUpdater: React.FC = () => {
                   size="L"
                   onClick={handleOpenConfirmModal}
                   loading={updating}
-                  disabled={
+                  disabled={!permissions.canWorkspaceExecute || (
                     loading ||
                     !selectedAttribute ||
                     !selectedAttribute.trim() ||
                     (gridEditMode
                       ? gridSerialized.targets.length === 0 || gridSerialized.hasValidationErrors
                       : totalSelectedCount === 0)
-                  }
+                  )}
+                  title={!permissions.canWorkspaceExecute ? "You do not have permission to execute bulk updates (action: plugin::bulk-updater.workspace.execute)." : undefined}
                 >
                   Update Selected ({gridEditMode ? gridSerialized.targets.length : totalSelectedCount})
                 </Button>
@@ -4663,13 +4712,15 @@ const BulkUpdater: React.FC = () => {
                 >
                   Publish Selected ({totalSelectedCount})
                 </Button>
+                )}
                 <Button
                   startIcon={<Download />}
                   variant="tertiary"
                   size="L"
                   onClick={handleBulkExportSelected}
                   loading={bulkExporting}
-                  disabled={loading || totalSelectedCount === 0}
+                  disabled={!permissions.canCsvExport || loading || totalSelectedCount === 0}
+                  title={!permissions.canCsvExport ? "You do not have permission to export CSV (action: plugin::bulk-updater.csv.export)." : undefined}
                   title="Export selected entries to Excel-compatible CSV with full nested component support"
                 >
                   Export Selected ({totalSelectedCount})
@@ -4682,7 +4733,8 @@ const BulkUpdater: React.FC = () => {
               <Flex justifyContent="space-between" alignItems="center" wrap="wrap" gap={3}>
                 <Flex gap={2} alignItems="center">
                   <Checkbox
-                    checked={publishOnApproval}
+                    checked={permissions.canWorkspacePublish && publishOnApproval}
+                    disabled={!permissions.canWorkspacePublish}
                     onCheckedChange={(checked: boolean) => setPublishOnApproval(Boolean(checked))}
                   >
                     <Typography fontWeight="bold">Auto-Publish after Update</Typography>
@@ -4898,6 +4950,7 @@ const BulkUpdater: React.FC = () => {
             </Button>
           </Flex>
 
+          {permissions.canApprovalView && (
           {/* Pending Approvals & Queued Batches Section */}
           <Box marginBottom={6} padding={5} background="neutral100" hasRadius style={{ border: '1px solid #e6e6ef' }}>
             <Flex justifyContent="space-between" alignItems="center" marginBottom={3}>
@@ -5060,6 +5113,7 @@ const BulkUpdater: React.FC = () => {
                                 >
                                   Approve &amp; Execute
                                 </Button>
+                                )}
                                 <Button
                                   size="S"
                                   variant="danger-light"
@@ -5068,6 +5122,7 @@ const BulkUpdater: React.FC = () => {
                                 >
                                   Reject
                                 </Button>
+                                )}
                               </>
                             )}
                             {batch.status === 'queued_offpeak' && (
@@ -5079,6 +5134,7 @@ const BulkUpdater: React.FC = () => {
                               >
                                 Run Now
                               </Button>
+                              )}
                             )}
                           </Flex>
                         </Td>
@@ -5088,6 +5144,8 @@ const BulkUpdater: React.FC = () => {
                 </Table>
               </Box>
             )}
+          
+          )}
           </Box>
 
           {auditNotice && (
@@ -5107,7 +5165,7 @@ const BulkUpdater: React.FC = () => {
             </Box>
           )}
 
-          {sortedAuditHistory.length > 0 && (
+          {permissions.canAuditView && sortedAuditHistory.length > 0 && (
             <Box className="bulk-updater-table-container" style={{ width: '100%', maxWidth: '100%', minWidth: 0, overflowX: 'auto' }}>
               <Table colCount={6} rowCount={sortedAuditHistory.length + 1} style={{ width: '100%' }}>
                 <Thead>
@@ -5256,6 +5314,7 @@ const BulkUpdater: React.FC = () => {
                               >
                                 Report
                               </Button>
+                              )}
                               <Button
                                 variant="tertiary"
                                 size="S"
@@ -5265,7 +5324,8 @@ const BulkUpdater: React.FC = () => {
                               >
                                 {isExpanded ? 'Hide Diffs' : 'View Diffs'}
                               </Button>
-                              {!rec.isRolledBack && (
+                              )}
+                              {!rec.isRolledBack && permissions.canAuditRollback && (
                                 isLatestEligible ? (
                                   <Button
                                     variant="danger"
