@@ -241,20 +241,32 @@ export default function ScopedQuotaSelectInput({
     });
 
     if (activeUiRule?.quotas) {
-      for (const [k, max] of Object.entries(activeUiRule.quotas)) {
+      const quotaEntries: Array<[string, any]> = Array.isArray(activeUiRule.quotas)
+        ? (activeUiRule.quotas as any[])
+            .map((item: any) => [
+              String(item?.key || item?.option || item?.name || item?.value || '').trim(),
+              typeof item?.maxAllowed === 'number'
+                ? item.maxAllowed
+                : parseInt(String(item?.maxAllowed ?? item?.max ?? 1), 10) || 1,
+            ])
+            .filter(([k]) => Boolean(k))
+        : Object.entries(activeUiRule.quotas);
+
+      for (const [k, max] of quotaEntries) {
         const lowerK = k.toLowerCase().trim();
+        const maxVal = typeof max === 'number' ? max : parseInt(String(max || 1), 10) || null;
         if (map.has(lowerK)) {
           const existing = map.get(lowerK)!;
           map.set(lowerK, {
             ...existing,
-            maxAllowed: typeof max === 'number' ? max : existing.maxAllowed,
+            maxAllowed: typeof maxVal === 'number' ? maxVal : existing.maxAllowed,
           });
         } else {
           // If option not in schema items, add it preserving the user-defined casing
           map.set(lowerK, {
             value: k, // preserve original casing from rule, e.g. "H1"
             label: k.toUpperCase(),
-            maxAllowed: typeof max === 'number' ? max : null,
+            maxAllowed: typeof maxVal === 'number' ? maxVal : null,
           });
         }
       }

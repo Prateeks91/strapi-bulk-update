@@ -1,8 +1,9 @@
 export const PLUGIN_ID = 'bulk-updater';
 
 export const PERMISSIONS = {
-  // General
+  // General (support both .read and .access aliases)
   read: `plugin::${PLUGIN_ID}.read`,
+  access: `plugin::${PLUGIN_ID}.access`,
 
   // Workspace
   workspaceView: `plugin::${PLUGIN_ID}.workspace.view`,

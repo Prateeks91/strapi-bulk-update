@@ -1392,7 +1392,8 @@ const BulkUpdater: React.FC = () => {
         } catch {}
       }
     } catch (err: any) {
-      if (!isAbortError(err)) {
+      const is403 = err?.response?.status === 403 || err?.status === 403;
+      if (!isAbortError(err) && !is403) {
         toggleNotification({
           type: 'danger',
           message: err?.message || 'Failed to load collections data',
@@ -4721,17 +4722,17 @@ const BulkUpdater: React.FC = () => {
                   Update Selected ({gridEditMode ? gridSerialized.targets.length : totalSelectedCount})
                 </Button>
                 {permissions.canWorkspacePublish && (
-                  <Button
-                    startIcon={<Check />}
-                    variant="success-light"
-                    size="L"
-                    onClick={handleOpenPublishModal}
-                    loading={publishing}
-                    disabled={loading || totalSelectedCount === 0}
-                    title="Directly publish selected draft records across collections"
-                  >
-                    Publish Selected ({totalSelectedCount})
-                  </Button>
+                <Button
+                  startIcon={<Check />}
+                  variant="success-light"
+                  size="L"
+                  onClick={handleOpenPublishModal}
+                  loading={publishing}
+                  disabled={loading || totalSelectedCount === 0}
+                  title="Directly publish selected draft records across collections"
+                >
+                  Publish Selected ({totalSelectedCount})
+                </Button>
                 )}
                 <Button
                   startIcon={<Download />}
@@ -4740,11 +4741,7 @@ const BulkUpdater: React.FC = () => {
                   onClick={handleBulkExportSelected}
                   loading={bulkExporting}
                   disabled={!permissions.canCsvExport || loading || totalSelectedCount === 0}
-                  title={
-                    !permissions.canCsvExport
-                      ? "You do not have permission to export CSV (action: plugin::bulk-updater.csv.export)."
-                      : "Export selected entries to Excel-compatible CSV with full nested component support"
-                  }
+                  title={!permissions.canCsvExport ? "You do not have permission to export CSV (action: plugin::bulk-updater.csv.export)." : "Export selected entries to Excel-compatible CSV with full nested component support"}
                 >
                   Export Selected ({totalSelectedCount})
                 </Button>
@@ -4975,7 +4972,7 @@ const BulkUpdater: React.FC = () => {
 
           {/* Pending Approvals & Queued Batches Section */}
           {permissions.canApprovalView && (
-            <Box marginBottom={6} padding={5} background="neutral100" hasRadius style={{ border: '1px solid #e6e6ef' }}>
+          <Box marginBottom={6} padding={5} background="neutral100" hasRadius style={{ border: '1px solid #e6e6ef' }}>
             <Flex justifyContent="space-between" alignItems="center" marginBottom={3}>
               <Box>
                 <Flex gap={2} alignItems="center">
@@ -5168,7 +5165,7 @@ const BulkUpdater: React.FC = () => {
                 </Table>
               </Box>
             )}
-            </Box>
+          </Box>
           )}
 
           {auditNotice && (

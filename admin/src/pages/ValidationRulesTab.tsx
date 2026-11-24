@@ -39,6 +39,47 @@ export interface ValidationRule {
   updatedAt?: string;
 }
 
+export const getQuotaBadges = (quotas: any): Array<{ key: string; maxAllowed: number }> => {
+  if (!quotas) return [];
+  if (Array.isArray(quotas)) {
+    return quotas
+      .map((item: any) => {
+        if (item && typeof item === 'object') {
+          return {
+            key: String(item.key || item.option || item.name || item.value || '').trim(),
+            maxAllowed:
+              typeof item.maxAllowed === 'number'
+                ? item.maxAllowed
+                : parseInt(String(item.maxAllowed ?? item.max ?? 1), 10) || 1,
+          };
+        }
+        return { key: String(item).trim(), maxAllowed: 1 };
+      })
+      .filter((q) => Boolean(q.key));
+  }
+  if (typeof quotas === 'object') {
+    return Object.entries(quotas)
+      .map(([k, v]) => {
+        if (v && typeof v === 'object' && ('key' in (v as any) || 'maxAllowed' in (v as any))) {
+          const item = v as any;
+          return {
+            key: String(item.key || item.option || item.name || k).trim(),
+            maxAllowed:
+              typeof item.maxAllowed === 'number'
+                ? item.maxAllowed
+                : parseInt(String(item.maxAllowed ?? 1), 10) || 1,
+          };
+        }
+        return {
+          key: String(k).trim(),
+          maxAllowed: typeof v === 'number' ? v : parseInt(String(v || 1), 10) || 1,
+        };
+      })
+      .filter((q) => Boolean(q.key));
+  }
+  return [];
+};
+
 export default function ValidationRulesTab() {
   const { get, post, del } = useFetchClient();
   const { toggleNotification } = useNotification();
@@ -164,10 +205,7 @@ export default function ValidationRulesTab() {
     setFormField(rule.targetField);
     setFormAction(rule.exceededAction || 'disable');
     setFormIncludeRichText(rule.includeRichTextHtml ?? true);
-    const quotaPairs = Object.entries(rule.quotas || {}).map(([k, v]) => ({
-      key: k,
-      maxAllowed: v,
-    }));
+    const quotaPairs = getQuotaBadges(rule.quotas);
     setFormQuotas(quotaPairs.length > 0 ? quotaPairs : [{ key: 'h1', maxAllowed: 1 }]);
     setModalOpen(true);
   };
@@ -374,7 +412,7 @@ export default function ValidationRulesTab() {
             </Thead>
             <Tbody>
               {rules.map((rule) => {
-                const quotaKeys = Object.entries(rule.quotas || {});
+                const quotaBadges = getQuotaBadges(rule.quotas);
                 const isGlobal = !rule.collectionUid || rule.collectionUid === '*';
                 const collectionName = !isGlobal
                   ? (availableCollections.find((c) => c.uid === rule.collectionUid)?.displayName || rule.collectionUid)
@@ -400,9 +438,9 @@ export default function ValidationRulesTab() {
                     </Td>
                     <Td style={{ minWidth: 180 }}>
                       <Flex gap={1} wrap="wrap">
-                        {quotaKeys.map(([optVal, maxVal]) => (
-                          <Badge key={optVal} backgroundColor="neutral100" textColor="primary700">
-                            <strong>{optVal.toUpperCase()}</strong>: max {maxVal}
+                        {quotaBadges.map((q, qIdx) => (
+                          <Badge key={`${q.key}-${qIdx}`} backgroundColor="neutral100" textColor="primary700">
+                            <strong>{q.key.toUpperCase()}</strong>: max {q.maxAllowed}
                           </Badge>
                         ))}
                       </Flex>
@@ -736,7 +774,7 @@ export default function ValidationRulesTab() {
                             {v.foundCount} used
                           </Typography>
                           <Typography variant="pi" textColor="neutral500">
-                            {' '}(Allowed max: {v.maxAllowed})
+                            {' '}(Allowed max: {typeof v.maxAllowed === 'object' ? JSON.stringify(v.maxAllowed) : String(v.maxAllowed)})
                           </Typography>
                         </Td>
                         <Td style={{ textAlign: 'right' }}>

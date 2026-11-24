@@ -38,13 +38,23 @@ export default (policyContext: any, config: any, { strapi }: { strapi?: any } = 
   const user = ctx?.state?.user;
   const userAbility = ctx?.state?.userAbility;
 
-  // 1. Super Admin universal bypass
-  if (user?.isSuperAdmin === true) {
+  // 1. Super Admin universal bypass (Strapi 5 admin super admin)
+  const isSuperAdmin = Boolean(
+    user?.isSuperAdmin === true ||
+    (Array.isArray(user?.roles) &&
+      user.roles.some((r: any) => r?.code === 'strapi-super-admin' || r?.name === 'Super Admin'))
+  );
+
+  if (isSuperAdmin) {
     return true;
   }
 
   // 2. CASL Ability check (standard Strapi 5 Admin auth)
   if (userAbility && typeof userAbility.can === 'function') {
+    if (userAbility.can('manage', 'all') || userAbility.can('*')) {
+      return true;
+    }
+
     const isAllowed =
       mode === 'any'
         ? actions.some((act) => userAbility.can(act))
@@ -75,7 +85,7 @@ export default (policyContext: any, config: any, { strapi }: { strapi?: any } = 
     ? user.permissions.map((p: any) => (typeof p === 'string' ? p : p?.action)).filter(Boolean)
     : [];
 
-  if (permissions.includes('*')) {
+  if (permissions.includes('*') || permissions.includes('admin::all')) {
     return true;
   }
 

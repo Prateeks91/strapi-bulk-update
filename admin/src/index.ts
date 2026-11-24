@@ -1,6 +1,7 @@
 import React from 'react';
 import { PLUGIN_ID } from './pluginId';
 import { Pencil, ClockCounterClockwise } from '@strapi/icons';
+import { MAIN_MENU_PERMISSIONS, SETTINGS_MENU_PERMISSIONS } from './constants/permissions';
 
 function escapeHtml(str: string): string {
   return (str || '')
@@ -79,12 +80,7 @@ export default {
         defaultMessage: 'Bulk Attribute Updater',
       },
       Component: () => import('./pages/BulkUpdater'),
-      permissions: [
-        {
-          action: `plugin::${PLUGIN_ID}.read`,
-          subject: null,
-        },
-      ],
+      permissions: MAIN_MENU_PERMISSIONS,
       position: 3,
     });
 
@@ -96,12 +92,7 @@ export default {
       },
       to: `${PLUGIN_ID}`,
       Component: () => import('./pages/SettingsPage'),
-      permissions: [
-        {
-          action: `plugin::${PLUGIN_ID}.settings.view`,
-          subject: null,
-        },
-      ],
+      permissions: SETTINGS_MENU_PERMISSIONS,
     });
 
     app.registerPlugin({

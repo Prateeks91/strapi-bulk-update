@@ -328,6 +328,43 @@ export interface ValidationResult {
 }
 
 /**
+ * Normalizes rule quotas to a clean Record<string, number> (e.g. { h1: 1, h2: 3 }).
+ * Handles legacy or malformed array formats like [{ key: 'h1', maxAllowed: 1 }]
+ * as well as objects with string numbers or nested key-value pairs.
+ */
+export function normalizeRuleQuotas(quotas: any): Record<string, number> {
+  const result: Record<string, number> = {};
+  if (!quotas) return result;
+  if (Array.isArray(quotas)) {
+    for (const item of quotas) {
+      if (item && typeof item === 'object') {
+        const key = item.key || item.option || item.name || item.val || item.value;
+        const max = item.maxAllowed ?? item.max ?? item.quota ?? item.limit ?? item.value;
+        if (key && max !== undefined) {
+          result[String(key).trim().toLowerCase()] = Math.max(1, parseInt(String(max), 10) || 1);
+        }
+      } else if (typeof item === 'string' && item.trim()) {
+        result[item.trim().toLowerCase()] = 1;
+      }
+    }
+  } else if (typeof quotas === 'object') {
+    for (const [k, v] of Object.entries(quotas)) {
+      if (v && typeof v === 'object' && ('key' in (v as any) || 'maxAllowed' in (v as any) || 'value' in (v as any))) {
+        const item = v as any;
+        const key = item.key || item.option || item.name || k;
+        const max = item.maxAllowed ?? item.max ?? item.quota ?? item.value;
+        if (key && max !== undefined) {
+          result[String(key).trim().toLowerCase()] = Math.max(1, parseInt(String(max), 10) || 1);
+        }
+      } else {
+        result[String(k).trim().toLowerCase()] = Math.max(1, parseInt(String(v), 10) || 1);
+      }
+    }
+  }
+  return result;
+}
+
+/**
  * Validates a document entity against all applicable Validation and Quota Rules.
  * Works across all rule types (structured fields, dynamic zones, headings, custom options).
  */
@@ -445,7 +482,8 @@ export async function validateEntityQuotas(
     const ruleCounts = structuredCounts[rule.id] || {};
     const rtRuleCounts = richTextCounts[rule.id] || {};
 
-    for (const [quotaKey, maxAllowed] of Object.entries(rule.quotas || {})) {
+    const effectiveQuotas = normalizeRuleQuotas(rule.quotas);
+    for (const [quotaKey, maxAllowed] of Object.entries(effectiveQuotas)) {
       const lowerVal = quotaKey.toLowerCase().trim();
       const structCount = ruleCounts[lowerVal] || 0;
       const rtCount = rule.includeRichTextHtml ? (rtRuleCounts[lowerVal] || 0) : 0;
@@ -498,7 +536,25 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
       await store.set({ value: { rules: DEFAULT_RULES } });
       return DEFAULT_RULES;
     }
-    return stored.rules;
+    let needsResave = false;
+    const sanitizedRules: ValidationRule[] = stored.rules.map((rule: any) => {
+      const normalizedQuotas = normalizeRuleQuotas(rule.quotas);
+      if (Array.isArray(rule.quotas)) {
+        needsResave = true;
+      }
+      return {
+        ...rule,
+        quotas: normalizedQuotas,
+      };
+    });
+    if (needsResave) {
+      try {
+        await store.set({ value: { rules: sanitizedRules } });
+      } catch (err) {
+        // silent fail on auto-heal
+      }
+    }
+    return sanitizedRules;
   },
 
   async saveRule(ruleData: Partial<ValidationRule>): Promise<ValidationRule> {
@@ -507,6 +563,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
     const now = new Date().toISOString();
     let savedRule: ValidationRule;
+    const normalizedQuotas = normalizeRuleQuotas(ruleData.quotas || { h1: 1 });
 
     if (ruleData.id) {
       // Update existing
@@ -515,6 +572,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         savedRule = {
           ...rules[index],
           ...ruleData,
+          quotas: normalizedQuotas,
           collectionUid: ruleData.collectionUid !== undefined ? ruleData.collectionUid : (rules[index].collectionUid || '*'),
           includeRichTextHtml: ruleData.includeRichTextHtml !== undefined ? Boolean(ruleData.includeRichTextHtml) : Boolean(rules[index].includeRichTextHtml),
           richTextFields: Array.isArray(ruleData.richTextFields) ? ruleData.richTextFields : (rules[index].richTextFields || []),
@@ -528,7 +586,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
           description: ruleData.description || '',
           collectionUid: ruleData.collectionUid || '*',
           targetField: ruleData.targetField || 'headingLevel',
-          quotas: ruleData.quotas || { h1: 1 },
+          quotas: normalizedQuotas,
           exceededAction: ruleData.exceededAction || 'disable',
           enabled: ruleData.enabled ?? true,
           scope: ruleData.scope || 'entry',
@@ -548,7 +606,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
         description: ruleData.description || '',
         collectionUid: ruleData.collectionUid || '*',
         targetField: ruleData.targetField || 'headingLevel',
-        quotas: ruleData.quotas || { h1: 1 },
+        quotas: normalizedQuotas,
         exceededAction: ruleData.exceededAction || 'disable',
         enabled: ruleData.enabled ?? true,
         scope: ruleData.scope || 'entry',
@@ -615,7 +673,7 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
     }
 
     const targetField = rule.targetField;
-    const quotas = rule.quotas || {};
+    const quotas = normalizeRuleQuotas(rule.quotas);
     const violations: Array<any> = [];
     let totalScanned = 0;
 

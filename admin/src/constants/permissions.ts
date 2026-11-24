@@ -1,8 +1,9 @@
 export const PLUGIN_ID = 'bulk-updater';
 
 export const PERMISSIONS = {
-  // General
+  // General (support both .read and .access aliases)
   read: `plugin::${PLUGIN_ID}.read`,
+  access: `plugin::${PLUGIN_ID}.access`,
 
   // Workspace
   workspaceView: `plugin::${PLUGIN_ID}.workspace.view`,
@@ -32,21 +33,23 @@ export const PERMISSIONS = {
   settingsManage: `plugin::${PLUGIN_ID}.settings.manage`,
 } as const;
 
-export const BULK_UPDATER_PERMISSIONS_LAYOUT = {
-  canRead: [{ action: PERMISSIONS.read, subject: null }],
-  canWorkspaceView: [{ action: PERMISSIONS.workspaceView, subject: null }],
-  canWorkspaceExecute: [{ action: PERMISSIONS.workspaceExecute, subject: null }],
-  canWorkspacePublish: [{ action: PERMISSIONS.workspacePublish, subject: null }],
-  canCsvExport: [{ action: PERMISSIONS.csvExport, subject: null }],
-  canCsvImport: [{ action: PERMISSIONS.csvImport, subject: null }],
-  canAuditView: [{ action: PERMISSIONS.auditView, subject: null }],
-  canAuditDetails: [{ action: PERMISSIONS.auditDetails, subject: null }],
-  canAuditRollback: [{ action: PERMISSIONS.auditRollback, subject: null }],
-  canApprovalView: [{ action: PERMISSIONS.approvalView, subject: null }],
-  canApprovalApprove: [{ action: PERMISSIONS.approvalApprove, subject: null }],
-  canApprovalReject: [{ action: PERMISSIONS.approvalReject, subject: null }],
-  canValidationView: [{ action: PERMISSIONS.validationView, subject: null }],
-  canValidationManage: [{ action: PERMISSIONS.validationManage, subject: null }],
-  canSettingsView: [{ action: PERMISSIONS.settingsView, subject: null }],
-  canSettingsManage: [{ action: PERMISSIONS.settingsManage, subject: null }],
-};
+/**
+ * Menu link permission guards:
+ * If the user has ANY of the main functional permissions or the general access permission,
+ * the main menu link will be displayed in Strapi's navigation bar.
+ */
+export const MAIN_MENU_PERMISSIONS = [
+  { action: PERMISSIONS.read, subject: null },
+  { action: PERMISSIONS.access, subject: null },
+  { action: PERMISSIONS.workspaceView, subject: null },
+  { action: PERMISSIONS.auditView, subject: null },
+  { action: PERMISSIONS.approvalView, subject: null },
+  { action: PERMISSIONS.validationView, subject: null },
+  { action: PERMISSIONS.csvExport, subject: null },
+  { action: PERMISSIONS.csvImport, subject: null },
+];
+
+export const SETTINGS_MENU_PERMISSIONS = [
+  { action: PERMISSIONS.settingsView, subject: null },
+  { action: PERMISSIONS.settingsManage, subject: null },
+];
