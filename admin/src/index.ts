@@ -79,7 +79,12 @@ export default {
         defaultMessage: 'Bulk Attribute Updater',
       },
       Component: () => import('./pages/BulkUpdater'),
-      permissions: [],
+      permissions: [
+        {
+          action: `plugin::${PLUGIN_ID}.read`,
+          subject: null,
+        },
+      ],
       position: 3,
     });
 
@@ -91,7 +96,12 @@ export default {
       },
       to: `${PLUGIN_ID}`,
       Component: () => import('./pages/SettingsPage'),
-      permissions: [],
+      permissions: [
+        {
+          action: `plugin::${PLUGIN_ID}.settings.view`,
+          subject: null,
+        },
+      ],
     });
 
     app.registerPlugin({

@@ -21,6 +21,7 @@ import {
 } from '@strapi/design-system';
 import { Plus, Trash, Check, ArrowClockwise, Search, Download } from '@strapi/icons';
 import { isAbortError } from '../utils/isAbortError';
+import { useBulkUpdaterRBAC } from '../hooks/useBulkUpdaterRBAC';
 
 export interface ValidationRule {
   id: string;
@@ -41,6 +42,7 @@ export interface ValidationRule {
 export default function ValidationRulesTab() {
   const { get, post, del } = useFetchClient();
   const { toggleNotification } = useNotification();
+  const permissions = useBulkUpdaterRBAC();
 
   const [rules, setRules] = useState<ValidationRule[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
@@ -289,6 +291,16 @@ export default function ValidationRulesTab() {
     }
   };
 
+  if (!permissions.canValidationView) {
+    return (
+      <Box padding={6} background="neutral0" shadow="filterShadow" hasRadius>
+        <Alert variant="warning" title="Access Denied">
+          You do not have permission to view Validation &amp; Quota Rules (action: plugin::bulk-updater.validation.view).
+        </Alert>
+      </Box>
+    );
+  }
+
   return (
     <Box>
       <style>{`
@@ -316,13 +328,15 @@ export default function ValidationRulesTab() {
             >
               Refresh
             </Button>
-            <Button
-              variant="default"
-              startIcon={<Plus />}
-              onClick={openCreateModal}
-            >
-              Create New Rule
-            </Button>
+            {permissions.canValidationManage && (
+              <Button
+                variant="default"
+                startIcon={<Plus />}
+                onClick={openCreateModal}
+              >
+                Create New Rule
+              </Button>
+            )}
           </Flex>
         </Flex>
       </Box>
@@ -411,6 +425,7 @@ export default function ValidationRulesTab() {
                         variant={rule.enabled ? 'success-light' : 'tertiary'}
                         size="S"
                         onClick={() => handleToggle(rule)}
+                        disabled={!permissions.canValidationManage}
                       >
                         {rule.enabled ? '● ACTIVE' : '○ DISABLED'}
                       </Button>
@@ -426,21 +441,25 @@ export default function ValidationRulesTab() {
                         >
                           Scan Violations
                         </Button>
-                        <Button
-                          variant="tertiary"
-                          size="S"
-                          onClick={() => openEditModal(rule)}
-                        >
-                          Edit
-                        </Button>
-                        <Button
-                          variant="danger-light"
-                          size="S"
-                          startIcon={<Trash />}
-                          onClick={() => handleDelete(rule.id, rule.name)}
-                        >
-                          Delete
-                        </Button>
+                        {permissions.canValidationManage && (
+                          <>
+                            <Button
+                              variant="tertiary"
+                              size="S"
+                              onClick={() => openEditModal(rule)}
+                            >
+                              Edit
+                            </Button>
+                            <Button
+                              variant="danger-light"
+                              size="S"
+                              startIcon={<Trash />}
+                              onClick={() => handleDelete(rule.id, rule.name)}
+                            >
+                              Delete
+                            </Button>
+                          </>
+                        )}
                       </Flex>
                     </Td>
                   </Tr>

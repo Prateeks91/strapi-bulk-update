@@ -1,4 +1,5 @@
 import routes from './routes';
+import policies from './policies';
 import contentTypes from './content-types';
 import bulkUpdaterController from './controllers/bulk-updater';
 import auditController from './controllers/audit';
@@ -10,11 +11,13 @@ import validationRulesService, { extractHeadingsFromRichText, matchesPath, clean
 import csvService from './services/csv';
 import contentHistoryService, { recordContentHistoryVersion } from './services/content-history';
 import { installUndiciCrashGuard } from './services/error-utils';
+import { BULK_UPDATER_PERMISSION_ACTIONS, PERMISSIONS } from './constants/permissions';
 
 export * from './services/csv/index';
 export { extractHeadingsFromRichText, validateEntityQuotas, deepMergeEntities } from './services/validation-rules';
 export { sortAuditRecordsDesc, withRollbackLock } from './services/audit';
 export { buildCollectionQueryFilters, getAllNestedValues } from './services/bulk-updater';
+export { PERMISSIONS, BULK_UPDATER_PERMISSION_ACTIONS } from './constants/permissions';
 export {
   isFetchFailedError,
   formatErrorWithCause,
@@ -60,6 +63,20 @@ export default {
     // Prevent detached undici fetch/webhook rejections triggered during Document Service
     // mutations from crashing the Strapi Node.js process while logging sanitized diagnostics
     installUndiciCrashGuard(strapi);
+
+    // Register plugin RBAC actions with Strapi's native Admin Permission Action Provider
+    try {
+      const actionProvider = strapi.admin?.services?.permission?.actionProvider;
+      if (actionProvider?.registerMany) {
+        actionProvider.registerMany(BULK_UPDATER_PERMISSION_ACTIONS);
+      } else if (actionProvider?.register) {
+        for (const action of BULK_UPDATER_PERMISSION_ACTIONS) {
+          actionProvider.register(action);
+        }
+      }
+    } catch (err: any) {
+      strapi.log?.warn?.(`[bulk-updater] Failed to register RBAC permissions: ${err?.message || err}`);
+    }
 
     // Intercept quota validation errors to return HTTP 400 ApplicationError so Strapi's admin UI displays specific danger banner
     strapi.server.use(async (ctx: any, next: any) => {
@@ -255,6 +272,7 @@ export default {
     } catch {}
   },
   routes,
+  policies,
   contentTypes,
   controllers: {
     bulkUpdater: bulkUpdaterController,

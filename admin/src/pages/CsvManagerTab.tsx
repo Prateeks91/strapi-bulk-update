@@ -30,6 +30,7 @@ import {
   type FailedCsvRowEntry,
 } from '../utils/csvParser';
 import { isAbortError } from '../utils/isAbortError';
+import { useBulkUpdaterRBAC } from '../hooks/useBulkUpdaterRBAC';
 import { getEntryLifecycleStatus, Entry, PendingBatch } from '../utils/lifecycleStatus';
 import { getAvailableColumnsForCsvExport, type ColumnDef } from '../utils/gridEdit';
 import {
@@ -68,6 +69,7 @@ interface AttributeMeta {
 export default function CsvManagerTab() {
   const { get, post } = useFetchClient();
   const { toggleNotification } = useNotification();
+  const permissions = useBulkUpdaterRBAC();
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const countAbortControllerRef = useRef<AbortController | null>(null);
@@ -1071,7 +1073,7 @@ export default function CsvManagerTab() {
               variant="tertiary"
               startIcon={<Download />}
               onClick={handleDownloadTemplate}
-              disabled={!selectedUid || downloadingTemplate}
+              disabled={!selectedUid || downloadingTemplate || (!permissions.canCsvExport && !permissions.canCsvImport)}
               loading={downloadingTemplate}
             >
               Download Sample CSV Template
@@ -1585,6 +1587,7 @@ export default function CsvManagerTab() {
         </Box>
 
         {/* Section 2: Import & Override Hub */}
+        {permissions.canCsvImport && (
         <Box padding={5} background="neutral100" hasRadius>
           <Typography variant="delta" tag="h3" fontWeight="bold" marginBottom={2}>
             2. Import &amp; Batch Override CSV
@@ -2122,6 +2125,7 @@ export default function CsvManagerTab() {
             </Box>
           )}
         </Box>
+        )}
       </Flex>
 
       {/* Confirmation Modal with Enterprise Guardrails (Maker-Checker, Execution Windows, Off-Peak Scheduling) */}
