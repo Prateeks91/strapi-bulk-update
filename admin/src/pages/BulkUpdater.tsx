@@ -999,8 +999,35 @@ function renderCellContent(
 
 const BulkUpdater: React.FC = () => {
   const { get, post } = useFetchClient();
-  const { toggleNotification } = useNotification();
+    const { toggleNotification } = useNotification();
   const permissions = useBulkUpdaterRBAC();
+
+  // Active view tab: 'editor' | 'audit' | 'rules' | 'csv' (synced with ?tab= query param)
+  const getInitialTab = (): 'editor' | 'audit' | 'rules' | 'csv' => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const t = params.get('tab');
+      if (t === 'audit' || t === 'editor' || t === 'rules' || t === 'csv') return t as any;
+    } catch {}
+    if (!permissions.isLoading) {
+      if (permissions.canWorkspaceView) return 'editor';
+      if (permissions.canCsvExport || permissions.canCsvImport) return 'csv';
+      if (permissions.canAuditView || permissions.canApprovalView) return 'audit';
+      if (permissions.canValidationView) return 'rules';
+    }
+    return 'editor';
+  };
+
+  const [activeTab, setActiveTabState] = useState<'editor' | 'audit' | 'rules' | 'csv'>(getInitialTab);
+
+  const setActiveTab = (tab: 'editor' | 'audit' | 'rules' | 'csv') => {
+    setActiveTabState(tab);
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.set('tab', tab);
+      window.history.replaceState({}, '', url.toString());
+    } catch {}
+  };
 
   // Dynamic RBAC tab alignment: redirect if current tab is unauthorized
   useEffect(() => {
@@ -1021,27 +1048,6 @@ const BulkUpdater: React.FC = () => {
       else if (permissions.canValidationView) setActiveTab('rules');
     }
   }, [permissions, activeTab]);
-
-  // Active view tab: 'editor' | 'audit' | 'rules' | 'csv' (synced with ?tab= query param)
-  const getInitialTab = (): 'editor' | 'audit' | 'rules' | 'csv' => {
-    try {
-      const params = new URLSearchParams(window.location.search);
-      const t = params.get('tab');
-      if (t === 'audit' || t === 'editor' || t === 'rules' || t === 'csv') return t as any;
-    } catch {}
-    return 'editor';
-  };
-
-  const [activeTab, setActiveTabState] = useState<'editor' | 'audit' | 'rules' | 'csv'>(getInitialTab);
-
-  const setActiveTab = (tab: 'editor' | 'audit' | 'rules' | 'csv') => {
-    setActiveTabState(tab);
-    try {
-      const url = new URL(window.location.href);
-      url.searchParams.set('tab', tab);
-      window.history.replaceState({}, '', url.toString());
-    } catch {}
-  };
 
   const [loading, setLoading] = useState<boolean>(true);
   const [updating, setUpdating] = useState<boolean>(false);
@@ -1546,7 +1552,8 @@ const BulkUpdater: React.FC = () => {
         }
       }
     } catch (err: any) {
-      if (!isAbortError(err)) {
+      const is403 = err?.response?.status === 403 || err?.status === 403;
+      if (!isAbortError(err) && !is403) {
         toggleNotification({
           type: 'danger',
           message: err?.message || 'Failed to fetch audit history.',
@@ -1586,18 +1593,36 @@ const BulkUpdater: React.FC = () => {
   };
 
   useEffect(() => {
-    fetchModels();
-    fetchAuditHistory();
-    fetchPendingBatches();
-    fetchValidationRules();
-  }, []);
+    if (permissions.isLoading) return;
+
+    if (permissions.canWorkspaceView || permissions.canCsvExport || permissions.canCsvImport || permissions.canValidationView) {
+      fetchModels();
+    }
+    if (permissions.canAuditView) {
+      fetchAuditHistory();
+    }
+    if (permissions.canApprovalView) {
+      fetchPendingBatches();
+    }
+    if (permissions.canValidationView) {
+      fetchValidationRules();
+    }
+  }, [
+    permissions.isLoading,
+    permissions.canWorkspaceView,
+    permissions.canCsvExport,
+    permissions.canCsvImport,
+    permissions.canValidationView,
+    permissions.canAuditView,
+    permissions.canApprovalView,
+  ]);
 
   useEffect(() => {
     if (activeTab === 'audit') {
-      fetchAuditHistory();
-      fetchPendingBatches();
+      if (permissions.canAuditView) fetchAuditHistory();
+      if (permissions.canApprovalView) fetchPendingBatches();
     }
-  }, [activeTab]);
+  }, [activeTab, permissions.canAuditView, permissions.canApprovalView]);
 
   // Explicit Search trigger: executes API call only when user clicks Search (or presses Enter)
   const handleApplySearch = () => {
