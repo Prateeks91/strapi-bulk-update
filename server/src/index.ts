@@ -14,7 +14,7 @@ import { installUndiciCrashGuard } from './services/error-utils';
 import { BULK_UPDATER_PERMISSION_ACTIONS, PERMISSIONS } from './constants/permissions';
 
 export * from './services/csv/index';
-export { extractHeadingsFromRichText, validateEntityQuotas, deepMergeEntities } from './services/validation-rules';
+export { extractHeadingsFromRichText, validateEntityQuotas, deepMergeEntities, normalizeRuleQuotas } from './services/validation-rules';
 export { sortAuditRecordsDesc, withRollbackLock } from './services/audit';
 export { buildCollectionQueryFilters, getAllNestedValues } from './services/bulk-updater';
 export { PERMISSIONS, BULK_UPDATER_PERMISSION_ACTIONS } from './constants/permissions';
@@ -58,6 +58,22 @@ export default {
       plugin: 'bulk-updater',
       type: 'string',
     });
+
+    // Register plugin RBAC actions early during register phase
+    try {
+      const actionProvider =
+        strapi.service?.('admin::permission')?.actionProvider ||
+        strapi.admin?.services?.permission?.actionProvider;
+      if (actionProvider?.registerMany) {
+        actionProvider.registerMany(BULK_UPDATER_PERMISSION_ACTIONS);
+      } else if (actionProvider?.register) {
+        for (const action of BULK_UPDATER_PERMISSION_ACTIONS) {
+          actionProvider.register(action);
+        }
+      }
+    } catch (err: any) {
+      strapi.log?.warn?.(`[bulk-updater] Early permission registration: ${err?.message || err}`);
+    }
   },
   bootstrap({ strapi }: { strapi: any }) {
     // Prevent detached undici fetch/webhook rejections triggered during Document Service
@@ -66,7 +82,9 @@ export default {
 
     // Register plugin RBAC actions with Strapi's native Admin Permission Action Provider
     try {
-      const actionProvider = strapi.admin?.services?.permission?.actionProvider;
+      const actionProvider =
+        strapi.service?.('admin::permission')?.actionProvider ||
+        strapi.admin?.services?.permission?.actionProvider;
       if (actionProvider?.registerMany) {
         actionProvider.registerMany(BULK_UPDATER_PERMISSION_ACTIONS);
       } else if (actionProvider?.register) {

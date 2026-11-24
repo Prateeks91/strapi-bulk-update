@@ -538,13 +538,7 @@ function renderCellContent(
           )}
           {dzItemsCount > 0 && (
             <Box marginTop={1}>
-              {permissions.canWorkspacePublish && (
-                {permissions.canApprovalApprove && (
-                                {permissions.canApprovalReject && (
-                                {permissions.canApprovalApprove && (
-                              {permissions.canAuditDetails && (
-                              {permissions.canAuditDetails && (
-                              <Button
+              <Button
                 variant="ghost"
                 size="S"
                 onClick={onToggleExpandDz}
@@ -1398,7 +1392,8 @@ const BulkUpdater: React.FC = () => {
         } catch {}
       }
     } catch (err: any) {
-      if (!isAbortError(err)) {
+      const is403 = err?.response?.status === 403 || err?.status === 403;
+      if (!isAbortError(err) && !is403) {
         toggleNotification({
           type: 'danger',
           message: err?.message || 'Failed to load collections data',
@@ -4726,6 +4721,7 @@ const BulkUpdater: React.FC = () => {
                 >
                   Update Selected ({gridEditMode ? gridSerialized.targets.length : totalSelectedCount})
                 </Button>
+                {permissions.canWorkspacePublish && (
                 <Button
                   startIcon={<Check />}
                   variant="success-light"
@@ -4745,8 +4741,7 @@ const BulkUpdater: React.FC = () => {
                   onClick={handleBulkExportSelected}
                   loading={bulkExporting}
                   disabled={!permissions.canCsvExport || loading || totalSelectedCount === 0}
-                  title={!permissions.canCsvExport ? "You do not have permission to export CSV (action: plugin::bulk-updater.csv.export)." : undefined}
-                  title="Export selected entries to Excel-compatible CSV with full nested component support"
+                  title={!permissions.canCsvExport ? "You do not have permission to export CSV (action: plugin::bulk-updater.csv.export)." : "Export selected entries to Excel-compatible CSV with full nested component support"}
                 >
                   Export Selected ({totalSelectedCount})
                 </Button>
@@ -4975,8 +4970,8 @@ const BulkUpdater: React.FC = () => {
             </Button>
           </Flex>
 
-          {permissions.canApprovalView && (
           {/* Pending Approvals & Queued Batches Section */}
+          {permissions.canApprovalView && (
           <Box marginBottom={6} padding={5} background="neutral100" hasRadius style={{ border: '1px solid #e6e6ef' }}>
             <Flex justifyContent="space-between" alignItems="center" marginBottom={3}>
               <Box>
@@ -5130,27 +5125,29 @@ const BulkUpdater: React.FC = () => {
                             </Button>
                             {batch.status === 'pending_approval' && (
                               <>
-                                <Button
-                                  size="S"
-                                  variant="success-light"
-                                  onClick={() => handleApproveBatch(batch.id)}
-                                  loading={approvingBatchId === batch.id}
-                                >
-                                  Approve &amp; Execute
-                                </Button>
+                                {permissions.canApprovalApprove && (
+                                  <Button
+                                    size="S"
+                                    variant="success-light"
+                                    onClick={() => handleApproveBatch(batch.id)}
+                                    loading={approvingBatchId === batch.id}
+                                  >
+                                    Approve &amp; Execute
+                                  </Button>
                                 )}
-                                <Button
-                                  size="S"
-                                  variant="danger-light"
-                                  onClick={() => handleRejectBatch(batch.id)}
-                                  loading={rejectingBatchId === batch.id}
-                                >
-                                  Reject
-                                </Button>
+                                {permissions.canApprovalReject && (
+                                  <Button
+                                    size="S"
+                                    variant="danger-light"
+                                    onClick={() => handleRejectBatch(batch.id)}
+                                    loading={rejectingBatchId === batch.id}
+                                  >
+                                    Reject
+                                  </Button>
                                 )}
                               </>
                             )}
-                            {batch.status === 'queued_offpeak' && (
+                            {batch.status === 'queued_offpeak' && permissions.canApprovalApprove && (
                               <Button
                                 size="S"
                                 variant="default"
@@ -5159,7 +5156,6 @@ const BulkUpdater: React.FC = () => {
                               >
                                 Run Now
                               </Button>
-                              )}
                             )}
                           </Flex>
                         </Td>
@@ -5169,9 +5165,8 @@ const BulkUpdater: React.FC = () => {
                 </Table>
               </Box>
             )}
-          
-          )}
           </Box>
+          )}
 
           {auditNotice && (
             <Alert variant="warning" title="Audit Configuration Status" marginBottom={4}>
@@ -5328,27 +5323,29 @@ const BulkUpdater: React.FC = () => {
                           </Td>
                           <Td style={{ minWidth: 160, textAlign: 'right', whiteSpace: 'nowrap' }}>
                             <Flex gap={2} justifyContent="flex-end">
-                              <Button
-                                variant="secondary"
-                                size="S"
-                                startIcon={<Download />}
-                                onClick={() => {
-                                  setDashboardBatchId(rec.batchId);
-                                  setShowProcessingDashboard(true);
-                                }}
-                              >
-                                Report
-                              </Button>
+                              {permissions.canAuditDetails && (
+                                <Button
+                                  variant="secondary"
+                                  size="S"
+                                  startIcon={<Download />}
+                                  onClick={() => {
+                                    setDashboardBatchId(rec.batchId);
+                                    setShowProcessingDashboard(true);
+                                  }}
+                                >
+                                  Report
+                                </Button>
                               )}
-                              <Button
-                                variant="tertiary"
-                                size="S"
-                                onClick={() =>
-                                  setExpandedDiffBatchId(isExpanded ? null : rec.batchId)
-                                }
-                              >
-                                {isExpanded ? 'Hide Diffs' : 'View Diffs'}
-                              </Button>
+                              {permissions.canAuditDetails && (
+                                <Button
+                                  variant="tertiary"
+                                  size="S"
+                                  onClick={() =>
+                                    setExpandedDiffBatchId(isExpanded ? null : rec.batchId)
+                                  }
+                                >
+                                  {isExpanded ? 'Hide Diffs' : 'View Diffs'}
+                                </Button>
                               )}
                               {!rec.isRolledBack && permissions.canAuditRollback && (
                                 isLatestEligible ? (
