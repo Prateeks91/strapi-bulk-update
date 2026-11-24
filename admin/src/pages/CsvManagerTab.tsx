@@ -248,15 +248,18 @@ export default function CsvManagerTab() {
   const [unreviewedConsent, setUnreviewedConsent] = useState<boolean>(true);
 
   useEffect(() => {
-    fetchInitialData();
-  }, []);
+    if (permissions.isLoading) return;
+    if (permissions.canCsvExport || permissions.canCsvImport) {
+      fetchInitialData();
+    }
+  }, [permissions.isLoading, permissions.canCsvExport, permissions.canCsvImport]);
 
   const fetchInitialData = async () => {
     try {
       setLoadingCollections(true);
       const [modelsRes, rulesRes, batchesRes] = await Promise.all([
         get('/bulk-updater/models'),
-        get('/bulk-updater/validation-rules'),
+        get('/bulk-updater/validation-rules').catch(() => ({ data: { rules: [] } })),
         get('/bulk-updater/pending-batches').catch(() => ({ data: { batches: [] } })),
       ]);
 

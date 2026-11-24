@@ -119,19 +119,25 @@ export default function ValidationRulesTab() {
       }
     } catch (err: any) {
       if (isAbortError(err)) return;
-      toggleNotification({
-        type: 'danger',
-        message: `Failed to load rules: ${err.message}`,
-      });
+      const is403 = err?.response?.status === 403 || err?.status === 403;
+      if (!is403) {
+        toggleNotification({
+          type: 'danger',
+          message: `Failed to load rules: ${err.message}`,
+        });
+      }
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => {
-    fetchRules();
-    fetchCollections();
-  }, []);
+    if (permissions.isLoading) return;
+    if (permissions.canValidationView) {
+      fetchRules();
+      fetchCollections();
+    }
+  }, [permissions.isLoading, permissions.canValidationView]);
 
   const openCreateModal = () => {
     fetchCollections();
